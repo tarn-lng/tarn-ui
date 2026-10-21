@@ -1,0 +1,20 @@
+import "ffi"
+struct NativeSession {}
+extern "C" fn malloc(size usize) *mut NativeSession
+extern "C" fn free(raw *mut NativeSession)
+pub struct Error { pub code i32 }
+pub struct Session { native *mut NativeSession }
+// Non-UI probe: same private pointer and fixed owned result as the proposed API.
+pub unsafe fn run(body mut fn(&mut Session) Result<void, Error>) Result<void, Error> {
+    var raw: *mut NativeSession = ffi.null()
+    unsafe { raw = malloc(1) }
+    if ffi.is_null(ffi.to_const(raw)) { return Err(Error{code: 1}) }
+    var session = Session{native: raw}
+    result := body(&mut session)
+    unsafe { free(session.native) }
+    print("closed")
+    return result
+}
+pub fn Session.touch(&mut self) bool {
+    return !ffi.is_null(ffi.to_const(self.native))
+}

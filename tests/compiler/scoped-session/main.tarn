@@ -1,0 +1,21 @@
+import "session"
+
+fn fail() Result<void, session.Error> { return Err(session.Error{code: 7}) }
+fn main() {
+    var calls: i64 = 0
+    body := fn(s &mut session.Session) Result<void, session.Error> {
+        calls = calls + 1
+        print(s.touch())
+        return Ok(())
+    }
+    unsafe {
+        match session.run(body) { Ok(_) => { print("ok") }
+        Err(e) => { print(e.code) } }
+        match session.run(fn(s &mut session.Session) Result<void, session.Error> {
+            try fail()
+            return Ok(())
+        }) { Ok(_) => { print("unexpected") }
+        Err(e) => { print(e.code) } }
+    }
+    print(calls)
+}

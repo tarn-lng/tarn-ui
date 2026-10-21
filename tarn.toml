@@ -1,0 +1,4 @@
+[package]
+name = "tarn_ui"
+version = "0.1.0"
+entry = "examples/counter/main.tarn"

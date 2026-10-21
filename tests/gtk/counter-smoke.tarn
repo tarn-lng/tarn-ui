@@ -1,0 +1,121 @@
+import "core/session"
+import "counter"
+extern "C" fn test_clean() i32
+extern "C" fn test_activate(count i32) i32
+extern "C" fn test_activate_native() i32
+extern "C" fn test_label_equals(value i64) i32
+fn check(value bool) { if !value { panic("counter smoke failed") } }
+fn next_increment(ui &mut session.Session) Result<void, session.Error> {
+    for {
+        event := try ui.next_event()
+        match event {
+            session.Event.Opened => {}
+            session.Event.Increment => { return Ok(()) }
+            session.Event.Closed => { return Err(session.Error{code: 98}) }
+        }
+    }
+}
+fn fail() Result<void, session.Error> { return Err(session.Error{code: 99}) }
+fn main() {
+    var value: i64 = 0
+    unsafe {
+        match session.run("Counter tests", "Contador en Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.enable_counter(value)
+            check(test_label_equals(0) == 1 && test_activate_native() == 1)
+            try next_increment(ui)
+            try counter.increment(ui, &mut value)
+            check(value == 1 && test_label_equals(1) == 1)
+            check(test_activate(7) == 1 && test_label_equals(1) == 1)
+            var index: i32 = 0
+            for index < 7 {
+                try next_increment(ui)
+                try counter.increment(ui, &mut value)
+                check(test_label_equals(value) == 1)
+                index = index + 1
+            }
+            check(value == 8)
+            try ui.request_close()
+            event := try ui.next_event()
+            match event {
+                session.Event.Closed => { return Ok(()) }
+                session.Event.Opened => { return Err(session.Error{code: 97}) }
+                session.Event.Increment => { return Err(session.Error{code: 97}) }
+            }
+        }) {
+            Ok(_) => { print("PASS native activation and seven queued clicks: 0 -> 8") }
+            Err(e) => { panic("multiple clicks failed") }
+        }
+        check(test_clean() == 1 && value == 8)
+        value = 50
+        match session.run("Close pending", "Contador en Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.enable_counter(value)
+            check(test_activate(3) == 1 && test_label_equals(50) == 1)
+            try ui.request_close()
+            event := try ui.next_event()
+            match event {
+                session.Event.Closed => {}
+                session.Event.Opened => { panic("close did not supersede opened") }
+                session.Event.Increment => { panic("close did not discard clicks") }
+            }
+            try counter.increment(ui, &mut value)
+            return Ok(())
+        }) {
+            Err(e) => { check(e.code == 6 && value == 50) }
+            Ok(_) => { panic("closed update accepted") }
+        }
+        check(test_clean() == 1)
+        print("PASS close discards three pending clicks; rejected update preserves state")
+        value = 9223372036854775806
+        match session.run("Overflow", "Contador en Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.enable_counter(value)
+            check(test_activate(2) == 1)
+            try next_increment(ui)
+            try counter.increment(ui, &mut value)
+            check(value == 9223372036854775807 && test_label_equals(value) == 1)
+            try next_increment(ui)
+            try counter.increment(ui, &mut value)
+            return Ok(())
+        }) {
+            Err(e) => { check(e.code == 9 && value == 9223372036854775807) }
+            Ok(_) => { panic("overflow accepted") }
+        }
+        check(test_clean() == 1)
+        print("PASS i64 maximum reached; next click returns overflow 9 without abort")
+        value = -9223372036854775807 - 1
+        match session.run("Minimum", "Contador en Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.enable_counter(value)
+            check(test_label_equals(value) == 1 && test_activate(1) == 1)
+            try next_increment(ui)
+            try counter.increment(ui, &mut value)
+            check(value == -9223372036854775807 && test_label_equals(value) == 1)
+            try fail()
+            return Ok(())
+        }) {
+            Err(e) => { check(e.code == 99) }
+            Ok(_) => { panic("body error lost") }
+        }
+        check(test_clean() == 1)
+        print("PASS i64 minimum and increment; body error 99 preserved")
+        match session.run("Queue overflow", "Contador en Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.enable_counter(0)
+            check(test_activate(65) == 1 && test_label_equals(0) == 1)
+            event := try ui.next_event()
+            return Ok(())
+        }) {
+            Err(e) => { check(e.code == 8) }
+            Ok(_) => { panic("queue overflow ignored") }
+        }
+        check(test_clean() == 1)
+        print("PASS queue overflow error 8 and scoped cleanup")
+        match session.run("Early return", "Contador en Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.enable_counter(0)
+            check(test_activate(3) == 1)
+            return Ok(())
+        }) {
+            Ok(_) => {}
+            Err(e) => { panic("early return failed") }
+        }
+        check(test_clean() == 1)
+        print("PASS early return frees widgets and pending events")
+    }
+}

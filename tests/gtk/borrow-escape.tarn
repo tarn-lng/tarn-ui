@@ -1,0 +1,14 @@
+import "core/session"
+fn main() {
+    var escaped: Option<&mut session.Session> = None
+    unsafe {
+        result := session.run("Escape", "Escape", fn(ui &mut session.Session) Result<void, session.Error> {
+            escaped = Some(ui)
+            return Ok(())
+        })
+    }
+    match escaped {
+        Some(ui) => { result := ui.request_close() }
+        None => {}
+    }
+}

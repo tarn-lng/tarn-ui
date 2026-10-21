@@ -1,0 +1,13 @@
+// Compile-fail: a direct store must not outlive its function-local owner.
+fn scoped(out &mut Option<&i64>) {
+    local: i64 := 42
+    *out = Some(&local)
+}
+fn main() {
+    var saved: Option<&i64> = None
+    scoped(&mut saved)
+    match saved {
+        Some(value) => { print(value) }
+        None => {}
+    }
+}

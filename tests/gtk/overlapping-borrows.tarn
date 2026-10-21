@@ -1,0 +1,13 @@
+import "core/session"
+fn both(first &mut session.Session, second &mut session.Session) {
+    result := first.set_counter(1)
+    other := second.set_counter(2)
+}
+fn main() {
+    unsafe {
+        result := session.run("Borrow", "Borrow", fn(ui &mut session.Session) Result<void, session.Error> {
+            both(ui, ui)
+            return Ok(())
+        })
+    }
+}

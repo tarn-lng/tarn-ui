@@ -1,0 +1,12 @@
+import "session"
+fn main() {
+    unsafe {
+        result := session.run(fn(s &mut session.Session) Result<void, session.Error> {
+            scope {
+                task := spawn move fn() bool { return s.touch() }
+                value := task.join()
+            }
+            return Ok(())
+        })
+    }
+}

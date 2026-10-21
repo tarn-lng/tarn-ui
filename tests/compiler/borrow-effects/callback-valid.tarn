@@ -1,0 +1,9 @@
+fn scoped(body mut fn(&i64)) {
+    local: i64 := 42
+    body(&local)
+}
+fn main() {
+    var saved: i64 = 0
+    scoped(fn(value &i64) { saved = *value })
+    print(saved)
+}

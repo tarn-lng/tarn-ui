@@ -1,0 +1,14 @@
+import "session"
+fn main() {
+    var escaped: Option<&mut session.Session> = None
+    unsafe {
+        result := session.run(fn(s &mut session.Session) Result<void, session.Error> {
+            escaped = Some(s)
+            return Ok(())
+        })
+    }
+    match escaped {
+        Some(s) => { print(s.touch()) }
+        None => {}
+    }
+}

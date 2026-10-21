@@ -1,0 +1,26 @@
+import "session"
+import "os"
+import "counter"
+
+fn main() {
+    var value: i64 = 0
+    unsafe {
+        match session.run("Tarn UI", "Hola desde Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.enable_counter(value)
+            for {
+                event := try ui.next_event()
+                match event {
+                    session.Event.Opened => { print("opened") }
+                    session.Event.Closed => { return Ok(()) }
+                    session.Event.Increment => { try counter.increment(ui, &mut value) }
+                }
+            }
+        }) {
+            Ok(_) => { print("closed") }
+            Err(error) => {
+                print(error.code)
+                os.exit(1)
+            }
+        }
+    }
+}

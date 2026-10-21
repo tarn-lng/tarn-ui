@@ -1,0 +1,5 @@
+import "session"
+import "ffi"
+fn main() {
+    s := session.Session{native: ffi.null()}
+}

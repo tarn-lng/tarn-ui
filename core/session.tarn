@@ -1,0 +1,78 @@
+import "ffi"
+
+struct NativeSession {}
+extern "C" fn tarn_ui_gtk_abi() u32
+extern "C" fn tarn_ui_gtk_create(title *u8, heading *u8, out *mut *mut NativeSession) i32
+extern "C" fn tarn_ui_gtk_next(raw *mut NativeSession) i32
+extern "C" fn tarn_ui_gtk_request_close(raw *mut NativeSession) i32
+extern "C" fn tarn_ui_gtk_release(raw *mut NativeSession) i32
+extern "C" fn tarn_ui_gtk_enable_counter(raw *mut NativeSession, value i64) i32
+extern "C" fn tarn_ui_gtk_set_counter(raw *mut NativeSession, value i64) i32
+
+pub struct Error { pub code i32 }
+pub enum Event {
+    Opened
+    Closed
+    Increment
+}
+pub struct Session { native *mut NativeSession }
+
+fn c_string(text &string) Result<ffi.CString, Error> {
+    match ffi.CString.new(text) {
+        Some(value) => { return Ok(value) }
+        None => { return Err(Error{code: 1}) }
+    }
+}
+
+// Requires the process main thread and no nested UI session. Native allocation
+// failure, ordinary return and body errors all clean up. Abort/exit do not unwind.
+pub unsafe fn run(title string, heading string,
+    body mut fn(&mut Session) Result<void, Error>) Result<void, Error> {
+    unsafe {
+        if tarn_ui_gtk_abi() != 2 { return Err(Error{code: 7}) }
+    }
+    c_title := try c_string(&title)
+    c_heading := try c_string(&heading)
+    var raw: *mut NativeSession = ffi.null()
+    var status: i32 = 0
+    unsafe {
+        status = tarn_ui_gtk_create(c_title.as_ptr(), c_heading.as_ptr(), ffi.of_mut(&mut raw))
+    }
+    if status != 0 { return Err(Error{code: status}) }
+    var session = Session{native: raw}
+    result := body(&mut session)
+    // Store the result before cleanup; never `try` past this release.
+    unsafe { status = tarn_ui_gtk_release(session.native) }
+    if status != 0 { return Err(Error{code: status}) }
+    return result
+}
+
+pub fn Session.next_event(&mut self) Result<Event, Error> {
+    var event: i32 = 0
+    unsafe { event = tarn_ui_gtk_next(self.native) }
+    if event == 1 { return Ok(Event.Opened) }
+    if event == 2 { return Ok(Event.Closed) }
+    if event == 3 { return Ok(Event.Increment) }
+    return Err(Error{code: -event})
+}
+
+pub fn Session.enable_counter(&mut self, value i64) Result<void, Error> {
+    var status: i32 = 0
+    unsafe { status = tarn_ui_gtk_enable_counter(self.native, value) }
+    if status != 0 { return Err(Error{code: status}) }
+    return Ok(())
+}
+
+pub fn Session.set_counter(&mut self, value i64) Result<void, Error> {
+    var status: i32 = 0
+    unsafe { status = tarn_ui_gtk_set_counter(self.native, value) }
+    if status != 0 { return Err(Error{code: status}) }
+    return Ok(())
+}
+
+pub fn Session.request_close(&mut self) Result<void, Error> {
+    var status: i32 = 0
+    unsafe { status = tarn_ui_gtk_request_close(self.native) }
+    if status != 0 { return Err(Error{code: status}) }
+    return Ok(())
+}

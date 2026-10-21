@@ -1,0 +1,10 @@
+import "session"
+
+// Application logic: no native state, aborting arithmetic or C-side increment.
+pub fn increment(ui &mut session.Session, value &mut i64) Result<void, session.Error> {
+    if *value == 9223372036854775807 { return Err(session.Error{code: 9}) }
+    next := *value + 1
+    try ui.set_counter(next)
+    *value = next
+    return Ok(())
+}

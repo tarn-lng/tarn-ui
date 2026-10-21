@@ -1,0 +1,46 @@
+import "core/session"
+extern "C" fn test_clean() i32
+
+fn check(value bool) { if !value { panic("UI smoke failed") } }
+fn fail() Result<void, session.Error> { return Err(session.Error{code: 99}) }
+fn main() {
+    var opened: i64 = 0
+    unsafe {
+        match session.run("Tarn UI smoke", "Hola desde Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            closed_event := try ui.next_event()
+            match closed_event {
+                session.Event.Opened => { opened = opened + 1 }
+                session.Event.Closed => { return Err(session.Error{code: 98}) }
+                session.Event.Increment => { return Err(session.Error{code: 97}) }
+            }
+            try ui.request_close()
+            event := try ui.next_event()
+            match event {
+                session.Event.Closed => { return Ok(()) }
+                session.Event.Opened => { return Err(session.Error{code: 97}) }
+                session.Event.Increment => { return Err(session.Error{code: 97}) }
+            }
+        }) {
+            Ok(_) => { print("normal-close") }
+            Err(e) => { panic("normal-close failed") }
+        }
+        check(test_clean() == 1)
+        match session.run("Error cleanup", "Owned by Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try fail()
+            return Ok(())
+        }) {
+            Err(e) => { check(e.code == 99) }
+            Ok(_) => { panic("lost body error") }
+        }
+        check(test_clean() == 1)
+        match session.run("Early return", "Owned by Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            return Ok(())
+        }) {
+            Ok(_) => { print("early-return") }
+            Err(e) => { panic("early return failed") }
+        }
+        check(test_clean() == 1)
+    }
+    check(opened == 1)
+    print("clean")
+}

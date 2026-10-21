@@ -1,0 +1,35 @@
+# Compilations, staged source copies and local executable-test artifacts.
+/.build/
+/target/
+/vendor/
+/dist/
+
+# Publish written evidence; keep machine-specific output and captures local.
+/evidence/**
+!/evidence/**/
+!/evidence/**/*.md
+*.log
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pyc
+__pycache__/
+
+# Local credentials, agent configuration and editor/OS files.
+/.aws/
+/.agents/
+/.codex/
+.env
+.env.*
+!.env.example
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

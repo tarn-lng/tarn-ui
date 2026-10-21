@@ -1,0 +1,13 @@
+fn scoped(body mut fn(&i64)) {
+    local: i64 := 42
+    body(&local)
+}
+fn main() {
+    // Compile-fail: keep the borrow, not a copy of its owned scalar value.
+    var saved: Option<&i64> = None
+    scoped(fn(value &i64) { saved = Some(value) })
+    match saved {
+        Some(value) => { print(value) }
+        None => {}
+    }
+}
