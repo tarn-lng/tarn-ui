@@ -1,0 +1,46 @@
+import "core/session"
+import "counter"
+import "os"
+extern "C" fn test_dev_mode() i32
+extern "C" fn test_dev_prepare()
+extern "C" fn test_dev_delay()
+extern "C" fn test_clean() i32
+fn main() {
+    var value: i64 = 0
+    var exit_code: u8 = 0
+    unsafe {
+        mode := test_dev_mode()
+        match session.run("Protocol fixture", "Native fixture", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.enable_counter(value)
+            unsafe { test_dev_prepare() }
+            for {
+                event := try ui.next_event()
+                match event {
+                    session.Event.Opened => {}
+                    session.Event.Closed => { return Ok(()) }
+                    session.Event.Increment => {
+                        if mode == 9 { unsafe { test_dev_delay() } }
+                        if mode == 10 {
+                            try ui.request_close()
+                            return Ok(())
+                        }
+                        if mode == 6 { return Err(session.Error{code: 99}) }
+                        if mode == 7 { try ui.request_close() } else {
+                            try counter.increment(ui, &mut value)
+                            if mode != 8 { try ui.complete_event() }
+                        }
+                    }
+                }
+            }
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                print(e.code)
+                exit_code = 1
+            }
+        }
+        if test_clean() != 1 { panic("protocol fixture leaked session resources") }
+    }
+    print("clean")
+    os.exit(exit_code)
+}

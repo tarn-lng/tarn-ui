@@ -2,7 +2,7 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 build="$root/.build/gtk-tests"
-evidence="$root/.build/evidence/phase2"
+evidence="${EVIDENCE_DIR:-$root/.build/evidence/phase2}"
 compiler="${TARN_BIN:-$root/.build/verified-da3173c/debug/tarn}"
 [[ $# == 0 || ( $# == 1 && $1 == --build-only ) ]] || {
     echo 'Usage: test-gtk.sh [--build-only]' >&2; exit 2;

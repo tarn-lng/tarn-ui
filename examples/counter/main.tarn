@@ -1,4 +1,4 @@
-import "session"
+import "core/session"
 import "os"
 import "counter"
 
@@ -12,7 +12,10 @@ fn main() {
                 match event {
                     session.Event.Opened => { print("opened") }
                     session.Event.Closed => { return Ok(()) }
-                    session.Event.Increment => { try counter.increment(ui, &mut value) }
+                    session.Event.Increment => {
+                        try counter.increment(ui, &mut value)
+                        try ui.complete_event()
+                    }
                 }
             }
         }) {

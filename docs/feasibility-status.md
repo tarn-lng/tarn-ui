@@ -1,5 +1,9 @@
 # Feasibility gate: full baseline pending
 
+Latest authorized milestone: Phase 3 development control. See
+[actual Phase 3 results](phase3-results.md); this does not claim a green full
+baseline or resolution of the renderer's LeakSanitizer findings.
+
 Current status: the user accepted Phase 1 and authorized Phase 2 only. The native
 counter and targeted tests are recorded in [Phase 2 results](phase2-results.md).
 The earlier gate observations below are historical and do not supersede that

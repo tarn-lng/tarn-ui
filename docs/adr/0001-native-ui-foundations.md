@@ -1,6 +1,12 @@
 # ADR 0001: native UI foundations and scoped GTK4 feasibility
 
 Status: **architectural direction approved**, with the constraints below.
+Phase 3 update (2026-10-21): the user authorized inspect/click/close development
+control after accepting Phase 2. The optional build uses an inherited private
+Unix socket capability, explicit operation/text grants and session binding.
+Applied-event completion remains in Tarn; production omits the transport.
+See [protocol guide](../devtools.md) and [measured results](../phase3-results.md).
+Screenshot/MCP and later phases remain deferred.
 Phase 2 update: the user accepted Phase 1 and explicitly authorized the counter
 only, with targeted executable tests. Counter state and checked increment logic
 are Tarn application code; native callbacks enqueue events. See

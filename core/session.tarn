@@ -8,6 +8,7 @@ extern "C" fn tarn_ui_gtk_request_close(raw *mut NativeSession) i32
 extern "C" fn tarn_ui_gtk_release(raw *mut NativeSession) i32
 extern "C" fn tarn_ui_gtk_enable_counter(raw *mut NativeSession, value i64) i32
 extern "C" fn tarn_ui_gtk_set_counter(raw *mut NativeSession, value i64) i32
+extern "C" fn tarn_ui_gtk_complete_event(raw *mut NativeSession, status i32) i32
 
 pub struct Error { pub code i32 }
 pub enum Event {
@@ -29,7 +30,7 @@ fn c_string(text &string) Result<ffi.CString, Error> {
 pub unsafe fn run(title string, heading string,
     body mut fn(&mut Session) Result<void, Error>) Result<void, Error> {
     unsafe {
-        if tarn_ui_gtk_abi() != 2 { return Err(Error{code: 7}) }
+        if tarn_ui_gtk_abi() != 3 { return Err(Error{code: 7}) }
     }
     c_title := try c_string(&title)
     c_heading := try c_string(&heading)
@@ -73,6 +74,14 @@ pub fn Session.set_counter(&mut self, value i64) Result<void, Error> {
 pub fn Session.request_close(&mut self) Result<void, Error> {
     var status: i32 = 0
     unsafe { status = tarn_ui_gtk_request_close(self.native) }
+    if status != 0 { return Err(Error{code: status}) }
+    return Ok(())
+}
+
+// Acknowledge only after the application handler has applied its owned state.
+pub fn Session.complete_event(&mut self) Result<void, Error> {
+    var status: i32 = 0
+    unsafe { status = tarn_ui_gtk_complete_event(self.native, 0) }
     if status != 0 { return Err(Error{code: status}) }
     return Ok(())
 }

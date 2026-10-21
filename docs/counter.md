@@ -1,5 +1,10 @@
 # Contador nativo: fase 2
 
+Actualización de fase 3: la ABI vigente es 3 y el ejemplo confirma cada evento
+aplicado con `complete_event`. El canal opcional se documenta en
+[la guía de desarrollo](devtools.md); sin `--dev`, el contador no expone transporte.
+Las observaciones de ABI 2 y resultados de fase 2 que siguen son históricas.
+
 El ejemplo tiene una ventana, un encabezado, una etiqueta numérica y un botón
 GTK4. El valor inicial es cero. El estado `i64` vive en
 `examples/counter/main.tarn`; `examples/counter/counter.tarn` implementa el

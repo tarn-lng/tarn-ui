@@ -5,9 +5,11 @@ tarn-ui/
   core/                      API semántica y runner de sesión
   backends/linux/gtk/        puente C privado y cabecera ABI
   examples/counter/          programa y lógica de aplicación en Tarn
+  devtools/                  cliente del canal privado para pruebas y lanzador
   tests/
     gtk/                     ciclo de vida, integración y compile-fail de la API
     compiler/                reproducciones de préstamos y sesión sin GTK
+    devtools/                protocolo, permisos y sonda de memoria del canal
   scripts/                   compilación, ejecución y verificación explícitas
   docs/                      guías, resultados y ADR
   evidence/                  informes históricos escritos
@@ -19,6 +21,9 @@ Las antiguas carpetas `probes/` y `examples/heading/` se integraron en
 `tests/compiler/` y `examples/counter/`. Los scripts activos son
 `build-counter.sh`, `run-counter.sh`, `test-gtk.sh` e `investigate-gtk-leaks.sh`.
 La guía histórica de la ventana sigue en `docs/native-ui.md`.
+El lanzador explícito de fase 3 es `scripts/run-dev-counter.py`; sus pruebas son
+`test-devtools.sh` y `test-devtools-memory.sh`. `devtools.inc` se incluye en el
+puente únicamente al compilar con `TARN_UI_DEVTOOLS`.
 
 ## Qué llega a GitHub
 

@@ -11,6 +11,10 @@ bash scripts/run-counter.sh
 Consulta [la guía del contador](docs/counter.md), [los resultados reales de fase 2](docs/phase2-results.md)
 y [la estructura y política de archivos](docs/repository.md).
 
+La fase 3 añade un [canal de desarrollo autorizado](docs/devtools.md) para
+inspección, clic y cierre. Se compila aparte con `--dev`; el binario normal no
+contiene ese transporte. [Resultados de fase 3](docs/phase3-results.md).
+
 Las pruebas puntuales de interacción, límites, errores y préstamos pasan.
 LeakSanitizer sigue fallando también con GTK sin el puente; el fallo se conserva.
 No se repitió la suite completa. No hay MCP, componentes reactivos, navegación
