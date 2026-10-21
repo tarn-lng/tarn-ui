@@ -1,0 +1,109 @@
+// Black-box launcher acceptance. Inputs and bounded expected outputs fit in the
+// pipes before wait_timeout; full captured output is validated after the reap.
+import "process"
+import "io"
+import "json"
+import "string"
+import "os"
+
+fn feed_and_observe(child &mut process.Child, input &string) Result<bool, io.Error> {
+    match &mut child.stdin {
+        Some(pipe) => { try pipe.write_all(input.bytes()) }
+        None => { return Err(io.Error.new(io.ErrorKind.InvalidInput)) }
+    }
+    match try child.process.wait_timeout(10000) {
+        Some(_) => { return Ok(true) }
+        None => { return Ok(false) }
+    }
+}
+fn invoke_launcher(launcher &string, binary &string, library_path &string, mode &string, input &string) Result<process.Output, io.Error> {
+    var deadline = "5000"
+    if mode == &"silent" { deadline = "200" }
+    var child = try process.Command.new(launcher.clone())
+        .arg("--allow").arg("inspect").arg("click").arg("close")
+        .arg("--binary").arg(binary.clone()).arg("--library-path").arg(library_path.clone())
+        .arg("--io-timeout-ms").arg(deadline).arg("--close-timeout-ms").arg("3000")
+        .env("TARN_UI_LAUNCHER_FIXTURE", mode.clone())
+        .stdin(process.Stdio.Piped).stdout(process.Stdio.Piped).stderr(process.Stdio.Piped)
+        .start_child()
+    var done = false
+    match feed_and_observe(&mut child, input) { Ok(value) => { done = value }
+        Err(_) => {} }
+    if !done {
+        match child.process.kill() { Ok(_) => {}
+            Err(_) => {} }
+    }
+    input_bytes: Vec<u8> := Vec.new()
+    return child.communicate(input_bytes)
+}
+fn check_startup(output &process.Output) Result<bool, io.Error> {
+    text := try output.stdout_text()
+    lines := string.lines(&text)
+    if lines.len() != 2 || !output.status.success() || !output.stderr.is_empty() { return Ok(false) }
+    var ready: json.Value
+    match json.parse(&lines.as_slice()[0]) { Ok(value) => { ready = value }
+        Err(_) => { return Ok(false) } }
+    var closed: json.Value
+    match json.parse(&lines.as_slice()[1]) { Ok(value) => { closed = value }
+        Err(_) => { return Ok(false) } }
+    result := closed.get("result").unwrap_or(json.Value.Null)
+    return Ok(ready.text("event").unwrap_or("") == "ready" &&
+        closed.text("request_id").unwrap_or("") == "acceptance_close" &&
+        result.bool("closed").unwrap_or(false))
+}
+fn check_failure(output &process.Output, code &string, native_exit i64, forced bool) Result<bool, io.Error> {
+    if !output.stdout.is_empty() { return Ok(false) }
+    var expected_code: i32 = 1
+    if forced { expected_code = 2 }
+    if output.status.code().unwrap_or(0) != expected_code { return Ok(false) }
+    errors := try output.stderr_text()
+    if string.contains(&errors, "CHILD_STDOUT_MARKER") || string.contains(&errors, "CHILD_STDERR_MARKER") { return Ok(false) }
+    var value: json.Value
+    match json.parse(&errors) { Ok(item) => { value = item }
+        Err(_) => { return Ok(false) } }
+    error := value.get("error").unwrap_or(json.Value.Null)
+    details := error.get("details").unwrap_or(json.Value.Null)
+    expected := code.clone()
+    return Ok(error.text("code").unwrap_or("") == expected &&
+        details.i64("native_exit").unwrap_or(0) == native_exit &&
+        details.bool("forced_cleanup").unwrap_or(!forced) == forced)
+}
+fn record(name &string, result Result<bool, io.Error>) bool {
+    var passed = false
+    var writer = json.Writer.new()
+    writer.begin_object()
+    writer.field_string("test", name)
+    match result { Ok(value) => { passed = value }
+        Err(error) => { writer.field_i64("native_code", i64(error.native_code())) } }
+    writer.field_bool("passed", passed)
+    writer.end_object()
+    print(writer.finish())
+    return passed
+}
+fn main() {
+    var arguments: Vec<string>
+    match os.args() { Ok(value) => { arguments = value }
+        Err(_) => { os.exit(2)
+            return } }
+    args := arguments.as_slice()
+    if args.len() != 5 { os.exit(2)
+        return }
+    var passed = true
+    close := "{\"version\":1,\"request_id\":\"acceptance_close\",\"method\":\"ui.close\",\"params\":{\"window_id\":\"main\"}}\n"
+    match invoke_launcher(&args[1], &args[2], &args[3], "", &close) {
+        Ok(output) => { if !record("launcher_native_start_and_close", check_startup(&output)) { passed = false } }
+        Err(error) => { record("launcher_native_start_and_close", Err(error))
+            passed = false }
+    }
+    match invoke_launcher(&args[1], &args[4], &args[3], "early", "") {
+        Ok(output) => { if !record("launcher_early_eof_status_and_output_isolation", check_failure(&output, "CONNECTION_LOST", 23, false)) { passed = false } }
+        Err(error) => { record("launcher_early_eof_status_and_output_isolation", Err(error))
+            passed = false }
+    }
+    match invoke_launcher(&args[1], &args[4], &args[3], "silent", "") {
+        Ok(output) => { if !record("launcher_timeout_terminate_wait", check_failure(&output, "TIMEOUT", -15, true)) { passed = false } }
+        Err(error) => { record("launcher_timeout_terminate_wait", Err(error))
+            passed = false }
+    }
+    if !passed { os.exit(1) }
+}

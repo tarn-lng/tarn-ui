@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
         g_print("GTK-only control: %" G_GINT64_FORMAT " windows created/destroyed\n", cycles);
         return 0;
     }
-    g_assert_cmpuint(tarn_ui_gtk_abi(), ==, 3);
+    g_assert_cmpuint(tarn_ui_gtk_abi(), ==, 4);
     void *s = NULL;
     g_assert_cmpint(tarn_ui_gtk_create(NULL, "x", &s), ==, 1);
     g_assert_null(s);

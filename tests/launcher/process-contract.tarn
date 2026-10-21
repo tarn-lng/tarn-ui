@@ -1,0 +1,224 @@
+// Executable integration probes for the public stdlib process/channel contract.
+// Child ownership stays outside fallible protocol helpers.
+import "net"
+import "process"
+import "io"
+import "time"
+import "os"
+import "console"
+import "string"
+import "json"
+
+fn timed_out() io.Error { return io.Error.new(io.ErrorKind.TimedOut) }
+fn invalid() io.Error { return io.Error.new(io.ErrorKind.InvalidData) }
+fn remaining(start time.Instant, limit i32) Result<i32, io.Error> {
+    duration := try start.elapsed()
+    if duration.as_millis() >= u64(limit) { return Err(timed_out()) }
+    return Ok(limit - i32(duration.as_millis()))
+}
+fn wait_ready(poller &mut net.Poll, start time.Instant, limit i32) Result<void, io.Error> {
+    var events: Vec<net.Event> = Vec.new()
+    events.push(net.Event.empty())
+    count := try poller.wait(events.as_mut_slice(), try remaining(start, limit))
+    if count == 0 { return Err(timed_out()) }
+    return Ok(())
+}
+fn read_line(stream &mut net.UnixStream, limit i32) Result<string, io.Error> {
+    var poller = try net.Poll.new()
+    try poller.register_unix(stream, net.Interest.Readable)
+    start := try time.Instant.now()
+    var scratch: Vec<u8> = Vec.new()
+    scratch.push(0)
+    var record: Vec<u8> = Vec.new()
+    for {
+        try remaining(start, limit)
+        match stream.read(scratch.as_mut_slice()) {
+            Ok(count) => {
+                if count == 0 { return Err(io.Error.new(io.ErrorKind.UnexpectedEof)) }
+                byte := scratch.as_slice()[0]
+                if byte == 10 {
+                    return string.from_utf8(record.as_slice()).ok_or(invalid())
+                }
+                record.push(byte)
+                if record.len() > 2097152 { return Err(io.Error.new(io.ErrorKind.LimitExceeded)) }
+            }
+            Err(error) => {
+                match error.kind { io.ErrorKind.WouldBlock => { try wait_ready(&mut poller, start, limit) }
+                    _ => { return Err(error) } }
+            }
+        }
+    }
+}
+fn write_line(stream &mut net.UnixStream, text &string) Result<void, io.Error> {
+    record := text.clone() + "\n"
+    var poller = try net.Poll.new()
+    try poller.register_unix(stream, net.Interest.Writable)
+    start := try time.Instant.now()
+    var offset: usize = 0
+    for offset < record.len() {
+        try remaining(start, 5000)
+        match stream.write(&record.bytes()[offset..]) {
+            Ok(count) => {
+                if count == 0 { return Err(io.Error.new(io.ErrorKind.WriteZero)) }
+                offset = offset + count
+            }
+            Err(error) => {
+                match error.kind { io.ErrorKind.WouldBlock => { try wait_ready(&mut poller, start, 5000) }
+                    _ => { return Err(error) } }
+            }
+        }
+    }
+    return Ok(())
+}
+fn parse_record(text string) Result<json.Value, io.Error> {
+    match json.parse(&text) { Ok(value) => { return Ok(value) }
+        Err(_) => { return Err(invalid()) } }
+}
+fn startup_protocol(stream &mut net.UnixStream) Result<void, io.Error> {
+    ready := try parse_record(try read_line(stream, 5000))
+    if ready.text("event").unwrap_or("") != "ready" { return Err(invalid()) }
+    identity := ready.text("session_id").ok_or(invalid())
+    session_id := try identity
+    var writer = json.Writer.new()
+    writer.begin_object()
+    writer.field_i64("version", 1)
+    writer.field_string("request_id", "native_probe_auth")
+    writer.field_string("method", "session.authorize")
+    writer.key("params")
+    writer.begin_object()
+    writer.field_string("session_id", &session_id)
+    writer.end_object()
+    writer.end_object()
+    request := writer.finish()
+    try write_line(stream, &request)
+    authorized := try parse_record(try read_line(stream, 5000))
+    if authorized.get("result").is_none() { return Err(invalid()) }
+    try write_line(stream, "{\"version\":1,\"request_id\":\"native_probe_close\",\"method\":\"ui.close\",\"params\":{\"window_id\":\"main\"}}")
+    closed := try parse_record(try read_line(stream, 5000))
+    result := closed.get("result").unwrap_or(json.Value.Null)
+    if !result.bool("closed").unwrap_or(false) { return Err(invalid()) }
+    return Ok(())
+}
+fn settle(owned process.Child) Result<process.Output, io.Error> {
+    var child = owned
+    var done = false
+    match child.process.wait_timeout(3000) {
+        Ok(Some(_)) => { done = true }
+        Ok(None) => {}
+        Err(_) => {}
+    }
+    if !done {
+        // Never propagate before explicitly arranging termination of a live child.
+        match child.process.kill() { Ok(_) => {}
+            Err(_) => {} }
+    }
+    var input: Vec<u8> = Vec.new()
+    return child.communicate(input)
+}
+fn spawn_fixture(program &string, mode &string, endpoint net.UnixStream) Result<process.Child, io.Error> {
+    return process.Command.new(program.clone()).arg("child").arg(mode.clone())
+        .stdin(process.Stdio.Null).stdout(process.Stdio.Piped).stderr(process.Stdio.Piped)
+        .pass(endpoint).start_child()
+}
+fn test_early_exit(program &string) Result<bool, io.Error> {
+    pair := try net.UnixStream.pair()
+    var stream = pair.first
+    try stream.set_nonblocking(true)
+    child := try spawn_fixture(program, "early", pair.second)
+    var eof = false
+    match read_line(&mut stream, 5000) {
+        Ok(_) => {}
+        Err(error) => { match error.kind { io.ErrorKind.UnexpectedEof => { eof = true }
+                _ => {} } }
+    }
+    output := try settle(child)
+    return Ok(eof && output.status.code().unwrap_or(-1) == 23 &&
+            try output.stdout_text() == "CHILD_STDOUT_MARKER\n" &&
+            try output.stderr_text() == "CHILD_STDERR_MARKER\n")
+}
+fn test_timeout(program &string) Result<bool, io.Error> {
+    pair := try net.UnixStream.pair()
+    var stream = pair.first
+    try stream.set_nonblocking(true)
+    var child = try spawn_fixture(program, "silent", pair.second)
+    var timeout = false
+    match read_line(&mut stream, 100) {
+        Ok(_) => {}
+        Err(error) => { match error.kind { io.ErrorKind.TimedOut => { timeout = true }
+                _ => {} } }
+    }
+    // Explicit timeout -> kill -> wait. No Process can reach an error return live.
+    var killed = false
+    match child.process.kill() { Ok(_) => { killed = true }
+        Err(_) => {} }
+    output := try settle(child)
+    return Ok(timeout && killed && output.status.signal().unwrap_or(0) == 9)
+}
+fn test_terminate(program &string) Result<bool, io.Error> {
+    pair := try net.UnixStream.pair()
+    var child = try spawn_fixture(program, "silent", pair.second)
+    var signalled = false
+    match child.process.terminate() { Ok(_) => { signalled = true }
+        Err(_) => {} }
+    output := try settle(child)
+    return Ok(signalled && output.status.signal().unwrap_or(0) == 15)
+}
+fn test_startup(binary &string, library_path &string) Result<bool, io.Error> {
+    pair := try net.UnixStream.pair()
+    var stream = pair.first
+    try stream.set_nonblocking(true)
+    child := try process.Command.new(binary.clone())
+        .env("LD_LIBRARY_PATH", library_path.clone())
+        .env("TARN_UI_DEV_FD", "3").env("TARN_UI_DEV_ALLOW", "inspect,click,close")
+        .env("TARN_UI_DEV_TEXT", "0").env("TARN_UI_DEV_CAPTURE", "0")
+        .stdin(process.Stdio.Null).stdout(process.Stdio.Piped).stderr(process.Stdio.Piped)
+        .pass(pair.second).start_child()
+    var valid = false
+    match startup_protocol(&mut stream) { Ok(_) => { valid = true }
+        Err(_) => {} }
+    output := try settle(child)
+    return Ok(valid && output.status.success())
+}
+fn report(name &string, result Result<bool, io.Error>) bool {
+    var passed = false
+    var writer = json.Writer.new()
+    writer.begin_object()
+    writer.field_string("test", name)
+    match result {
+        Ok(value) => { passed = value }
+        Err(error) => { writer.field_i64("native_code", i64(error.native_code())) }
+    }
+    writer.field_bool("passed", passed)
+    writer.end_object()
+    print(writer.finish())
+    return passed
+}
+fn child_mode(mode &string) {
+    if mode == &"early" {
+        var output = console.stdout()
+        var errors = console.stderr()
+        match output.write_text("CHILD_STDOUT_MARKER\n") { Ok(_) => {}
+            Err(_) => { os.exit(90) } }
+        match errors.write_text("CHILD_STDERR_MARKER\n") { Ok(_) => {}
+            Err(_) => { os.exit(91) } }
+        os.exit(23)
+    }
+    match time.sleep_blocking(time.Duration.seconds(30)) { Ok(_) => {}
+        Err(_) => { os.exit(92) } }
+}
+fn main() {
+    var arguments: Vec<string>
+    match os.args() { Ok(value) => { arguments = value }
+        Err(_) => { os.exit(2)
+            return } }
+    args := arguments.as_slice()
+    if args.len() == 3 && args[1] == "child" { child_mode(&args[2])
+        return }
+    if args.len() != 3 { os.exit(2) }
+    var passed = true
+    if !report("early_eof_status_and_piped_stdio_isolation", test_early_exit(&args[0])) { passed = false }
+    if !report("unresponsive_timeout_kill_wait", test_timeout(&args[0])) { passed = false }
+    if !report("terminate_then_wait", test_terminate(&args[0])) { passed = false }
+    if !report("gtk_socketpair_ready_authorize_close", test_startup(&args[1], &args[2])) { passed = false }
+    if !passed { os.exit(1) }
+}

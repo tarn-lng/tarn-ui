@@ -9,8 +9,8 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-from devtools.session import Session
+sys.path.insert(0, str(ROOT / "tests/devtools"))
+from reference_session import Session
 
 FIXTURE = ROOT / ".build/devtools-tests/counter"
 
@@ -108,7 +108,8 @@ class Protocol(unittest.TestCase):
             self.error(s.request("ui.click", {"window_id": "main", "element_id": "missing"}), "NOT_FOUND")
             self.error(s.request("ui.click", {"window_id": "main", "element_id": "counter"}), "WRONG_ELEMENT_TYPE")
             self.error(s.request("ui.click", {"window_id": "main", "element_id": "increment/0"}), "WRONG_ELEMENT_TYPE")
-            for method in ("ui.screenshot", "ui.type", "ui.rebuild"):
+            self.error(s.request("ui.screenshot", {"window_id": "main"}), "UNAUTHORIZED")
+            for method in ("ui.type", "ui.rebuild"):
                 self.error(s.request(method, {}), "UNSUPPORTED_OPERATION")
             self.close(s)
 

@@ -1,0 +1,395 @@
+// Scoped process ownership: no error can drop a potentially live child before
+// explicit termination. This module uses only public Tarn stdlib APIs.
+import "net"
+import "process"
+import "json"
+import "string"
+import "time"
+import "io"
+import "wire"
+
+pub struct Config {
+    pub binary string
+    pub library_path string
+    pub grants string
+    pub allow_text bool
+    pub allow_capture bool
+    pub io_timeout i32
+    pub close_timeout i32
+}
+pub struct Channel {
+    socket net.UnixStream
+    poll net.Poll
+    token net.Token
+    buffer Vec<u8>
+    output Option<process.ChildStdout>
+    errors Option<process.ChildStderr>
+    output_token Option<net.Token>
+    errors_token Option<net.Token>
+    output_eof bool
+    errors_eof bool
+    pub stdout Vec<u8>
+    pub stderr Vec<u8>
+    pub ready json.Value
+    pub closed bool
+    sequence u64
+    timeout i32
+}
+pub struct Outcome {
+    pub failure Option<wire.Error>
+    pub status process.ExitStatus
+    pub forced_cleanup bool
+    pub stdout Vec<u8>
+    pub stderr Vec<u8>
+}
+fn flag(value bool) string { if value { return "1" }
+    return "0" }
+fn io_failure(error io.Error) wire.Error { return wire.native("transport", error) }
+fn elapsed(start time.Instant) Result<i32, wire.Error> {
+    match start.elapsed() {
+        Ok(duration) => {
+            if duration.as_millis() > 2147483647 { return Ok(2147483647) }
+            return Ok(i32(duration.as_millis()))
+        }
+        Err(error) => { return Err(io_failure(error)) }
+    }
+}
+fn now() Result<time.Instant, wire.Error> {
+    match time.Instant.now() { Ok(value) => { return Ok(value) }
+        Err(error) => { return Err(io_failure(error)) } }
+}
+fn bytes(count usize) Vec<u8> {
+    var buffer: Vec<u8> = Vec.new()
+    var index: usize = 0
+    for index < count { buffer.push(0)
+        index = index + 1 }
+    return buffer
+}
+fn Channel.new(socket net.UnixStream, timeout i32) Result<Channel, wire.Error> {
+    var stream = socket
+    match stream.set_nonblocking(true) { Ok(_) => {}
+        Err(error) => { return Err(io_failure(error)) } }
+    var poller: net.Poll
+    match net.Poll.new() { Ok(value) => { poller = value }
+        Err(error) => { return Err(io_failure(error)) } }
+    var token: net.Token
+    match poller.register_unix(&stream, net.Interest.Readable) { Ok(value) => { token = value }
+        Err(error) => { return Err(io_failure(error)) } }
+    return Ok(Channel { socket: stream, poll: poller, token: token, buffer: Vec.new(),
+            output: None, errors: None, output_token: None, errors_token: None, output_eof: false, errors_eof: false,
+            stdout: Vec.new(), stderr: Vec.new(), ready: json.Value.Null,
+            closed: false, sequence: 0, timeout: timeout })
+}
+fn Channel.setup_pipes(&mut self) Result<void, wire.Error> {
+    match &mut self.output {
+        Some(pipe) => {
+            match pipe.set_nonblocking(true) { Ok(_) => {}
+                Err(error) => { return Err(io_failure(error)) } }
+            match pipe.register(&mut self.poll) { Ok(value) => { self.output_token = Some(value) }
+                Err(error) => { return Err(io_failure(error)) } }
+        }
+        None => { self.output_eof = true }
+    }
+    match &mut self.errors {
+        Some(pipe) => {
+            match pipe.set_nonblocking(true) { Ok(_) => {}
+                Err(error) => { return Err(io_failure(error)) } }
+            match pipe.register(&mut self.poll) { Ok(value) => { self.errors_token = Some(value) }
+                Err(error) => { return Err(io_failure(error)) } }
+        }
+        None => { self.errors_eof = true }
+    }
+    return Ok(())
+}
+fn Channel.drain(&mut self) Result<void, wire.Error> {
+    var scratch = bytes(8192)
+    var turns: usize = 0
+    match &mut self.output {
+        Some(pipe) => {
+            for !self.output_eof && turns < 32 {
+                turns = turns + 1
+                match pipe.read(scratch.as_mut_slice()) {
+                    Ok(count) => {
+                        if count == 0 {
+                            self.output_eof = true
+                            match self.output_token {
+                                Some(token) => { self.output_token = None
+                                    match pipe.deregister(&mut self.poll, token) { Ok(_) => {}
+                                        Err(error) => { return Err(io_failure(error)) } }
+                                }
+                                None => {}
+                            }
+                        } else {
+                            for byte in &scratch.as_slice()[..count] { self.stdout.push(byte) }
+                        }
+                    }
+                    Err(error) => {
+                        match error.kind { io.ErrorKind.WouldBlock => { break }
+                            _ => { return Err(io_failure(error)) } }
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    turns = 0
+    match &mut self.errors {
+        Some(pipe) => {
+            for !self.errors_eof && turns < 32 {
+                turns = turns + 1
+                match pipe.read(scratch.as_mut_slice()) {
+                    Ok(count) => {
+                        if count == 0 {
+                            self.errors_eof = true
+                            match self.errors_token {
+                                Some(token) => { self.errors_token = None
+                                    match pipe.deregister(&mut self.poll, token) { Ok(_) => {}
+                                        Err(error) => { return Err(io_failure(error)) } }
+                                }
+                                None => {}
+                            }
+                        } else {
+                            for byte in &scratch.as_slice()[..count] { self.stderr.push(byte) }
+                        }
+                    }
+                    Err(error) => {
+                        match error.kind { io.ErrorKind.WouldBlock => { break }
+                            _ => { return Err(io_failure(error)) } }
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    return Ok(())
+}
+fn Channel.wait_io(&mut self, start time.Instant) Result<void, wire.Error> {
+    remaining := self.timeout - try elapsed(start)
+    if remaining <= 0 { return Err(wire.fail("TIMEOUT", "transport", "link deadline exceeded")) }
+    var events: Vec<net.Event> = Vec.new()
+    events.push(net.Event.empty())
+    events.push(net.Event.empty())
+    events.push(net.Event.empty())
+    match self.poll.wait(events.as_mut_slice(), remaining) {
+        Ok(count) => { if count == 0 { return Err(wire.fail("TIMEOUT", "transport", "link deadline exceeded")) } }
+        Err(error) => { return Err(io_failure(error)) }
+    }
+    try self.drain()
+    return Ok(())
+}
+pub fn Channel.send(&mut self, record &string) Result<void, wire.Error> {
+    if record.len() > 1048576 { return Err(wire.fail("INVALID_REQUEST", "protocol", "request budget exceeded")) }
+    line := record.clone() + "\n"
+    start := try now()
+    match self.poll.modify_unix(&self.socket, self.token, net.Interest.Writable) {
+        Ok(_) => {}
+        Err(error) => { return Err(io_failure(error)) }
+    }
+    var offset: usize = 0
+    for offset < line.len() {
+        if try elapsed(start) >= self.timeout { return Err(wire.fail("TIMEOUT", "transport", "send deadline exceeded")) }
+        match self.socket.write(&line.bytes()[offset..]) {
+            Ok(count) => {
+                if count == 0 { return Err(wire.fail("CONNECTION_LOST", "transport", "zero-byte link write")) }
+                offset = offset + count
+            }
+            Err(error) => {
+                match error.kind { io.ErrorKind.WouldBlock => { try self.wait_io(start) }
+                    _ => { return Err(io_failure(error)) } }
+            }
+        }
+    }
+    match self.poll.modify_unix(&self.socket, self.token, net.Interest.Readable) {
+        Ok(_) => {}
+        Err(error) => { return Err(io_failure(error)) }
+    }
+    return Ok(())
+}
+pub fn Channel.receive(&mut self) Result<json.Value, wire.Error> {
+    var start = try now()
+    var scratch = bytes(8192)
+    for {
+        var index: usize = 0
+        var found = false
+        for byte in self.buffer.as_slice() {
+            if byte == 10 { found = true
+                break }
+            index = index + 1
+        }
+        if found {
+            var text = ""
+            match string.from_utf8(&self.buffer.as_slice()[..index]) {
+                Some(value) => { text = value }
+                None => { return Err(wire.fail("INVALID_RESPONSE", "protocol", "response is not UTF-8")) }
+            }
+            var rest: Vec<u8> = Vec.new()
+            for byte in &self.buffer.as_slice()[index + 1..] { rest.push(byte) }
+            self.buffer = rest
+            return wire.parse(&text, 2097152)
+        }
+        if try elapsed(start) >= self.timeout { return Err(wire.fail("TIMEOUT", "transport", "receive deadline exceeded")) }
+        try self.drain()
+        match self.socket.read(scratch.as_mut_slice()) {
+            Ok(count) => {
+                if count == 0 { return Err(wire.fail("CONNECTION_LOST", "transport", "development link closed before a complete response")) }
+                if self.buffer.len() + count > 2097152 { return Err(wire.fail("INVALID_RESPONSE", "protocol", "response budget exceeded")) }
+                for byte in &scratch.as_slice()[..count] { self.buffer.push(byte) }
+                // Match Python socket.settimeout: progress resets recv's idle timeout.
+                start = try now()
+            }
+            Err(error) => {
+                match error.kind { io.ErrorKind.WouldBlock => { try self.wait_io(start) }
+                    _ => { return Err(io_failure(error)) } }
+            }
+        }
+    }
+}
+pub fn Channel.request(&mut self, method &string, params &json.Value) Result<json.Value, wire.Error> {
+    self.sequence = self.sequence + 1
+    // Session-specific namespace prevents collisions with numeric raw-launcher IDs.
+    id := "launcher_" + &wire.field_text(&self.ready, "session_id") + "_" + &string.from_u64(self.sequence)
+    var request = wire.object()
+    wire.put(&mut request, "version", wire.number(1))
+    wire.put(&mut request, "request_id", json.Value.Text(id.clone()))
+    wire.put(&mut request, "method", json.Value.Text(method.clone()))
+    wire.put(&mut request, "params", params.clone())
+    try self.send(&json.encode(&request))
+    reply := try self.receive()
+    if wire.field_text(&reply, "request_id") != id { return Err(wire.fail("INVALID_RESPONSE", "protocol", "out-of-order response")) }
+    result := wire.get(&reply, "result")
+    if result.bool("closed").unwrap_or(false) { self.closed = true }
+    return Ok(reply)
+}
+fn Channel.bootstrap(&mut self) Result<void, wire.Error> {
+    try self.setup_pipes()
+    self.ready = try self.receive()
+    if wire.field_text(&self.ready, "event") != "ready" || wire.field_text(&self.ready, "session_id").is_empty() {
+        return Err(wire.fail("LAUNCH_FAILED", "launch", "development session did not become ready"))
+    }
+    var params = wire.object()
+    wire.put(&mut params, "session_id", wire.get(&self.ready, "session_id"))
+    authorized := try self.request("session.authorize", &params)
+    if !wire.get(&authorized, "error").is_null() {
+        return Err(wire.fail("UNAUTHORIZED", "authorization", "development session refused authorization"))
+    }
+    return Ok(())
+}
+fn observe(child &mut process.Process, link &mut Channel, timeout i32) Result<bool, wire.Error> {
+    start := try now()
+    for {
+        try link.drain()
+        match child.try_wait() {
+            Ok(Some(_)) => { return Ok(true) }
+            Ok(None) => {}
+            Err(error) => { return Err(wire.native("shutdown", error)) }
+        }
+        remaining := timeout - try elapsed(start)
+        if remaining <= 0 { return Ok(false) }
+        var step = remaining
+        if step > 20 { step = 20 }
+        match child.wait_timeout(step) {
+            Ok(Some(_)) => { return Ok(true) }
+            Ok(None) => {}
+            Err(error) => { return Err(wire.native("shutdown", error)) }
+        }
+    }
+}
+struct Completion { status process.ExitStatus
+    forced bool
+    failure Option<wire.Error> }
+fn finish(owned process.Process, link &mut Channel, grace i32, allow_close bool, failed bool) Result<Completion, wire.Error> {
+    var child = owned
+    var failure: Option<wire.Error> = None
+    var done = false
+    var forced = false
+    if !failed && !link.closed && allow_close {
+        var target = wire.object()
+        wire.put(&mut target, "window_id", json.Value.Text("main"))
+        match link.request("ui.close", &target) {
+            Ok(reply) => { if !wire.get(&reply, "error").is_null() {
+                    failure = Some(wire.fail("SHUTDOWN_FAILED", "shutdown", "native close was refused")) } }
+            Err(error) => { failure = Some(error) }
+        }
+    }
+    var wait_for: i32 = 0
+    if link.closed { wait_for = grace }
+    match observe(&mut child, link, wait_for) {
+        Ok(value) => { done = value }
+        Err(error) => { failure = Some(error) }
+    }
+    if !done {
+        forced = true
+        // Deliberately do not `try`: any error must still reach kill + wait.
+        match child.terminate() { Ok(_) => {}
+            Err(error) => { failure = Some(wire.native("shutdown", error)) } }
+        match observe(&mut child, link, grace) {
+            Ok(value) => { done = value }
+            Err(error) => { failure = Some(error) }
+        }
+        if !done {
+            match child.kill() { Ok(_) => {}
+                Err(error) => { failure = Some(wire.native("shutdown", error)) } }
+        }
+    }
+    // Consuming wait is the unique reap. A live child was explicitly signalled.
+    var status: process.ExitStatus
+    match child.wait() { Ok(value) => { status = value }
+        Err(error) => { return Err(wire.native("shutdown", error)) } }
+    // Drain remaining bytes without a blocking communicate/read_all. Descendant
+    // pipe writers cannot extend this deadline; dropping the link closes them.
+    match now() {
+        Ok(start) => {
+            for !link.output_eof || !link.errors_eof {
+                match link.drain() { Ok(_) => {}
+                    Err(error) => { failure = Some(error)
+                        break } }
+                match elapsed(start) {
+                    Ok(ms) => { if ms >= grace {
+                            failure = Some(wire.fail("TIMEOUT", "shutdown", "child output did not reach EOF"))
+                            break } }
+                    Err(error) => { failure = Some(error)
+                        break }
+                }
+                match time.sleep_blocking(time.Duration.milliseconds(1)) { Ok(_) => {}
+                    Err(error) => { failure = Some(wire.native("shutdown", error))
+                        break } }
+            }
+        }
+        Err(error) => { failure = Some(error) }
+    }
+    return Ok(Completion { status: status, forced: forced, failure: failure })
+}
+pub fn run(config &Config, body mut fn(&mut Channel) Result<void, wire.Error>) Result<Outcome, wire.Error> {
+    var pair: net.UnixPair
+    match net.UnixStream.pair() { Ok(value) => { pair = value }
+        Err(error) => { return Err(wire.native("launch", error)) } }
+    var link = try Channel.new(pair.first, config.io_timeout)
+    var launched: process.Child
+    match process.Command.new(config.binary.clone())
+        .env("LD_LIBRARY_PATH", config.library_path.clone())
+        .env("TARN_UI_DEV_FD", "3")
+        .env("TARN_UI_DEV_ALLOW", config.grants.clone())
+        .env("TARN_UI_DEV_TEXT", flag(config.allow_text))
+        .env("TARN_UI_DEV_CAPTURE", flag(config.allow_capture))
+        .stdin(process.Stdio.Null).stdout(process.Stdio.Piped).stderr(process.Stdio.Piped)
+        .pass(pair.second).start_child() {
+        Ok(value) => { launched = value }
+        Err(error) => { return Err(wire.native("launch", error)) }
+    }
+    child := launched.process
+    link.output = launched.stdout
+    link.errors = launched.stderr
+    var failure: Option<wire.Error> = None
+    match link.bootstrap() {
+        Ok(_) => { match body(&mut link) { Ok(_) => {}
+                Err(error) => { failure = Some(error) } } }
+        Err(error) => { failure = Some(error) }
+    }
+    // No `try` above this point after child creation. Cleanup happens even when
+    // setup, ready, authorization, callbacks or transport operations failed.
+    completion := try finish(child, &mut link, config.close_timeout,
+        string.contains(&("," + &config.grants + ","), ",close,"), failure.is_some())
+    if failure.is_none() { failure = completion.failure }
+    return Ok(Outcome { failure: failure, status: completion.status,
+            forced_cleanup: completion.forced, stdout: link.stdout, stderr: link.stderr })
+}

@@ -1,0 +1,27 @@
+// Deliberately does not answer the inherited protocol endpoint.
+import "os"
+import "console"
+import "time"
+fn main() {
+    var mode = "early"
+    match os.env("TARN_UI_LAUNCHER_FIXTURE") {
+        Ok(Some(value)) => { mode = value }
+        Ok(None) => {}
+        Err(_) => { os.exit(90)
+            return }
+    }
+    if mode == "silent" {
+        match time.sleep_blocking(time.Duration.seconds(30)) { Ok(_) => {}
+            Err(_) => { os.exit(91) } }
+        return
+    }
+    var output = console.stdout()
+    var errors = console.stderr()
+    match output.write_text("CHILD_STDOUT_MARKER\n") { Ok(_) => {}
+        Err(_) => { os.exit(92)
+            return } }
+    match errors.write_text("CHILD_STDERR_MARKER\n") { Ok(_) => {}
+        Err(_) => { os.exit(93)
+            return } }
+    os.exit(23)
+}

@@ -11,6 +11,8 @@ if [[ ${1:-} == --dev ]]; then
     flags=(-DTARN_UI_DEVTOOLS)
     packages+=(json-glib-1.0)
 fi
+build="${TARN_UI_BUILD_DIR:-$build}"
+[[ $build == /* ]] || { echo 'TARN_UI_BUILD_DIR must be absolute' >&2; exit 2; }
 compiler="${TARN_BIN:-$root/.build/verified-da3173c/debug/tarn}"
 bash "$root/scripts/checkout-tarn.sh"
 mkdir -p "$build/source/core"
@@ -32,11 +34,11 @@ LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" \
         "$compiler" "$build/libtarn_ui_gtk.so"
     sha256sum "$root/examples/counter/counter.tarn" "$root/examples/counter/main.tarn"
     if [[ ${1:-} == --dev ]]; then sha256sum "$root/backends/linux/gtk/devtools.inc"; fi
-    printf 'ABI=3\nLIBRARY_PATH=%s\nLD_LIBRARY_PATH=%s\n' "$build" "$build"
+    printf 'ABI=4\nLIBRARY_PATH=%s\nLD_LIBRARY_PATH=%s\n' "$build" "$build"
 } > "$build/provenance.txt"
 printf 'Built %s\n' "$build/counter"
 if [[ ${1:-} == --dev ]]; then
-    printf 'Launch explicitly: python3 scripts/run-dev-counter.py --allow inspect click close --allow-text\n'
+    printf 'Build launcher: bash scripts/build-launcher.sh; then .build/launcher/tarn-ui --allow inspect click close --allow-text\n'
 else
     printf 'Run: bash scripts/run-counter.sh\n'
 fi

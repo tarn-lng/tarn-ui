@@ -6,6 +6,7 @@ extern "C" fn tarn_ui_gtk_create(title *u8, heading *u8, out *mut *mut NativeSes
 extern "C" fn tarn_ui_gtk_next(raw *mut NativeSession) i32
 extern "C" fn tarn_ui_gtk_request_close(raw *mut NativeSession) i32
 extern "C" fn tarn_ui_gtk_release(raw *mut NativeSession) i32
+extern "C" fn tarn_ui_gtk_finish(raw *mut NativeSession, application_error i32) i32
 extern "C" fn tarn_ui_gtk_enable_counter(raw *mut NativeSession, value i64) i32
 extern "C" fn tarn_ui_gtk_set_counter(raw *mut NativeSession, value i64) i32
 extern "C" fn tarn_ui_gtk_complete_event(raw *mut NativeSession, status i32) i32
@@ -30,7 +31,7 @@ fn c_string(text &string) Result<ffi.CString, Error> {
 pub unsafe fn run(title string, heading string,
     body mut fn(&mut Session) Result<void, Error>) Result<void, Error> {
     unsafe {
-        if tarn_ui_gtk_abi() != 3 { return Err(Error{code: 7}) }
+        if tarn_ui_gtk_abi() != 4 { return Err(Error{code: 7}) }
     }
     c_title := try c_string(&title)
     c_heading := try c_string(&heading)
@@ -43,9 +44,18 @@ pub unsafe fn run(title string, heading string,
     var session = Session{native: raw}
     result := body(&mut session)
     // Store the result before cleanup; never `try` past this release.
-    unsafe { status = tarn_ui_gtk_release(session.native) }
-    if status != 0 { return Err(Error{code: status}) }
-    return result
+    match result {
+        Ok(_) => {
+            unsafe { status = tarn_ui_gtk_finish(session.native, 0) }
+            if status != 0 { return Err(Error{code: status}) }
+            return Ok(())
+        }
+        Err(error) => {
+            unsafe { status = tarn_ui_gtk_finish(session.native, error.code) }
+            if status != 0 { return Err(Error{code: status}) }
+            return Err(error)
+        }
+    }
 }
 
 pub fn Session.next_event(&mut self) Result<Event, Error> {

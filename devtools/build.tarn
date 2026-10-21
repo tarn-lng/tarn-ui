@@ -1,0 +1,134 @@
+// Fixed project recipe. No request can supply a command, argument or source path.
+import "process"
+import "process_run"
+import "fs"
+import "path"
+import "string"
+import "json"
+import "time"
+import "io"
+import "wire"
+
+pub struct Config { pub root string
+    pub compiler string }
+fn mkdir(directory &string) Result<void, wire.Error> {
+    match fs.create_dir(directory) { Ok(_) => { return Ok(()) }
+        Err(error) => { match error.kind { io.ErrorKind.AlreadyExists => {
+            match fs.metadata(directory) { Ok(info) => { if info.is_dir { return Ok(()) } }
+                Err(problem) => { return Err(wire.native("build", problem)) } }
+        }
+            _ => {} }
+            return Err(wire.native("build", error)) } }
+}
+fn remaining(start time.Instant) Result<i32, wire.Error> {
+    match start.elapsed() { Ok(duration) => {
+        if duration.as_millis() >= 60000 { return Err(wire.fail("BUILD_FAILED", "build", "project deadline exceeded")) }
+        return Ok(60000 - i32(duration.as_millis()))
+    }
+        Err(error) => { return Err(wire.native("build", error)) } }
+}
+fn records(text &string) json.Value {
+    var values: Vec<json.Value> = Vec.new()
+    lines := string.lines(text)
+    for line in lines.as_slice() {
+        match json.parse(line) { Ok(value) => { values.push(value) }
+            Err(_) => { var value = wire.object()
+                wire.put(&mut value, "kind", json.Value.Text("unstructured_output"))
+                wire.put(&mut value, "text", json.Value.Text(line.clone()))
+                values.push(value) } }
+    }
+    return json.Value.List(values)
+}
+fn stage(command process.Command, start time.Instant, name &string) Result<json.Value, wire.Error> {
+    var output: process.Output
+    match process_run.run(command, try remaining(start)) { Ok(value) => { output = value }
+        Err(problem) => { var error = wire.fail("BUILD_FAILED", "build", "project command could not finish")
+            wire.put(&mut error.details, "command", json.Value.Text(name.clone()))
+            wire.put(&mut error.details, "cause", wire.error_value(&problem))
+            return Err(error) } }
+    stdout := string.from_utf8(output.stdout.as_slice()).unwrap_or("[non-UTF-8 build output]")
+    stderr := string.from_utf8(output.stderr.as_slice()).unwrap_or("[non-UTF-8 build output]")
+    var result = wire.object()
+    wire.put(&mut result, "command", json.Value.Text(name.clone()))
+    wire.put(&mut result, "exit_code", wire.number(i64(output.status.code().unwrap_or(-output.status.signal().unwrap_or(0)))))
+    wire.put(&mut result, "stdout", json.Value.Text(stdout.clone()))
+    wire.put(&mut result, "stderr", json.Value.Text(stderr))
+    wire.put(&mut result, "diagnostics", records(&stdout))
+    if !output.status.success() { var error = wire.fail("BUILD_FAILED", "build", "project command failed")
+        error.details = result
+        return Err(error) }
+    return Ok(result)
+}
+fn snapshot(root &string, output &string, source &string, target &string) Result<void, wire.Error> {
+    input := path.join(root, source)
+    var info: fs.Metadata
+    match fs.metadata(&input) { Ok(value) => { info = value }
+        Err(error) => { return Err(wire.native("build", error)) } }
+    if !info.is_file || info.len > 1048576 { return Err(wire.fail("BUILD_FAILED", "build", "source file budget exceeded")) }
+    var data: Vec<u8>
+    match fs.read(&input) { Ok(value) => { data = value }
+        Err(error) => { return Err(wire.native("build", error)) } }
+    destination := path.join(output, target)
+    match fs.write(&destination, data.as_slice()) { Ok(_) => { return Ok(()) }
+        Err(error) => { return Err(wire.native("build", error)) } }
+}
+pub fn run(config &Config) Result<json.Value, wire.Error> {
+    if !path.is_absolute(&config.root) || !path.is_absolute(&config.compiler) {
+        return Err(wire.fail("BUILD_FAILED", "build", "project root and compiler must be absolute startup paths"))
+    }
+    var start: time.Instant
+    match time.Instant.now() { Ok(value) => { start = value }
+        Err(error) => { return Err(wire.native("build", error)) } }
+    base := path.join(&config.root, ".build")
+    try mkdir(&base)
+    builds := path.join(&base, "project-builds")
+    try mkdir(&builds)
+    var timestamp: time.Timestamp
+    match time.now_utc() { Ok(value) => { timestamp = value }
+        Err(error) => { return Err(wire.native("build", error)) } }
+    stem := string.from_i64(timestamp.unix_seconds) + "_" + &string.from_u64(u64(timestamp.nanos))
+    var output = ""
+    var index: u64 = 0
+    for index < 100 {
+        candidate := path.join(&builds, &(stem.clone() + "_" + &string.from_u64(index)))
+        match fs.create_dir(&candidate) { Ok(_) => { output = candidate
+            break }
+            Err(error) => { match error.kind { io.ErrorKind.AlreadyExists => { index = index + 1 }
+                _ => { return Err(wire.native("build", error)) } } } }
+    }
+    if output.is_empty() { return Err(wire.fail("BUILD_FAILED", "build", "build directory collision budget exceeded")) }
+    try mkdir(&path.join(&output, "source"))
+    try mkdir(&path.join(&output, "source/core"))
+    try mkdir(&path.join(&output, "native"))
+    try snapshot(&config.root, &output, "core/session.tarn", "source/core/session.tarn")
+    try snapshot(&config.root, &output, "examples/counter/main.tarn", "source/main.tarn")
+    try snapshot(&config.root, &output, "examples/counter/counter.tarn", "source/counter.tarn")
+    try snapshot(&config.root, &output, "backends/linux/gtk/bridge.c", "native/bridge.c")
+    try snapshot(&config.root, &output, "backends/linux/gtk/bridge.h", "native/bridge.h")
+    try snapshot(&config.root, &output, "backends/linux/gtk/devtools.inc", "native/devtools.inc")
+    try stage(process.Command.new("pkg-config").arg("--atleast-version=1.10").arg("json-glib-1.0"), start, "json-glib-version")
+    flags_result := try stage(process.Command.new("pkg-config").arg("--cflags").arg("--libs").arg("gtk4").arg("json-glib-1.0"), start, "pkg-config")
+    flags_text := wire.field_text(&flags_result, "stdout")
+    flags := string.fields(&flags_text)
+    var native = process.Command.new("cc").arg("-std=c11").arg("-Wall").arg("-Wextra").arg("-Werror")
+        .arg("-fPIC").arg("-shared").arg("-DTARN_UI_DEVTOOLS").arg(path.join(&output, "native/bridge.c"))
+        .arg("-o").arg(path.join(&output, "libtarn_ui_gtk.so"))
+    for flag in flags.as_slice() {
+        if string.contains(flag, "'") || string.contains(flag, "\"") || string.contains(flag, "\\") {
+            return Err(wire.fail("BUILD_FAILED", "build", "quoted SDK flags require an explicit supported tokenizer"))
+        }
+        native = native.arg(flag.clone())
+    }
+    try stage(native, start, "cc")
+    binary := path.join(&output, "counter")
+    compiler_result := try stage(process.Command.new(config.compiler.clone()).arg("build")
+        .arg(path.join(&output, "source/main.tarn")).arg("--link").arg("tarn_ui_gtk")
+        .arg("-o").arg(binary.clone()).arg("--json").env("LIBRARY_PATH", output.clone()), start, "tarn")
+    var result = wire.object()
+    wire.put(&mut result, "binary", json.Value.Text(binary))
+    wire.put(&mut result, "library_path", json.Value.Text(output))
+    wire.put(&mut result, "exit_code", wire.number(0))
+    wire.put(&mut result, "diagnostics", wire.get(&compiler_result, "diagnostics"))
+    wire.put(&mut result, "backend", json.Value.Text("gtk4"))
+    return Ok(result)
+}

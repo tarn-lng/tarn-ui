@@ -1,0 +1,253 @@
+// Independent stdio MCP client. Tests the native launcher executable, not a
+// mock dispatch function. Child protocol output is never forwarded to stdout.
+import "process"
+import "net"
+import "io"
+import "time"
+import "json"
+import "string"
+import "os"
+
+struct Client { child process.Child
+    buffer Vec<u8> }
+fn bad() io.Error { return io.Error.new(io.ErrorKind.InvalidData) }
+fn get(value &json.Value, name &string) json.Value { return value.get(name).unwrap_or(json.Value.Null) }
+fn Client.send(&mut self, text &string) Result<void, io.Error> {
+    record := text.clone() + "\n"
+    match &mut self.child.stdin {
+        Some(pipe) => { return pipe.write_all(record.bytes()) }
+        None => { return Err(bad()) }
+    }
+}
+fn Client.read(&mut self) Result<json.Value, io.Error> {
+    var poller = try net.Poll.new()
+    match &mut self.child.stdout {
+        Some(pipe) => { try pipe.set_nonblocking(true)
+            try pipe.register(&mut poller) }
+        None => { return Err(bad()) }
+    }
+    start := try time.Instant.now()
+    var scratch: Vec<u8> = Vec.new()
+    var position: usize = 0
+    for position < 8192 { scratch.push(0)
+        position = position + 1 }
+    for {
+        position = 0
+        var found = false
+        for byte in self.buffer.as_slice() {
+            if byte == 10 { found = true
+                break }
+            position = position + 1
+        }
+        if found {
+            text := try string.from_utf8(&self.buffer.as_slice()[..position]).ok_or(bad())
+            var rest: Vec<u8> = Vec.new()
+            for byte in &self.buffer.as_slice()[position + 1..] { rest.push(byte) }
+            self.buffer = rest
+            // A diagnostic marker or any non-JSON child output makes this fail.
+            match json.parse(&text) { Ok(value) => { return Ok(value) }
+                Err(_) => { return Err(bad()) } }
+        }
+        duration := try start.elapsed()
+        if duration.as_millis() >= 10000 { return Err(io.Error.new(io.ErrorKind.TimedOut)) }
+        var count: usize = 0
+        var blocked = false
+        match &mut self.child.stdout {
+            Some(pipe) => {
+                match pipe.read(scratch.as_mut_slice()) {
+                    Ok(value) => { count = value }
+                    Err(error) => { match error.kind { io.ErrorKind.WouldBlock => { blocked = true }
+                            _ => { return Err(error) } } }
+                }
+            }
+            None => { return Err(bad()) }
+        }
+        if blocked {
+            var events: Vec<net.Event> = Vec.new()
+            events.push(net.Event.empty())
+            try poller.wait(events.as_mut_slice(), 10000 - i32(duration.as_millis()))
+            continue
+        }
+        if count == 0 { return Err(io.Error.new(io.ErrorKind.UnexpectedEof)) }
+        if self.buffer.len() + count > 8388608 { return Err(io.Error.new(io.ErrorKind.LimitExceeded)) }
+        for byte in &scratch.as_slice()[..count] { self.buffer.push(byte) }
+    }
+}
+fn Client.ask(&mut self, record &string, id &string) Result<json.Value, io.Error> {
+    try self.send(record)
+    reply := try self.read()
+    if reply.text("jsonrpc").unwrap_or("") != "2.0" || reply.text("id").unwrap_or("") != id.clone() { return Err(bad()) }
+    return Ok(reply)
+}
+fn data(reply &json.Value) Result<json.Value, io.Error> {
+    result := get(reply, "result")
+    if result.bool("isError").unwrap_or(true) { return Err(bad()) }
+    return Ok(get(&result, "structuredContent"))
+}
+fn Client.call(&mut self, id &string, name &string, arguments &json.Value) Result<json.Value, io.Error> {
+    var writer = json.Writer.new()
+    writer.begin_object()
+    writer.field_string("jsonrpc", "2.0")
+    writer.field_string("id", id)
+    writer.field_string("method", "tools/call")
+    writer.key("params")
+    writer.begin_object()
+    writer.field_string("name", name)
+    writer.key("arguments")
+    writer.value(arguments)
+    writer.end_object()
+    writer.end_object()
+    return self.ask(&writer.finish(), id)
+}
+fn counter(node &json.Value) Option<i64> {
+    if node.text("id").unwrap_or("") == "counter" {
+        return string.parse_i64(&node.text("text").unwrap_or(""))
+    }
+    children := get(node, "children").into_list()
+    for item in children.as_slice() {
+        match counter(item) { Some(value) => { return Some(value) }
+            None => {} }
+    }
+    return None
+}
+fn protocol(client &mut Client, scenario &string) Result<bool, io.Error> {
+    try client.send("{bad}")
+    malformed := try client.read()
+    if get(&malformed, "error").i64("code").unwrap_or(0) != -32700 || !get(&malformed, "id").is_null() { return Ok(false) }
+    try client.send("{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"method\":\"ping\",\"jsonrpc,id\":1}")
+    unexpected := try client.read()
+    if get(&unexpected, "error").i64("code").unwrap_or(0) != -32600 { return Ok(false) }
+    try client.send("{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"method\":\"ping\",\"method\":\"ping\"}")
+    duplicate := try client.read()
+    if get(&duplicate, "error").i64("code").unwrap_or(0) != -32700 { return Ok(false) }
+    premature := try client.ask("{\"jsonrpc\":\"2.0\",\"id\":\"before\",\"method\":\"tools/list\"}", "before")
+    if get(&premature, "error").i64("code").unwrap_or(0) != -32002 { return Ok(false) }
+    initialized := try client.ask("{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"tarn-acceptance\",\"version\":\"1\"}}}", "init")
+    if get(&initialized, "result").text("protocolVersion").unwrap_or("") != "2025-11-25" { return Ok(false) }
+    try client.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+    try client.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"x\"}}")
+    listed := try client.ask("{\"jsonrpc\":\"2.0\",\"id\":\"list\",\"method\":\"tools/list\"}", "list")
+    tools := get(&get(&listed, "result"), "tools").into_list()
+    var expected_tools: usize = 6
+    if scenario == &"restricted" { expected_tools = 3 }
+    if tools.len() != expected_tools { return Ok(false) }
+    denied := try client.call("denied", "project.build", &json.Value.Object(Vec.new()))
+    if get(&denied, "error").i64("code").unwrap_or(0) != -32602 { return Ok(false) }
+    var empty_members: Vec<json.Member> = Vec.new()
+    empty := json.Value.Object(empty_members)
+    if scenario == &"restricted" {
+        for item in tools.as_slice() {
+            name := item.text("name").unwrap_or("")
+            if name == "ui.click" || name == "ui.screenshot" || name == "ui.diagnostics" { return Ok(false) }
+        }
+        forbidden := try client.call("capture", "ui.screenshot", &empty)
+        return Ok(get(&forbidden, "error").i64("code").unwrap_or(0) == -32602)
+    }
+    started := try client.call("start", "ui.start", &empty)
+    if scenario != &"normal" {
+        result := get(&started, "result")
+        if !result.bool("isError").unwrap_or(false) { return Ok(false) }
+        error := get(&get(&result, "structuredContent"), "error")
+        details := get(&error, "details")
+        if scenario == &"early" {
+            return Ok(error.text("code").unwrap_or("") == "CONNECTION_LOST" &&
+                    details.i64("native_exit").unwrap_or(0) == 23 && !details.bool("forced_cleanup").unwrap_or(true))
+        }
+        return Ok(error.text("code").unwrap_or("") == "TIMEOUT" &&
+                details.i64("native_exit").unwrap_or(0) == -15 && details.bool("forced_cleanup").unwrap_or(false))
+    }
+    ready := try data(&started)
+    if ready.text("event").unwrap_or("") != "ready" { return Ok(false) }
+    first := try data(&try client.call("inspect", "ui.inspect", &empty))
+    before := try counter(&get(&first, "root")).ok_or(bad())
+    var click: json.Value
+    match json.parse("{\"element_id\":\"increment\"}") { Ok(value) => { click = value }
+        Err(_) => { return Err(bad()) } }
+    applied := try data(&try client.call("click", "ui.click", &click))
+    after := try data(&try client.call("after", "ui.inspect", &empty))
+    if counter(&get(&after, "root")).unwrap_or(-1) != before + 1 ||
+        after.u64("revision").unwrap_or(0) < applied.u64("revision").unwrap_or(1) { return Ok(false) }
+    var capture_writer = json.Writer.new()
+    capture_writer.begin_object()
+    capture_writer.field_u64("min_revision", applied.u64("revision").unwrap_or(1))
+    capture_writer.end_object()
+    var capture_args: json.Value
+    match json.parse(&capture_writer.finish()) { Ok(value) => { capture_args = value }
+        Err(_) => { return Err(bad()) } }
+    captured := try client.call("capture", "ui.screenshot", &capture_args)
+    image := try data(&captured)
+    content := get(&get(&captured, "result"), "content").into_list()
+    if content.len() != 2 || image.text("format").unwrap_or("") != "png" ||
+        image.u64("width").unwrap_or(0) == 0 || image.u64("height").unwrap_or(0) == 0 ||
+        image.u64("revision").unwrap_or(0) < applied.u64("revision").unwrap_or(1) ||
+        image.text("sha256").unwrap_or("").len() != 64 { return Ok(false) }
+    encoded := image.text("data_base64").unwrap_or("")
+    if !string.starts_with(&encoded, "iVBORw0KGgo") ||
+        content.as_slice()[1].text("data").unwrap_or("") != encoded { return Ok(false) }
+    closed := try data(&try client.call("close", "ui.close", &empty))
+    ping := try client.ask("{\"jsonrpc\":\"2.0\",\"id\":\"done\",\"method\":\"ping\"}", "done")
+    return Ok(closed.bool("closed").unwrap_or(false) && get(&ping, "error").is_null())
+}
+fn cleanup(owned process.Child) Result<process.Output, io.Error> {
+    match owned.stdin { Some(pipe) => { pipe.close() }
+        None => {} }
+    var child = process.Child { stdin: None, stdout: owned.stdout, stderr: owned.stderr, process: owned.process }
+    var done = false
+    match child.process.wait_timeout(3000) { Ok(Some(_)) => { done = true }
+        _ => {} }
+    if !done {
+        match child.process.kill() { Ok(_) => {}
+            Err(_) => {} }
+    }
+    input_bytes: Vec<u8> := Vec.new()
+    return child.communicate(input_bytes)
+}
+fn run_case(launcher &string, binary &string, library_path &string, scenario &string) Result<bool, io.Error> {
+    var deadline = "5000"
+    if scenario == &"silent" { deadline = "200" }
+    var command = process.Command.new(launcher.clone())
+        .arg("--mode").arg("mcp").arg("--allow").arg("inspect").arg("close")
+    if scenario != &"restricted" {
+        command = command.arg("click").arg("screenshot").arg("diagnostics").arg("--allow-text").arg("--allow-capture")
+    }
+    command = command
+        .arg("--binary").arg(binary.clone()).arg("--library-path").arg(library_path.clone())
+        .arg("--io-timeout-ms").arg(deadline)
+        .env("TARN_UI_LAUNCHER_FIXTURE", scenario.clone())
+        .stdin(process.Stdio.Piped).stdout(process.Stdio.Piped).stderr(process.Stdio.Piped)
+    child := try command.start_child()
+    var client = Client { child: child, buffer: Vec.new() }
+    var passed = false
+    match protocol(&mut client, scenario) { Ok(value) => { passed = value }
+        Err(_) => {} }
+    if !client.buffer.is_empty() { passed = false }
+    output := try cleanup(client.child)
+    return Ok(passed && output.status.success() && output.stdout.is_empty() && output.stderr.is_empty())
+}
+fn report(name &string, result Result<bool, io.Error>) bool {
+    var passed = false
+    var writer = json.Writer.new()
+    writer.begin_object()
+    writer.field_string("test", name)
+    match result { Ok(value) => { passed = value }
+        Err(error) => { writer.field_i64("native_code", i64(error.native_code())) } }
+    writer.field_bool("passed", passed)
+    writer.end_object()
+    print(writer.finish())
+    return passed
+}
+fn main() {
+    var arguments: Vec<string>
+    match os.args() { Ok(value) => { arguments = value }
+        Err(_) => { os.exit(2)
+            return } }
+    args := arguments.as_slice()
+    if args.len() != 5 { os.exit(2)
+        return }
+    var passed = true
+    if !report("mcp_native_counter_capture_close", run_case(&args[1], &args[2], &args[3], "normal")) { passed = false }
+    if !report("mcp_early_exit_keeps_child_output_private", run_case(&args[1], &args[4], &args[3], "early")) { passed = false }
+    if !report("mcp_timeout_cleanup_is_explicit", run_case(&args[1], &args[4], &args[3], "silent")) { passed = false }
+    if !report("mcp_grants_limit_tool_discovery", run_case(&args[1], &args[4], &args[3], "restricted")) { passed = false }
+    if !passed { os.exit(1) }
+}

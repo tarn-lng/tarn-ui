@@ -8,23 +8,25 @@ import socket
 import subprocess
 import uuid
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class Session:
     def __init__(self, *, binary=None, allow=("inspect", "click", "close"),
-                 allow_text=False, authorize=True, env=None):
+                 allow_text=False, allow_capture=False, authorize=True, env=None):
         binary = Path(binary or ROOT / ".build/counter-dev/counter").resolve()
         self.sock, child = socket.socketpair()
         self.sock.settimeout(5)
         self.buffer = bytearray()
         self.forced_cleanup = False
+        self._shutdown = False
         child_env = os.environ.copy()
-        for key in ("TARN_UI_DEV_FD", "TARN_UI_DEV_ALLOW", "TARN_UI_DEV_TEXT"):
+        for key in ("TARN_UI_DEV_FD", "TARN_UI_DEV_ALLOW", "TARN_UI_DEV_TEXT", "TARN_UI_DEV_CAPTURE"):
             child_env.pop(key, None)
         child_env.update(env or {})
         child_env.update(LD_LIBRARY_PATH=str(binary.parent), TARN_UI_DEV_FD=str(child.fileno()),
-                         TARN_UI_DEV_ALLOW=",".join(allow), TARN_UI_DEV_TEXT="1" if allow_text else "0")
+                         TARN_UI_DEV_ALLOW=",".join(allow), TARN_UI_DEV_TEXT="1" if allow_text else "0",
+                         TARN_UI_DEV_CAPTURE="1" if allow_capture else "0")
         try:
             self.process = subprocess.Popen([str(binary)], env=child_env,
                                             pass_fds=(child.fileno(),), stdout=subprocess.PIPE,
@@ -42,8 +44,11 @@ class Session:
                 reply = self.request("session.authorize", {"session_id": self.ready["session_id"]})
                 if "error" in reply:
                     raise RuntimeError("development session refused authorization")
-        except BaseException:
+        except BaseException as error:
             self.shutdown()
+            error.native_exit = self.process.returncode
+            error.native_stdout = self.stdout
+            error.native_stderr = self.stderr
             raise
 
     def receive(self):
@@ -74,6 +79,9 @@ class Session:
 
     def shutdown(self):
         """Bounded cleanup. Forced cleanup is exposed, never counted as clean exit."""
+        if self._shutdown:
+            return
+        self._shutdown = True
         self.sock.close()
         if self.process.poll() is None:
             self.forced_cleanup = True

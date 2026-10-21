@@ -5,8 +5,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-from devtools.session import Session
+sys.path.insert(0, str(ROOT / "tests/devtools"))
+from reference_session import Session
 
 asan = subprocess.check_output(["cc", "-print-file-name=libasan.so"], text=True).strip()
 binary = ROOT / ".build/devtools-memory/counter"

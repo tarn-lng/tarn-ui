@@ -1,0 +1,183 @@
+// Native Tarn launcher. The child never inherits the launcher's protocol stdio.
+import "session"
+import "mcp"
+import "wire"
+import "json"
+import "console"
+import "os"
+import "path"
+import "string"
+
+struct Options { config session.Config
+    help bool
+    mode string }
+fn usage() string {
+    return "tarn-ui --allow inspect click close [screenshot diagnostics] [--allow-text] [--allow-capture] [--binary PATH] [--library-path DIR] [--mode protocol|mcp]\n"
+}
+fn argument(args &[]string, index usize) Result<string, wire.Error> {
+    if index >= args.len() { return Err(wire.fail("INVALID_ARGUMENT", "configuration", "missing option value")) }
+    return Ok(args[index].clone())
+}
+fn timeout_value(args &[]string, index usize) Result<i32, wire.Error> {
+    value := try argument(args, index)
+    match string.parse_u64(&value) {
+        Some(number) => { if number > 0 && number <= 60000 { return Ok(i32(number)) } }
+        None => {}
+    }
+    return Err(wire.fail("INVALID_ARGUMENT", "configuration", "timeout must be between 1 and 60000 milliseconds"))
+}
+fn options(args &[]string) Result<Options, wire.Error> {
+    var config = session.Config { binary: ".build/counter-dev/counter", library_path: "",
+        grants: "", allow_text: false, allow_capture: false, io_timeout: 5000, close_timeout: 3000 }
+    var mode = "protocol"
+    var index: usize = 1
+    var help = false
+    for index < args.len() {
+        option := args[index].clone()
+        index = index + 1
+        if option == "--help" { help = true
+            continue }
+        if option == "--allow-text" { config.allow_text = true
+            continue }
+        if option == "--allow-capture" { config.allow_capture = true
+            continue }
+        if option == "--mode" {
+            mode = try argument(args, index)
+            if mode != "protocol" && mode != "mcp" {
+                return Err(wire.fail("INVALID_ARGUMENT", "configuration", "mode must be protocol or mcp"))
+            }
+            index = index + 1
+            continue
+        }
+        if option == "--binary" { config.binary = try argument(args, index)
+            index = index + 1
+            continue }
+        if option == "--library-path" { config.library_path = try argument(args, index)
+            index = index + 1
+            continue }
+        if option == "--io-timeout-ms" { config.io_timeout = try timeout_value(args, index)
+            index = index + 1
+            continue }
+        if option == "--close-timeout-ms" { config.close_timeout = try timeout_value(args, index)
+            index = index + 1
+            continue }
+        if option == "--allow" {
+            start := index
+            for index < args.len() {
+                grant := args[index].clone()
+                if string.starts_with(&grant, "--") { break }
+                if grant != "inspect" && grant != "click" && grant != "close" &&
+                    grant != "screenshot" && grant != "diagnostics" {
+                    return Err(wire.fail("INVALID_ARGUMENT", "configuration", "unknown operation grant"))
+                }
+                if !config.grants.is_empty() { config.grants = config.grants + "," }
+                config.grants = config.grants + &grant
+                index = index + 1
+            }
+            if index == start { return Err(wire.fail("INVALID_ARGUMENT", "configuration", "--allow requires at least one operation")) }
+            continue
+        }
+        return Err(wire.fail("INVALID_ARGUMENT", "configuration", "unknown launcher option"))
+    }
+    if !help && config.grants.is_empty() {
+        return Err(wire.fail("INVALID_ARGUMENT", "configuration", "--allow is required"))
+    }
+    if config.library_path.is_empty() { config.library_path = path.parent(&config.binary).unwrap_or(".") }
+    return Ok(Options { config: config, help: help, mode: mode })
+}
+fn emit(output &mut console.Output, value &json.Value) Result<void, wire.Error> {
+    record := json.encode(value) + "\n"
+    match output.write_text(&record) { Ok(_) => { return Ok(()) }
+        Err(error) => { return Err(wire.native("output", error)) } }
+}
+fn serve(link &mut session.Channel) Result<void, wire.Error> {
+    var output = console.stdout()
+    var input = console.stdin().buffered()
+    try emit(&mut output, &link.ready)
+    for {
+        var line: string
+        match input.read_line(1048576) {
+            Ok(Some(value)) => { line = value }
+            Ok(None) => { return Ok(()) }
+            Err(error) => { return Err(wire.native("input", error)) }
+        }
+        // Raw protocol records retain their IDs and reach the native validator,
+        // including malformed records. The launcher never expands permissions.
+        try link.send(&line)
+        reply := try link.receive()
+        try emit(&mut output, &reply)
+        result := wire.get(&reply, "result")
+        if result.bool("closed").unwrap_or(false) { link.closed = true
+            return Ok(()) }
+    }
+}
+fn diagnostic(error &wire.Error) {
+    var output = console.stderr()
+    var record = wire.object()
+    wire.put(&mut record, "error", wire.error_value(error))
+    match emit(&mut output, &record) { Ok(_) => {}
+        Err(_) => {} }
+}
+fn outcome_diagnostic(error &wire.Error, outcome &session.Outcome, grants &string) {
+    var output = console.stderr()
+    var details = error.details.clone()
+    native_exit := outcome.status.code().unwrap_or(-outcome.status.signal().unwrap_or(0))
+    wire.put(&mut details, "native_exit", wire.number(i64(native_exit)))
+    wire.put(&mut details, "forced_cleanup", json.Value.Bool(outcome.forced_cleanup))
+    if string.contains(&("," + grants + ","), ",diagnostics,") {
+        wire.put(&mut details, "stdout", json.Value.Text(string.from_utf8(outcome.stdout.as_slice()).unwrap_or("[non-UTF-8 output]")))
+        wire.put(&mut details, "stderr", json.Value.Text(string.from_utf8(outcome.stderr.as_slice()).unwrap_or("[non-UTF-8 output]")))
+    }
+    var value = wire.object()
+    wire.put(&mut value, "code", json.Value.Text(error.code.clone()))
+    wire.put(&mut value, "stage", json.Value.Text(error.stage.clone()))
+    wire.put(&mut value, "message", json.Value.Text(error.message.clone()))
+    wire.put(&mut value, "details", details)
+    var record = wire.object()
+    wire.put(&mut record, "error", value)
+    match emit(&mut output, &record) { Ok(_) => {}
+        Err(_) => {} }
+}
+fn launch() u8 {
+    var arguments: Vec<string>
+    match os.args() {
+        Ok(value) => { arguments = value }
+        Err(error) => { diagnostic(&wire.native("configuration", error))
+            return 2 }
+    }
+    var selected: Options
+    match options(arguments.as_slice()) {
+        Ok(value) => { selected = value }
+        Err(error) => { diagnostic(&error)
+            return 2 }
+    }
+    if selected.help { var output = console.stdout()
+        match output.write_text(&usage()) { Ok(_) => { return 0 }
+            Err(_) => { return 1 } } }
+    if selected.mode == "mcp" {
+        match mcp.serve(&selected.config) {
+            Ok(status) => { return status }
+            Err(error) => { diagnostic(&error)
+                return 1 }
+        }
+    }
+    match session.run(&selected.config, fn(link &mut session.Channel) Result<void, wire.Error> {
+            return serve(link)
+    }) {
+        Ok(outcome) => {
+            match &outcome.failure { Some(error) => { outcome_diagnostic(error, &outcome, &selected.config.grants) }
+                None => {} }
+            if outcome.forced_cleanup { return 2 }
+            if outcome.failure.is_some() { return 1 }
+            if !outcome.status.success() { return 1 }
+            return 0
+        }
+        Err(error) => { diagnostic(&error)
+            return 1 }
+    }
+}
+fn main() {
+    status := launch()
+    // launch has returned: all scoped child/socket/pipe owners are already gone.
+    if status != 0 { os.exit(status) }
+}

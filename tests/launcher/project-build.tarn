@@ -1,0 +1,25 @@
+// Staged beside the ordinary devtools modules by test-project-build.sh.
+import "build"
+import "wire"
+import "json"
+import "console"
+import "os"
+fn run() Result<void, wire.Error> {
+    var args: Vec<string>
+    match os.args() { Ok(value) => { args = value }
+        Err(error) => { return Err(wire.native("arguments", error)) } }
+    config := build.Config { root: args.as_slice()[1].clone(), compiler: args.as_slice()[2].clone() }
+    result := try build.run(&config)
+    var output = console.stdout()
+    match output.write_text(&(json.encode(&result) + "\n")) { Ok(_) => { return Ok(()) }
+        Err(error) => { return Err(wire.native("output", error)) } }
+}
+fn main() {
+    match run() { Ok(_) => {}
+        Err(error) => {
+            var output = console.stderr()
+            match output.write_text(&(json.encode(&wire.error_value(&error)) + "\n")) { Ok(_) => {}
+                Err(_) => {} }
+            os.exit(1)
+        } }
+}

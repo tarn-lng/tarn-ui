@@ -1,4 +1,4 @@
-# Canal de desarrollo: fase 3
+# Canal de desarrollo GTK4
 
 La variante de desarrollo permite inspeccionar el árbol GTK real, activar el botón
 y cerrar la ventana. El estado del contador y el incremento siguen en Tarn.
@@ -8,15 +8,19 @@ El binario normal no contiene el transporte ni depende de JSON-GLib.
 
 ```bash
 TARN_SOURCE="$PWD/.build/tarn-source" bash scripts/build-counter.sh --dev
-python3 scripts/run-dev-counter.py --allow inspect click close --allow-text
+bash scripts/build-launcher.sh
+.build/launcher/tarn-ui --allow inspect click close --allow-text
 ```
 
 `TARN_SOURCE` selecciona el checkout limpio del commit fijado; puede omitirse si
 `../tarn` cumple esa condición. El compilador ya construido se selecciona con
 `TARN_BIN` o, por defecto, `.build/verified-da3173c/debug/tarn`. No se recompila ni
 modifica Tarn. Además de GTK4, la variante de desarrollo requiere JSON-GLib
-**1.10 o posterior** para el analizador JSON estricto. El lanzador usa Python 3
-y su biblioteca estándar.
+**1.10 o posterior** para el analizador JSON estricto. El lanzador usa Tarn y las
+APIs públicas de su biblioteca estándar. Su script de compilación usa `../tarn/target/debug/tarn` por defecto y requiere las
+correcciones hasta `39c4617` (ADR 0074); el ejemplo GTK conserva su pin independiente.
+Se requiere Linux 5.3 o posterior para la espera con pidfd. El [informe de
+migración](launcher-migration.md) detalla plazos, errores y resultados.
 
 El lanzador crea un `socketpair` Unix privado y entrega solo un extremo al hijo.
 No hay un puerto, listener, ruta pública de socket ni credencial en argumentos.
@@ -55,8 +59,11 @@ pueda recuperarse y los fallos terminales del canal usan `request_id:null`.
 El bootstrap reservado `session.authorize` acepta únicamente `session_id`.
 
 No se admiten campos adicionales, claves duplicadas, tipos incorrectos, UTF-8
-inválido, NUL, comentarios JSON ni versiones distintas de 1. No existen métodos
-de captura, escritura de texto, shell o reconstrucción. No se implementó MCP.
+inválido, NUL, comentarios JSON ni versiones distintas de 1. La captura se autoriza con `--allow screenshot --allow-capture`; recibe
+`window_id` y opcionalmente `min_revision`. Espera un frame real y devuelve PNG,
+dimensiones, revisión y hash. No existen métodos de escritura de texto, shell
+o reconstrucción. `--mode mcp` usa el adaptador MCP stdio en Tarn; consulta el
+[contrato y sus pruebas](launcher-migration.md#mcp-stdio-boundary).
 
 ### `ui.inspect`
 

@@ -1,0 +1,142 @@
+// Bounded direct-command execution for the fixed native build recipe.
+import "process"
+import "io"
+import "time"
+import "wire"
+
+struct Capture {
+    output Option<process.ChildStdout>
+    errors Option<process.ChildStderr>
+    stdout Vec<u8>
+    stderr Vec<u8>
+    output_eof bool
+    errors_eof bool
+}
+fn initialize(capture &mut Capture) Result<void, wire.Error> {
+    match &mut capture.output { Some(pipe) => {
+        match pipe.set_nonblocking(true) { Ok(_) => {}
+            Err(error) => { return Err(wire.native("build", error)) } }
+    }
+        None => { capture.output_eof = true } }
+    match &mut capture.errors { Some(pipe) => {
+        match pipe.set_nonblocking(true) { Ok(_) => {}
+            Err(error) => { return Err(wire.native("build", error)) } }
+    }
+        None => { capture.errors_eof = true } }
+    return Ok(())
+}
+fn drain(capture &mut Capture) Result<void, wire.Error> {
+    var scratch: Vec<u8> = Vec.new()
+    var index: usize = 0
+    for index < 8192 { scratch.push(0)
+        index = index + 1 }
+    var turns: usize = 0
+    match &mut capture.output {
+        Some(pipe) => { for !capture.output_eof && turns < 32 {
+            turns = turns + 1
+            match pipe.read(scratch.as_mut_slice()) {
+                Ok(count) => {
+                    if count == 0 { capture.output_eof = true }
+                    if capture.stdout.len() + count > 1048576 { return Err(wire.fail("BUILD_FAILED", "build", "compiler stdout budget exceeded")) }
+                    for byte in &scratch.as_slice()[..count] { capture.stdout.push(byte) }
+                }
+                Err(error) => { match error.kind { io.ErrorKind.WouldBlock => { break }
+                    _ => { return Err(wire.native("build", error)) } } }
+            }
+        } }
+        None => {}
+    }
+    turns = 0
+    match &mut capture.errors {
+        Some(pipe) => { for !capture.errors_eof && turns < 32 {
+            turns = turns + 1
+            match pipe.read(scratch.as_mut_slice()) {
+                Ok(count) => {
+                    if count == 0 { capture.errors_eof = true }
+                    if capture.stderr.len() + count > 1048576 { return Err(wire.fail("BUILD_FAILED", "build", "compiler stderr budget exceeded")) }
+                    for byte in &scratch.as_slice()[..count] { capture.stderr.push(byte) }
+                }
+                Err(error) => { match error.kind { io.ErrorKind.WouldBlock => { break }
+                    _ => { return Err(wire.native("build", error)) } } }
+            }
+        } }
+        None => {}
+    }
+    return Ok(())
+}
+fn clock() Result<time.Instant, wire.Error> {
+    match time.Instant.now() { Ok(value) => { return Ok(value) }
+        Err(error) => { return Err(wire.native("build", error)) } }
+}
+fn elapsed(start time.Instant) Result<u64, wire.Error> {
+    match start.elapsed() { Ok(value) => { return Ok(value.as_millis()) }
+        Err(error) => { return Err(wire.native("build", error)) } }
+}
+fn observe(child &mut process.Process, capture &mut Capture, millis i32) Result<bool, wire.Error> {
+    start := try clock()
+    for {
+        try drain(capture)
+        match child.try_wait() {
+            Ok(Some(_)) => { return Ok(true) }
+            Ok(None) => {}
+            Err(error) => { return Err(wire.native("build", error)) }
+        }
+        duration := try elapsed(start)
+        if duration >= u64(millis) { return Ok(false) }
+        var step = i32(u64(millis) - duration)
+        if step > 20 { step = 20 }
+        match child.wait_timeout(step) { Ok(Some(_)) => { return Ok(true) }
+            Ok(None) => {}
+            Err(error) => { return Err(wire.native("build", error)) } }
+    }
+}
+pub fn run(command process.Command, millis i32) Result<process.Output, wire.Error> {
+    var launched: process.Child
+    match command.stdin(process.Stdio.Null).stdout(process.Stdio.Piped).stderr(process.Stdio.Piped).start_child() {
+        Ok(value) => { launched = value }
+        Err(error) => { return Err(wire.native("build", error)) }
+    }
+    var child = launched.process
+    var capture = Capture { output: launched.stdout, errors: launched.stderr,
+        stdout: Vec.new(), stderr: Vec.new(), output_eof: false, errors_eof: false }
+    var failure: Option<wire.Error> = None
+    var done = false
+    match initialize(&mut capture) { Ok(_) => {
+        match observe(&mut child, &mut capture, millis) {
+            Ok(value) => { done = value
+                if !value { failure = Some(wire.fail("BUILD_FAILED", "build", "build deadline exceeded")) } }
+            Err(error) => { failure = Some(error) }
+        }
+    }
+        Err(error) => { failure = Some(error) } }
+    if !done {
+        match child.terminate() { Ok(_) => {}
+            Err(error) => { if failure.is_none() { failure = Some(wire.native("build", error)) } } }
+        match observe(&mut child, &mut capture, 3000) { Ok(value) => { done = value }
+            Err(_) => {} }
+        if !done { match child.kill() { Ok(_) => {}
+            Err(error) => { if failure.is_none() { failure = Some(wire.native("build", error)) } } } }
+    }
+    // The only consuming reap, after explicit signalling on every failure path.
+    var status: process.ExitStatus
+    match child.wait() { Ok(value) => { status = value }
+        Err(error) => { return Err(wire.native("build", error)) } }
+    match clock() { Ok(start) => {
+        for !capture.output_eof || !capture.errors_eof {
+            match drain(&mut capture) { Ok(_) => {}
+                Err(error) => { if failure.is_none() { failure = Some(error) }
+                    break } }
+            match elapsed(start) { Ok(ms) => { if ms >= 3000 {
+                if failure.is_none() { failure = Some(wire.fail("BUILD_FAILED", "build", "build output did not reach EOF")) }
+                break } }
+                Err(error) => { if failure.is_none() { failure = Some(error) }
+                    break } }
+            match time.sleep_blocking(time.Duration.milliseconds(1)) { Ok(_) => {}
+                Err(error) => { if failure.is_none() { failure = Some(wire.native("build", error)) }
+                    break } }
+        }
+    }
+        Err(error) => { if failure.is_none() { failure = Some(error) } } }
+    match failure { Some(error) => { return Err(error) }
+        None => { return Ok(process.Output { status: status, stdout: capture.stdout, stderr: capture.stderr }) } }
+}

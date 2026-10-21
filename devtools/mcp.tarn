@@ -1,0 +1,335 @@
+// MCP stdio adapter. All child ownership and transport remain in session.tarn.
+// Explicit protocol profile: 2025-11-25. No shell/build execution capability.
+import "session"
+import "wire"
+import "json"
+import "console"
+import "string"
+
+struct Request { id json.Value
+    method string
+    params json.Value
+    notification bool }
+struct Server {
+    input console.LineReader
+    output console.Output
+    negotiated bool
+    initialized bool
+    pending_id json.Value
+    close_result json.Value
+    failed bool
+}
+fn is_object(value &json.Value) bool {
+    match value { json.Value.Object(_) => { return true }
+        _ => { return false } }
+}
+fn fields(value &json.Value, allowed &string) bool {
+    match value {
+        json.Value.Object(members) => {
+            choices := string.split(allowed, ",")
+            for member in members.as_slice() {
+                var found = false
+                for candidate in choices.as_slice() {
+                    if candidate == &member.key { found = true }
+                }
+                if !found { return false }
+            }
+            return true
+        }
+        _ => { return false }
+    }
+}
+fn permitted(config &session.Config, name &string) bool {
+    if name == &"ui.start" { return true }
+    if name == &"ui.screenshot" && !config.allow_capture { return false }
+    methods := string.split(&config.grants, ",")
+    for grant in methods.as_slice() {
+        candidate := "ui." + grant
+        if name == &candidate { return true }
+    }
+    return false
+}
+fn Server.emit(&mut self, value &json.Value) Result<void, wire.Error> {
+    record := json.encode(value) + "\n"
+    match self.output.write_text(&record) { Ok(_) => { return Ok(()) }
+        Err(error) => { return Err(wire.native("mcp_output", error)) } }
+}
+fn Server.reply(&mut self, id &json.Value, result json.Value) Result<void, wire.Error> {
+    var record = wire.object()
+    wire.put(&mut record, "jsonrpc", json.Value.Text("2.0"))
+    wire.put(&mut record, "id", id.clone())
+    wire.put(&mut record, "result", result)
+    return self.emit(&record)
+}
+fn Server.rpc_error(&mut self, id &json.Value, code i64, message &string) Result<void, wire.Error> {
+    var error = wire.object()
+    wire.put(&mut error, "code", wire.number(code))
+    wire.put(&mut error, "message", json.Value.Text(message.clone()))
+    var record = wire.object()
+    wire.put(&mut record, "jsonrpc", json.Value.Text("2.0"))
+    wire.put(&mut record, "id", id.clone())
+    wire.put(&mut record, "error", error)
+    return self.emit(&record)
+}
+fn Server.read(&mut self) Result<Option<Request>, wire.Error> {
+    for {
+        var line: string
+        match self.input.read_line(1048576) {
+            Ok(Some(value)) => { line = value }
+            Ok(None) => { return Ok(None) }
+            Err(error) => { return Err(wire.native("mcp_input", error)) }
+        }
+        var record: json.Value
+        match wire.parse(&line, 1048576) {
+            Ok(value) => { record = value }
+            Err(_) => { try self.rpc_error(&json.Value.Null, -32700, "invalid JSON record")
+                continue }
+        }
+        if wire.field_text(&record, "jsonrpc") != "2.0" || record.text("method").is_none() ||
+            !fields(&record, ",jsonrpc,id,method,params,") {
+            try self.rpc_error(&json.Value.Null, -32600, "invalid JSON-RPC request")
+            continue
+        }
+        notification := record.get("id").is_none()
+        id := wire.get(&record, "id")
+        var valid_id = false
+        match &id {
+            json.Value.Text(value) => { valid_id = value.len() <= 128 }
+            json.Value.Number(_) => { valid_id = id.as_i64().is_some() }
+            _ => {}
+        }
+        if !notification && !valid_id {
+            try self.rpc_error(&json.Value.Null, -32600, "invalid request id")
+            continue
+        }
+        params := record.get("params").unwrap_or(wire.object())
+        if !is_object(&params) {
+            if !notification { try self.rpc_error(&id, -32602, "params must be an object") }
+            continue
+        }
+        return Ok(Some(Request { id: id, method: wire.field_text(&record, "method"),
+                    params: params, notification: notification }))
+    }
+}
+fn schema_type(kind &string) json.Value {
+    var value = wire.object()
+    wire.put(&mut value, "type", json.Value.Text(kind.clone()))
+    return value
+}
+fn tool(name &string) json.Value {
+    var properties = wire.object()
+    var required: Vec<json.Value> = Vec.new()
+    if name != &"ui.start" {
+        wire.put(&mut properties, "window_id", schema_type("string"))
+    }
+    if name == &"ui.click" {
+        wire.put(&mut properties, "element_id", schema_type("string"))
+        required.push(json.Value.Text("element_id"))
+    }
+    if name == &"ui.screenshot" {
+        var revision = schema_type("integer")
+        wire.put(&mut revision, "minimum", wire.number(0))
+        wire.put(&mut properties, "min_revision", revision)
+    }
+    var schema = schema_type("object")
+    wire.put(&mut schema, "properties", properties)
+    wire.put(&mut schema, "required", json.Value.List(required))
+    wire.put(&mut schema, "additionalProperties", json.Value.Bool(false))
+    var value = wire.object()
+    wire.put(&mut value, "name", json.Value.Text(name.clone()))
+    wire.put(&mut value, "description", json.Value.Text("Authorized operation on the configured native Tarn application."))
+    wire.put(&mut value, "inputSchema", schema)
+    wire.put(&mut value, "outputSchema", schema_type("object"))
+    var annotations = wire.object()
+    wire.put(&mut annotations, "readOnlyHint", json.Value.Bool(name == &"ui.inspect" || name == &"ui.diagnostics"))
+    wire.put(&mut annotations, "openWorldHint", json.Value.Bool(false))
+    wire.put(&mut value, "annotations", annotations)
+    return value
+}
+fn tools(config &session.Config) json.Value {
+    var entries: Vec<json.Value> = Vec.new()
+    entries.push(tool("ui.start"))
+    // Stable order independent of launch argument order or duplicate grants.
+    candidates := string.split("ui.click,ui.close,ui.diagnostics,ui.inspect,ui.screenshot", ",")
+    for name in candidates.as_slice() {
+        if permitted(config, name) { entries.push(tool(name)) }
+    }
+    var result = wire.object()
+    wire.put(&mut result, "tools", json.Value.List(entries))
+    return result
+}
+fn Server.common(&mut self, request &Request, config &session.Config) Result<bool, wire.Error> {
+    if request.notification {
+        if request.method == "notifications/initialized" && self.negotiated { self.initialized = true }
+        return Ok(true)
+    }
+    if request.method == "initialize" {
+        if self.negotiated { try self.rpc_error(&request.id, -32600, "already initialized")
+            return Ok(true) }
+        info := wire.get(&request.params, "clientInfo")
+        if request.params.text("protocolVersion").is_none() || !is_object(&wire.get(&request.params, "capabilities")) ||
+            info.text("name").is_none() || info.text("version").is_none() {
+            try self.rpc_error(&request.id, -32602, "invalid initialize parameters")
+            return Ok(true)
+        }
+        var result = wire.object()
+        wire.put(&mut result, "protocolVersion", json.Value.Text("2025-11-25"))
+        var capabilities = wire.object()
+        var capability = wire.object()
+        wire.put(&mut capability, "listChanged", json.Value.Bool(false))
+        wire.put(&mut capabilities, "tools", capability)
+        wire.put(&mut result, "capabilities", capabilities)
+        var info_result = wire.object()
+        wire.put(&mut info_result, "name", json.Value.Text("tarn-ui"))
+        wire.put(&mut info_result, "version", json.Value.Text("0.1.0"))
+        wire.put(&mut result, "serverInfo", info_result)
+        try self.reply(&request.id, result)
+        self.negotiated = true
+        return Ok(true)
+    }
+    if request.method == "ping" { try self.reply(&request.id, wire.object())
+        return Ok(true) }
+    if !self.initialized { try self.rpc_error(&request.id, -32002, "initialization required")
+        return Ok(true) }
+    if request.method == "tools/list" {
+        if !fields(&request.params, ",cursor,_meta,") || !wire.get(&request.params, "cursor").is_null() {
+            try self.rpc_error(&request.id, -32602, "invalid tool cursor")
+        } else { try self.reply(&request.id, tools(config)) }
+        return Ok(true)
+    }
+    if request.method != "tools/call" { try self.rpc_error(&request.id, -32601, "method not found")
+        return Ok(true) }
+    if !fields(&request.params, ",name,arguments,_meta,") || request.params.text("name").is_none() ||
+        !is_object(&request.params.get("arguments").unwrap_or(wire.object())) {
+        try self.rpc_error(&request.id, -32602, "invalid tool call")
+        return Ok(true)
+    }
+    if !permitted(config, &wire.field_text(&request.params, "name")) {
+        try self.rpc_error(&request.id, -32602, "unknown or unauthorized tool")
+        return Ok(true)
+    }
+    return Ok(false)
+}
+fn Server.tool_result(&mut self, id &json.Value, value json.Value, failed bool) Result<void, wire.Error> {
+    var content: Vec<json.Value> = Vec.new()
+    var text = wire.object()
+    wire.put(&mut text, "type", json.Value.Text("text"))
+    wire.put(&mut text, "text", json.Value.Text(json.encode(&value)))
+    content.push(text)
+    if !failed && wire.field_text(&value, "format") == "png" && value.text("data_base64").is_some() {
+        var image = wire.object()
+        wire.put(&mut image, "type", json.Value.Text("image"))
+        wire.put(&mut image, "mimeType", json.Value.Text("image/png"))
+        wire.put(&mut image, "data", wire.get(&value, "data_base64"))
+        content.push(image)
+    }
+    var result = wire.object()
+    wire.put(&mut result, "content", json.Value.List(content))
+    wire.put(&mut result, "structuredContent", value)
+    wire.put(&mut result, "isError", json.Value.Bool(failed))
+    try self.reply(id, result)
+    self.pending_id = json.Value.Null
+    return Ok(())
+}
+fn Server.tool_error(&mut self, id &json.Value, error &wire.Error) Result<void, wire.Error> {
+    var result = wire.object()
+    wire.put(&mut result, "error", wire.error_value(error))
+    return self.tool_result(id, result, true)
+}
+fn arguments(request &Request) json.Value {
+    var params = request.params.get("arguments").unwrap_or(wire.object())
+    if params.get("window_id").is_none() {
+        wire.put(&mut params, "window_id", json.Value.Text("main"))
+    }
+    return params
+}
+fn Server.active(&mut self, link &mut session.Channel, config &session.Config, start_id &json.Value) Result<void, wire.Error> {
+    try self.tool_result(start_id, link.ready.clone(), false)
+    for {
+        var request: Request
+        match try self.read() { Some(value) => { request = value }
+            None => { return Ok(()) } }
+        if try self.common(&request, config) { continue }
+        name := wire.field_text(&request.params, "name")
+        if name == "ui.start" {
+            try self.tool_error(&request.id, &wire.fail("SESSION_ACTIVE", "launch", "session already running"))
+            continue
+        }
+        self.pending_id = request.id.clone()
+        reply := try link.request(&name, &arguments(&request))
+        if !wire.get(&reply, "error").is_null() {
+            var error = wire.object()
+            wire.put(&mut error, "error", wire.get(&reply, "error"))
+            try self.tool_result(&request.id, error, true)
+            continue
+        }
+        result := wire.get(&reply, "result")
+        if name == "ui.close" {
+            self.close_result = result
+            return Ok(())
+        }
+        try self.tool_result(&request.id, result, false)
+    }
+}
+fn Server.completed(&mut self, outcome &session.Outcome) Result<void, wire.Error> {
+    var error: Option<wire.Error> = None
+    match &outcome.failure {
+        Some(value) => { error = Some(wire.Error { code: value.code.clone(), stage: value.stage.clone(),
+                    message: value.message.clone(), details: value.details.clone() }) }
+        None => {}
+    }
+    if error.is_none() && (outcome.forced_cleanup || !outcome.status.success()) {
+        error = Some(wire.fail("SHUTDOWN_FAILED", "shutdown", "unsuccessful native process cleanup"))
+    }
+    match error {
+        Some(mut_error) => {
+            var failure = mut_error
+            wire.put(&mut failure.details, "native_exit", wire.number(i64(outcome.status.code().unwrap_or(-outcome.status.signal().unwrap_or(0)))))
+            wire.put(&mut failure.details, "forced_cleanup", json.Value.Bool(outcome.forced_cleanup))
+            if !self.pending_id.is_null() {
+                id := self.pending_id.clone()
+                try self.tool_error(&id, &failure)
+            } else { self.failed = true }
+        }
+        None => {
+            if !self.pending_id.is_null() {
+                id := self.pending_id.clone()
+                try self.tool_result(&id, self.close_result.clone(), false)
+            }
+        }
+    }
+    self.close_result = json.Value.Null
+    return Ok(())
+}
+pub fn serve(config &session.Config) Result<u8, wire.Error> {
+    var server = Server { input: console.stdin().buffered(), output: console.stdout(),
+        negotiated: false, initialized: false, pending_id: json.Value.Null,
+        close_result: json.Value.Null, failed: false }
+    for {
+        var request: Request
+        match try server.read() { Some(value) => { request = value }
+            None => { if server.failed { return Ok(2) }
+                return Ok(0) } }
+        if try server.common(&request, config) { continue }
+        name := wire.field_text(&request.params, "name")
+        if name != "ui.start" {
+            try server.tool_error(&request.id, &wire.fail("NOT_READY", "launch", "start a UI session first"))
+            continue
+        }
+        params := request.params.get("arguments").unwrap_or(wire.object())
+        if !fields(&params, ",") {
+            try server.tool_error(&request.id, &wire.fail("INVALID_REQUEST", "client", "ui.start takes no arguments"))
+            continue
+        }
+        server.pending_id = request.id.clone()
+        match session.run(config, fn(link &mut session.Channel) Result<void, wire.Error> {
+                return server.active(link, config, &request.id)
+        }) {
+            Ok(outcome) => { try server.completed(&outcome) }
+            Err(error) => {
+                id := server.pending_id.clone()
+                try server.tool_error(&id, &error)
+            }
+        }
+    }
+}

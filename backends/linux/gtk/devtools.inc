@@ -15,12 +15,18 @@ struct DevChannel {
     GString *input, *output;
     unsigned lines;
     gboolean failed, ready, authorized, allow_text, timed_out;
-    gboolean inspect, click, close, closed;
+    gboolean inspect, click, close, screenshot, diagnostics, allow_capture, closed;
     const char *terminal;
     char *session_id, *pending_id, *close_id;
     uint64_t revision, sequence, pending_token;
     gint64 deadline;
     GHashTable *request_ids;
+    char *capture_id;
+    GdkFrameClock *capture_clock;
+    gulong capture_handler;
+    gboolean frame_ready;
+    uint64_t frame_revision;
+    int32_t application_error;
 };
 
 static JsonObject *dev_object(void) { return json_object_new(); }
@@ -72,6 +78,12 @@ static void dev_reply(DevChannel *d, const char *id, JsonObject *result, const c
         JsonObject *e = dev_object();
         dev_string(e, "code", error);
         dev_string(e, "message", error);
+        dev_string(e, "stage", g_str_equal(error, "UNAUTHORIZED") ? "authorization" :
+            g_str_equal(error, "CAPTURE_UNAVAILABLE") ? "capture" :
+            (g_str_equal(error, "NATIVE_ERROR") && d->application_error) ? "application" : "protocol");
+        JsonObject *details = dev_object();
+        if (d->application_error) dev_int(details, "application_code", d->application_error);
+        json_object_set_object_member(e, "details", details);
         json_object_set_object_member(o, "error", e);
     } else json_object_set_object_member(o, "result", result);
     dev_wire(d, o);
@@ -106,12 +118,19 @@ static void dev_clear_pending(DevChannel *d) {
     g_clear_pointer(&d->pending_id, g_free);
     d->pending_token = 0;
 }
+static void dev_clear_capture(DevChannel *d) {
+    if (d->capture_handler) g_signal_handler_disconnect(d->capture_clock, d->capture_handler);
+    d->capture_handler = 0;
+    g_clear_object(&d->capture_clock);
+    g_clear_pointer(&d->capture_id, g_free);
+}
 static void dev_free(Session *s) {
     DevChannel *d = s->dev;
     if (!d) return;
     if (d->reader) g_source_remove(d->reader);
     if (d->writer) g_source_remove(d->writer);
     dev_clear_pending(d);
+    dev_clear_capture(d);
     close(d->fd);
     g_string_free(d->input, TRUE);
     g_string_free(d->output, TRUE);
@@ -219,6 +238,57 @@ static gboolean dev_fields(JsonObject *o, const char *const *allowed) {
     g_list_free(members);
     return valid;
 }
+static void dev_after_paint(GdkFrameClock *clock, gpointer data) {
+    (void)clock;
+    DevChannel *d = data;
+    d->frame_ready = TRUE;
+    d->frame_revision = d->revision;
+}
+static void dev_capture(Session *s) {
+    DevChannel *d = s->dev;
+    GtkWidget *window = GTK_WIDGET(s->window);
+    GskRenderNode *node = NULL;
+    GdkTexture *texture = NULL;
+    GBytes *png = NULL;
+    const char *error = "CAPTURE_UNAVAILABLE";
+    int width = gtk_widget_get_width(window), height = gtk_widget_get_height(window);
+#ifdef TARN_UI_TESTING
+    if (g_strcmp0(g_getenv("TARN_UI_TEST_MODE"), "capture-failure") == 0) goto done;
+#endif
+    if (!gtk_widget_get_realized(window) || !gtk_widget_get_mapped(window) ||
+        width <= 0 || height <= 0 || width > 4096 || height > 4096) goto done;
+    GskRenderer *renderer = gtk_native_get_renderer(GTK_NATIVE(window));
+    if (!renderer) goto done;
+    GdkPaintable *paintable = gtk_widget_paintable_new(window);
+    GtkSnapshot *snapshot = gtk_snapshot_new();
+    gdk_paintable_snapshot(paintable, GDK_SNAPSHOT(snapshot), width, height);
+    node = gtk_snapshot_free_to_node(snapshot);
+    g_object_unref(paintable);
+    if (!node) goto done;
+    texture = gsk_renderer_render_texture(renderer, node, NULL);
+    if (!texture) goto done;
+    png = gdk_texture_save_to_png_bytes(texture);
+    if (!png || g_bytes_get_size(png) > DEV_RECORD_LIMIT) goto done;
+    JsonObject *result = dev_result(d);
+    dev_string(result, "format", "png");
+    dev_int(result, "width", gdk_texture_get_width(texture));
+    dev_int(result, "height", gdk_texture_get_height(texture));
+    dev_int(result, "frame_counter", gdk_frame_clock_get_frame_counter(d->capture_clock));
+    dev_string(result, "coordinate_space", "window-content");
+    char *hash = g_compute_checksum_for_bytes(G_CHECKSUM_SHA256, png);
+    dev_string(result, "sha256", hash); g_free(hash);
+    gsize size; const guchar *bytes = g_bytes_get_data(png, &size);
+    char *base64 = g_base64_encode(bytes, size);
+    dev_string(result, "data_base64", base64); g_free(base64);
+    dev_reply(d, d->capture_id, result, NULL);
+    error = NULL;
+done:
+    if (error) dev_reply(d, d->capture_id, NULL, error);
+    g_clear_pointer(&png, g_bytes_unref);
+    g_clear_object(&texture);
+    if (node) gsk_render_node_unref(node);
+    dev_clear_capture(d);
+}
 typedef struct { GHashTable *members; gboolean duplicate; } DevParse;
 static void dev_member(JsonParser *parser, JsonObject *object, const char *member, gpointer data) {
     (void)parser;
@@ -279,16 +349,43 @@ static void dev_request(Session *s, const char *record, gsize length) {
     }
     if (!d->authorized) { error = "UNAUTHORIZED"; goto done; }
     gboolean inspect = g_str_equal(method, "ui.inspect"), click = g_str_equal(method, "ui.click"), close = g_str_equal(method, "ui.close");
-    if (!inspect && !click && !close) { error = "UNSUPPORTED_OPERATION"; goto done; }
-    if ((inspect && !d->inspect) || (click && !d->click) || (close && !d->close)) { error = "UNAUTHORIZED"; goto done; }
+    gboolean capture = g_str_equal(method, "ui.screenshot"), diagnostics = g_str_equal(method, "ui.diagnostics");
+    if (!inspect && !click && !close && !capture && !diagnostics) { error = "UNSUPPORTED_OPERATION"; goto done; }
+    if ((inspect && !d->inspect) || (click && !d->click) || (close && !d->close) ||
+        (capture && (!d->screenshot || !d->allow_capture)) || (diagnostics && !d->diagnostics)) { error = "UNAUTHORIZED"; goto done; }
     const char *const action_fields[] = {"window_id", "element_id", NULL};
     const char *const window_fields[] = {"window_id", NULL};
-    if (!dev_fields(params, click ? action_fields : window_fields) || json_object_get_size(params) != (click ? 2 : 1)) goto done;
+    const char *const capture_fields[] = {"window_id", "min_revision", NULL};
+    if (!dev_fields(params, capture ? capture_fields : click ? action_fields : window_fields)) goto done;
+    if (json_object_get_size(params) != (click ? 2 : 1) && !(capture && json_object_get_size(params) == 2)) goto done;
     if (!dev_get_string(params, "window_id") || (click && !dev_get_string(params, "element_id"))) goto done;
     if (g_strcmp0(dev_get_string(params, "window_id"), "main") != 0) { error = "NOT_FOUND"; goto done; }
     if (s->closed || d->closed) { error = "WINDOW_CLOSED"; goto done; }
     if (!gtk_widget_get_mapped(GTK_WIDGET(s->window)) || gtk_widget_get_width(GTK_WIDGET(s->window)) <= 0) { error = "NOT_READY"; goto done; }
-    if (inspect) {
+    if (capture) {
+        JsonNode *minimum = json_object_get_member(params, "min_revision");
+        if (minimum && (!JSON_NODE_HOLDS_VALUE(minimum) || json_node_get_value_type(minimum) != G_TYPE_INT64 || json_node_get_int(minimum) < 0)) goto done;
+        if (minimum && (uint64_t)json_node_get_int(minimum) > d->revision) { error = "NOT_READY"; goto done; }
+        GdkFrameClock *clock = gtk_widget_get_frame_clock(GTK_WIDGET(s->window));
+        if (!clock) { error = "CAPTURE_UNAVAILABLE"; goto done; }
+        d->capture_id = g_strdup(id);
+        d->capture_clock = g_object_ref(clock);
+        d->frame_ready = FALSE;
+        d->deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+        d->capture_handler = g_signal_connect(clock, "after-paint", G_CALLBACK(dev_after_paint), d);
+        d->timer = g_timeout_add(2000, dev_timeout, d);
+        gtk_widget_queue_draw(GTK_WIDGET(s->window));
+        gdk_frame_clock_request_phase(clock, GDK_FRAME_CLOCK_PHASE_AFTER_PAINT);
+    } else if (diagnostics) {
+        JsonObject *result = dev_result(d);
+        dev_string(result, "stage", "native");
+        dev_string(result, "backend", "gtk4");
+        dev_int(result, "abi", tarn_ui_gtk_abi());
+        dev_int(result, "queued_events", s->pending_increments);
+        dev_bool(result, "queue_full", s->queue_full);
+        dev_bool(result, "mapped", gtk_widget_get_mapped(GTK_WIDGET(s->window)));
+        dev_reply(d, id, result, NULL);
+    } else if (inspect) {
         JsonObject *result = dev_result(d);
         dev_string(result, "platform", "linux");
         dev_string(result, "backend", "gtk4");
@@ -355,6 +452,31 @@ static gboolean dev_pump(Session *s) {
             if (d->timed_out) { dev_free(s); return FALSE; }
         } else return FALSE;
     }
+    if (d->capture_id) {
+#ifdef TARN_UI_TESTING
+        if (!s->closed && g_strcmp0(g_getenv("TARN_UI_TEST_MODE"), "capture-close") == 0)
+            gtk_window_close(s->window);
+#endif
+        if (s->closed || g_get_monotonic_time() >= d->deadline) {
+            dev_reply(d, d->capture_id, NULL, s->closed ? "WINDOW_CLOSED" : "CAPTURE_UNAVAILABLE");
+            dev_clear_capture(d);
+            if (d->timer) g_source_remove(d->timer);
+            d->timer = 0;
+            d->timed_out = FALSE;
+        } else if (d->frame_ready) {
+            if (d->frame_revision != d->revision) {
+                d->frame_ready = FALSE;
+                gtk_widget_queue_draw(GTK_WIDGET(s->window));
+                gdk_frame_clock_request_phase(d->capture_clock, GDK_FRAME_CLOCK_PHASE_AFTER_PAINT);
+            } else {
+                dev_capture(s);
+                if (d->timer) g_source_remove(d->timer);
+                d->timer = 0;
+            }
+        } else return FALSE;
+        if (d->capture_id) return FALSE;
+        return TRUE;
+    }
     if (d->output->len || d->close_id) return FALSE;
     gsize length;
     char *record = dev_pop(d, &length);
@@ -365,6 +487,7 @@ static gboolean dev_pump(Session *s) {
 static void dev_complete(Session *s, int32_t status) {
     DevChannel *d = s->dev;
     if (!d) return;
+    d->application_error = s->application_error;
     if (d->pending_id && g_get_monotonic_time() >= d->deadline) {
         dev_reply(d, d->pending_id, NULL, "TIMEOUT");
         dev_free(s);
@@ -379,11 +502,16 @@ static void dev_complete(Session *s, int32_t status) {
 static void dev_dispose(Session *s, gboolean window_closed) {
     DevChannel *d = s->dev;
     if (!d) return;
+    d->application_error = s->application_error;
     if (d->pending_id) {
         dev_reply(d, d->pending_id, NULL, window_closed ? "WINDOW_CLOSED" : "NATIVE_ERROR");
         dev_clear_pending(d);
     }
     d->closed = TRUE;
+    if (d->capture_id) {
+        dev_reply(d, d->capture_id, NULL, "WINDOW_CLOSED");
+        dev_clear_capture(d);
+    }
     if (d->close_id) {
         ++d->revision;
         JsonObject *result = dev_result(d); dev_bool(result, "closed", TRUE);
@@ -419,6 +547,7 @@ static int dev_start(Session *s) {
     d->session_id = g_uuid_string_random();
     d->request_ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     d->allow_text = g_strcmp0(g_getenv("TARN_UI_DEV_TEXT"), "1") == 0;
+    d->allow_capture = g_strcmp0(g_getenv("TARN_UI_DEV_CAPTURE"), "1") == 0;
     s->dev = d;
     const char *grants = g_getenv("TARN_UI_DEV_ALLOW");
     if (!grants || !*grants) { dev_free(s); return 1; }
@@ -428,6 +557,8 @@ static int dev_start(Session *s) {
         if (g_str_equal(parts[i], "inspect")) d->inspect = TRUE;
         else if (g_str_equal(parts[i], "click")) d->click = TRUE;
         else if (g_str_equal(parts[i], "close")) d->close = TRUE;
+        else if (g_str_equal(parts[i], "screenshot")) d->screenshot = TRUE;
+        else if (g_str_equal(parts[i], "diagnostics")) d->diagnostics = TRUE;
         else valid = FALSE;
     }
     g_strfreev(parts);

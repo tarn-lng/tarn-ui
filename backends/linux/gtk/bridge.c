@@ -18,6 +18,7 @@ typedef struct {
     gboolean queue_full;
     uint64_t increment_tokens[64], enqueue_token, dispatched_token;
     unsigned increment_head;
+    int32_t application_error;
 #ifdef TARN_UI_DEVTOOLS
     DevChannel *dev;
 #endif
@@ -49,7 +50,7 @@ static void finalized(gpointer data, GObject *object) {
 #define FAIL_AT(stage) FALSE
 #endif
 
-uint32_t tarn_ui_gtk_abi(void) { return 3; }
+uint32_t tarn_ui_gtk_abi(void) { return 4; }
 
 static void clicked(GtkButton *button, gpointer data) {
     (void)button;
@@ -216,6 +217,14 @@ int32_t tarn_ui_gtk_request_close(void *raw) {
 int32_t tarn_ui_gtk_release(void *raw) {
     int32_t status = validate(raw);
     if (status) return status;
+    dispose(raw);
+    return 0;
+}
+
+int32_t tarn_ui_gtk_finish(void *raw, int32_t application_error) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    ((Session *)raw)->application_error = application_error;
     dispose(raw);
     return 0;
 }

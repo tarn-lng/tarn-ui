@@ -1,0 +1,98 @@
+// Ordinary Tarn JSON policy shared by the launcher adapters.
+import "json"
+import "string"
+import "io"
+
+pub struct Error {
+    pub code string
+    pub stage string
+    pub message string
+    pub details json.Value
+}
+pub fn object() json.Value {
+    members: Vec<json.Member> := Vec.new()
+    return json.Value.Object(members)
+}
+pub fn put(value &mut json.Value, key string, item json.Value) {
+    match value {
+        json.Value.Object(members) => { members.push(json.Member { key: key, value: item }) }
+        _ => { panic("internal JSON object invariant") }
+    }
+}
+pub fn field_text(value &json.Value, key &string) string {
+    return value.text(key).unwrap_or("")
+}
+pub fn get(value &json.Value, key &string) json.Value {
+    return value.get(key).unwrap_or(json.Value.Null)
+}
+pub fn number(value i64) json.Value { return json.Value.Number(string.from_i64(value)) }
+pub fn fail(code string, stage string, message string) Error {
+    return Error { code: code, stage: stage, message: message, details: object() }
+}
+pub fn native(stage string, error io.Error) Error {
+    var result = fail("NATIVE_IO", stage, "native I/O operation failed")
+    put(&mut result.details, "native_code", number(i64(error.native_code())))
+    return result
+}
+pub fn error_value(error &Error) json.Value {
+    var value = object()
+    put(&mut value, "code", json.Value.Text(error.code.clone()))
+    put(&mut value, "stage", json.Value.Text(error.stage.clone()))
+    put(&mut value, "message", json.Value.Text(error.message.clone()))
+    put(&mut value, "details", error.details.clone())
+    return value
+}
+fn validate(value &json.Value, depth usize) bool {
+    if depth > 64 { return false }
+    match value {
+        json.Value.Text(text) => {
+            for byte in text.bytes() { if byte == 0 { return false } }
+        }
+        json.Value.List(items) => {
+            for item in items.as_slice() { if !validate(item, depth + 1) { return false } }
+        }
+        json.Value.Object(members) => {
+            var index: usize = 0
+            for member in members.as_slice() {
+                for byte in member.key.bytes() { if byte == 0 { return false } }
+                var previous: usize = 0
+                for previous < index {
+                    if members.as_slice()[previous].key == member.key { return false }
+                    previous = previous + 1
+                }
+                if !validate(&member.value, depth + 1) { return false }
+                index = index + 1
+            }
+        }
+        _ => {}
+    }
+    return true
+}
+pub fn parse(text &string, limit usize) Result<json.Value, Error> {
+    if text.len() > limit { return Err(fail("INVALID_REQUEST", "protocol", "record budget exceeded")) }
+    var quoted = false
+    var escaped = false
+    var depth: usize = 0
+    for byte in text.bytes() {
+        if quoted {
+            if escaped { escaped = false } else {
+                if byte == 92 { escaped = true } else { if byte == 34 { quoted = false } }
+            }
+        } else {
+            if byte == 34 { quoted = true }
+            if byte == 123 || byte == 91 { depth = depth + 1
+                if depth > 64 { return Err(fail("INVALID_REQUEST", "protocol", "JSON nesting budget exceeded")) } }
+            if byte == 125 || byte == 93 {
+                if depth == 0 { return Err(fail("INVALID_REQUEST", "protocol", "unbalanced JSON")) }
+                depth = depth - 1
+            }
+        }
+    }
+    match json.parse(text) {
+        Ok(value) => {
+            if !validate(&value, 0) { return Err(fail("INVALID_REQUEST", "protocol", "duplicate member or NUL in JSON")) }
+            return Ok(value)
+        }
+        Err(_) => { return Err(fail("INVALID_REQUEST", "protocol", "invalid JSON record")) }
+    }
+}

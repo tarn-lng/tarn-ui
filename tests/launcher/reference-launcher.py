@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from devtools.session import Session
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests/devtools"))
+from reference_session import Session
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--allow", nargs="+", required=True, choices=("inspect", "click", "close"))
