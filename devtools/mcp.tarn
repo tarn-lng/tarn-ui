@@ -128,9 +128,15 @@ fn tool(name &string) json.Value {
     if name != &"ui.start" && name != &"project.build" {
         wire.put(&mut properties, "window_id", schema_type("string"))
     }
-    if name == &"ui.click" {
+    if name == &"ui.click" || name == &"ui.fill" {
         wire.put(&mut properties, "element_id", schema_type("string"))
         required.push(json.Value.Text("element_id"))
+    }
+    if name == &"ui.fill" {
+        var text = schema_type("string")
+        wire.put(&mut text, "maxLength", wire.number(256))
+        wire.put(&mut properties, "text", text)
+        required.push(json.Value.Text("text"))
     }
     if name == &"ui.screenshot" {
         var revision = schema_type("integer")
@@ -144,6 +150,7 @@ fn tool(name &string) json.Value {
     var value = wire.object()
     wire.put(&mut value, "name", json.Value.Text(name.clone()))
     var description = "Authorized operation on the configured native Tarn application."
+    if name == &"ui.fill" { description = "Replace a visible editable text field (max 256 Unicode characters, single line); waits for the application view. Requires the fill grant." }
     if name == &"project.build" { description = "Compile the configured counter project using a fixed native recipe; close any running UI session first. Takes no arguments." }
     wire.put(&mut value, "description", json.Value.Text(description))
     wire.put(&mut value, "inputSchema", schema)
@@ -159,7 +166,7 @@ fn tools(config &session.Config, allow_build bool) json.Value {
     entries.push(tool("ui.start"))
     if allow_build { entries.push(tool("project.build")) }
     // Stable order independent of launch argument order or duplicate grants.
-    candidates := string.split("ui.click,ui.close,ui.diagnostics,ui.inspect,ui.screenshot", ",")
+    candidates := string.split("ui.click,ui.close,ui.diagnostics,ui.fill,ui.inspect,ui.screenshot", ",")
     for name in candidates.as_slice() {
         if permitted(config, allow_build, name) { entries.push(tool(name)) }
     }

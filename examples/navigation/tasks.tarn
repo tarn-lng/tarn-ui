@@ -1,0 +1,91 @@
+import "core/components"
+import "string"
+
+pub struct Row { pub id u32
+    pub text string }
+pub struct Model { rows Vec<Row>
+    selected u32
+    next_id u32
+    draft string }
+pub fn Model.new() Model { return Model{rows: Vec.new(), selected: 0, next_id: 1, draft: ""} }
+pub fn Model.value(&self) &string { return &self.draft }
+pub fn Model.count(&self) usize { return self.rows.len() }
+pub fn Model.selected_id(&self) u32 { return self.selected }
+pub fn Model.can_add(&self) bool { return !string.trim(&self.draft).is_empty() && self.rows.len() < 32 && self.next_id <= 900 }
+pub fn Model.can_up(&self) bool {
+    if self.rows.is_empty() { return false }
+    return self.selected != 0 && self.rows.as_slice()[0].id != self.selected
+}
+pub fn Model.can_edit(&self) bool { return self.selected != 0 && !string.trim(&self.draft).is_empty() }
+pub fn Model.reduce(&mut self, action u32, text &string) {
+    if action == 8 { self.draft = text.clone()
+        return }
+    if action == 9 {
+        if !self.can_add() { return }
+        self.rows.push(Row{id: self.next_id, text: string.trim(&self.draft)})
+        self.next_id = self.next_id + 1
+        self.draft = ""
+        return
+    }
+    if action >= 101 && action <= 1000 {
+        for row in self.rows.as_slice() {
+            if row.id + 100 == action { self.selected = row.id
+                self.draft = row.text.clone()
+                return }
+        }
+        // Already queued actions for a removed row have no effect.
+        return
+    }
+    if self.selected == 0 { return }
+    var next: Vec<Row> = Vec.new()
+    var index: usize = 0
+    var selected_index: usize = 0
+    for row in self.rows.as_slice() {
+        if row.id == self.selected { selected_index = index }
+        index = index + 1
+    }
+    index = 0
+    for row in self.rows.as_slice() {
+        if action == 10 && row.id == self.selected {} else if action == 11 && selected_index > 0 && index == selected_index - 1 {
+            picked := &self.rows.as_slice()[selected_index]
+            next.push(Row{id: picked.id, text: picked.text.clone()})
+        } else if action == 11 && selected_index > 0 && index == selected_index {
+            previous := &self.rows.as_slice()[selected_index - 1]
+            next.push(Row{id: previous.id, text: previous.text.clone()})
+        } else if action == 12 && row.id == self.selected && self.can_edit() {
+            next.push(Row{id: row.id, text: string.trim(&self.draft)})
+        } else { next.push(Row{id: row.id, text: row.text.clone()}) }
+        index = index + 1
+    }
+    self.rows = next
+    if action == 10 { self.selected = 0
+        self.draft = "" }
+}
+pub fn Model.items(&self) Vec<components.Button> {
+    var items: Vec<components.Button> = Vec.new()
+    for row in self.rows.as_slice() {
+        var label = row.text.clone()
+        if row.id == self.selected { label = "✓ " + label }
+        items.push(components.Button{key: "task-" + &string.from_u64(u64(row.id)), text: label, action: 100 + row.id})
+    }
+    return items
+}
+pub fn page() components.Page {
+    var children: Vec<components.Node> = Vec.new()
+    children.push(components.heading("tasks-title", "Mi lista"))
+    children.push(components.label("tasks-help", "Selecciona una fila para editarla, eliminarla o subirla."))
+    children.push(components.input("task-input", "", 8))
+    var actions: Vec<components.Node> = Vec.new()
+    actions.push(components.primary_button("task-add", "Añadir", 9))
+    actions.push(components.button("task-edit", "Aplicar edición", 12))
+    children.push(components.row("task-actions", 8, actions))
+    var empty: Vec<components.Node> = Vec.new()
+    children.push(components.column("task-list", 6, empty))
+    children.push(components.label("tasks-count", "0 elementos"))
+    var selection: Vec<components.Node> = Vec.new()
+    selection.push(components.button("task-remove", "Eliminar selección", 10))
+    selection.push(components.button("task-up", "Subir selección", 11))
+    children.push(components.row("task-selection", 8, selection))
+    children.push(components.button("tasks-back", "Volver", 13))
+    return components.Page{key: "tasks", children: children}
+}

@@ -16,7 +16,7 @@ struct Options { config session.Config
     capture_directory string
     recipe build.Config }
 fn usage() string {
-    return "tarn-ui --allow inspect click close [screenshot diagnostics] [--allow-text] [--allow-capture] [--binary PATH] [--library-path DIR] [--mode protocol|mcp] [--allow-build --project-root DIR --compiler PATH] [--capture-dir NEW_DIR]\n"
+    return "tarn-ui --allow inspect click close [fill screenshot diagnostics] [--allow-text] [--allow-capture] [--binary PATH] [--library-path DIR] [--mode protocol|mcp] [--allow-build --project-root DIR --compiler PATH] [--capture-dir NEW_DIR]\n"
 }
 fn argument(args &[]string, index usize) Result<string, wire.Error> {
     if index >= args.len() { return Err(wire.fail("INVALID_ARGUMENT", "configuration", "missing option value")) }
@@ -84,7 +84,7 @@ fn options(args &[]string) Result<Options, wire.Error> {
             for index < args.len() {
                 grant := args[index].clone()
                 if string.starts_with(&grant, "--") { break }
-                if grant != "inspect" && grant != "click" && grant != "close" &&
+                if grant != "inspect" && grant != "click" && grant != "fill" && grant != "close" &&
                     grant != "screenshot" && grant != "diagnostics" {
                     return Err(wire.fail("INVALID_ARGUMENT", "configuration", "unknown operation grant"))
                 }

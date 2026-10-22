@@ -12,12 +12,29 @@ aplazando la investigación de memoria para evitar que bloquee el producto.
 - Implementado: etiquetas, botones y páginas con claves estables, vistas con
   diferencias de propiedades y navegación entre dos pantallas con estado
   compartido, pila de rutas y acción de volver.
-- Siguiente: disposición nativa más general, foco, accesibilidad y tema sobre
-  esos componentes, con pruebas de identidad y disposición de cada pantalla.
+- Implementado: filas y columnas anidadas, foco por página, encabezados y
+  nombres accesibles, estilos semánticos del tema nativo y pruebas de disposición.
+- Implementado: entrada de texto con snapshots ordenados, estado Tarn y textos
+  derivados; nombre editable del contador con indicación cuando está vacío.
+- Implementado: envío local con borrador y nombre confirmado, validación de
+  nombres vacíos y controles habilitados derivados mediante diff de propiedades.
+- Implementado: restablecer al último nombre confirmado y sincronizar entradas
+  desde el modelo sin generar nuevos eventos de edición.
+- Implementado: `ui.fill` con permiso explícito por protocolo y MCP; pruebas del
+  formulario real de extremo a extremo sin hooks de edición.
+- Implementado: primera reconciliación de listas con claves estables, edición,
+  reordenamiento y eliminación de filas nativas, con pruebas de identidad y limpieza.
+- Siguiente dentro de la fase 5: ampliar la reconciliación a bloques condicionales
+  y subárboles de controles mixtos; las listas actuales contienen botones de fila.
+- Pendiente de cierre de fase 5: revisar sus criterios de identidad, disposición,
+  accesibilidad y ciclo de vida sobre los componentes dinámicos.
+- La plantilla de proyecto es una propuesta para la preview, separada del siguiente
+  bloque técnico del plan original. La fase 6 continúa siendo preparación móvil.
 
 Las entregas están documentadas en [reactivity.md](reactivity.md) y
 [componentes y navegación](components-navigation.md). La composición actual
-usa páginas de topología fija; la reconciliación de árboles queda pendiente.
+usa páginas de topología fija con [regiones de listas dinámicas](dynamic-lists.md);
+la reconciliación general de árboles queda pendiente.
 
 ## Recordatorio aplazado: Mesa/EGL
 

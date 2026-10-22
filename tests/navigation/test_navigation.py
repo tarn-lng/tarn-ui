@@ -24,8 +24,10 @@ def walk(node):
 class Navigation(unittest.TestCase):
     def start(self, fixture_mode=None, **options):
         binary = ".build/navigation-dev/navigation" if fixture_mode is None else ".build/navigation-tests/views"
-        return Session(binary=ROOT / binary, allow_text=True,
-                       env={"G_DEBUG": "fatal-warnings", "TARN_UI_VIEW_MODE": fixture_mode or ""}, **options)
+        env = {"G_DEBUG": "fatal-warnings", "TARN_UI_VIEW_MODE": fixture_mode or ""}
+        env.update(options.pop("env", {}))
+        return Session(binary=ROOT / binary, allow_text=options.pop("allow_text", True),
+                       env=env, **options)
 
     def inspect(self, session):
         result = session.request("ui.inspect", {"window_id": "main"})["result"]
@@ -41,6 +43,271 @@ class Navigation(unittest.TestCase):
     def clean(self, session):
         self.assertFalse(session.forced_cleanup)
         self.assertEqual(session.stderr, b"")
+
+    def test_dynamic_list_add_edit_reorder_remove_and_navigation(self):
+        with self.start(allow=("inspect", "click", "fill", "close", "screenshot"), allow_capture=True) as session:
+            self.click(session, "open-tasks")
+            _, view = self.inspect(session)
+            self.assertTrue(view["tasks"]["visible"])
+            self.assertFalse(view["task-add"]["enabled"])
+            for text in ("Primero", "Segundo", "Tercero"):
+                self.fill(session, text, "task-input")
+                self.click(session, "task-add")
+            _, view = self.inspect(session)
+            self.assertEqual([node["id"] for node in view["task-list"]["children"]], ["task-1", "task-2", "task-3"])
+            self.assertEqual(view["task-input"]["text"], "")
+            self.click(session, "task-3")
+            self.assertIn("result", self.click(session, "task-up"))
+            _, view = self.inspect(session)
+            self.assertEqual([node["id"] for node in view["task-list"]["children"]], ["task-1", "task-3", "task-2"])
+            self.fill(session, "Tercero editado", "task-input")
+            self.click(session, "task-edit")
+            _, view = self.inspect(session)
+            self.assertEqual(view["task-3"]["text"], "✓ Tercero editado")
+            self.click(session, "tasks-back")
+            self.assertEqual(self.click(session, "task-3")["error"]["code"], "HIDDEN")
+            self.click(session, "open-tasks")
+            _, view = self.inspect(session)
+            self.assertEqual(view["task-3"]["text"], "✓ Tercero editado")
+            result = session.request("ui.screenshot", {"window_id": "main"})["result"]
+            (ROOT / ".build/navigation-tests/tasks.png").write_bytes(base64.b64decode(result["data_base64"]))
+            self.click(session, "task-remove")
+            self.assertEqual(self.click(session, "task-3")["error"]["code"], "NOT_FOUND")
+            _, view = self.inspect(session)
+            self.assertEqual([node["id"] for node in view["task-list"]["children"]], ["task-1", "task-2"])
+            self.assertEqual(view["tasks-count"]["text"], "2 elementos")
+            self.assertFalse(view["task-remove"]["enabled"])
+            for key in ("task-1", "task-2"):
+                self.click(session, key)
+                self.click(session, "task-remove")
+            _, view = self.inspect(session)
+            self.assertEqual(view["task-list"]["children"], [])
+            self.assertEqual(view["tasks-count"]["text"], "0 elementos")
+            self.fill(session, "Nueva identidad", "task-input")
+            self.click(session, "task-add")
+            _, view = self.inspect(session)
+            self.assertIn("task-4", view)
+            self.assertNotIn("task-1", view)
+            self.close(session)
+        self.clean(session)
+
+    def fill(self, session, text, key="name-input"):
+        return session.request("ui.fill", {"window_id": "main", "element_id": key, "text": text})
+
+    def test_real_form_fill_save_navigation_and_reset(self):
+        with self.start(allow=("inspect", "click", "fill", "close")) as session:
+            self.assertEqual(self.fill(session, "  Ana María  ")["result"]["revision"], 1)
+            _, view = self.inspect(session)
+            self.assertEqual(view["name-input"]["text"], "  Ana María  ")
+            self.assertTrue(view["save-name"]["enabled"])
+            self.assertTrue(view["reset-name"]["enabled"])
+            self.assertTrue(any(node["focused"] for node in walk(view["name-input"])))
+            self.assertEqual(view["details-title"]["text"], "Resumen del contador")
+            self.click(session, "save-name")
+            _, view = self.inspect(session)
+            self.assertEqual(view["name-input"]["text"], "Ana María")
+            self.assertEqual(view["details-title"]["text"], "Resumen de Ana María")
+            self.assertFalse(view["save-name"]["enabled"])
+            self.assertFalse(view["reset-name"]["enabled"])
+            self.click(session, "open-details")
+            self.assertEqual(self.fill(session, "Oculto")["error"]["code"], "HIDDEN")
+            self.click(session, "go-back")
+            self.fill(session, "Luis")
+            self.click(session, "reset-name")
+            _, view = self.inspect(session)
+            self.assertEqual(view["name-input"]["text"], "Ana María")
+            self.assertFalse(view["save-name"]["enabled"])
+            self.fill(session, "   ")
+            _, view = self.inspect(session)
+            self.assertFalse(view["save-name"]["enabled"])
+            self.assertIn("espacios", view["name-feedback"]["text"])
+            self.click(session, "reset-name")
+            self.close(session)
+        self.clean(session)
+
+    def test_fill_validates_input_and_acknowledges_equal_and_empty_values(self):
+        with self.start(allow=("inspect", "fill", "close")) as session:
+            for revision, text in enumerate(("", "", "é" * 256, "", "Nuevo", "Nuevo"), 1):
+                self.assertEqual(self.fill(session, text)["result"]["revision"], revision)
+                _, view = self.inspect(session)
+                self.assertEqual(view["name-input"]["text"], text)
+            for text in ("x" * 257, "dos\nlíneas", "retorno\rcarro", 42, None):
+                self.assertEqual(self.fill(session, text)["error"]["code"], "INVALID_REQUEST")
+            self.assertEqual(self.fill(session, "bad", "home-add")["error"]["code"], "WRONG_ELEMENT_TYPE")
+            self.assertEqual(self.fill(session, "bad", "missing")["error"]["code"], "NOT_FOUND")
+            _, view = self.inspect(session)
+            self.assertEqual(view["name-input"]["text"], "Nuevo")
+            self.close(session)
+        self.clean(session)
+
+    def test_fill_pipeline_is_ordered_and_closed_fields_reject_writes(self):
+        with self.start(allow=("inspect", "click", "fill", "close")) as session:
+            records = [
+                ("ui.fill", {"window_id": "main", "element_id": "name-input", "text": "Primero"}),
+                ("ui.fill", {"window_id": "main", "element_id": "name-input", "text": "Último"}),
+                ("ui.click", {"window_id": "main", "element_id": "save-name"}),
+                ("ui.inspect", {"window_id": "main"}),
+                ("ui.close", {"window_id": "main"}),
+                ("ui.fill", {"window_id": "main", "element_id": "name-input", "text": "Tarde"}),
+            ]
+            session.sock.sendall(b"".join(json.dumps({"version": 1, "request_id": str(i), "method": method,
+                                                    "params": params}).encode() + b"\n"
+                                           for i, (method, params) in enumerate(records)))
+            replies = [session.receive() for _ in records]
+            self.assertEqual([reply["request_id"] for reply in replies], list(map(str, range(6))))
+            self.assertEqual([reply["result"]["revision"] for reply in replies[:3]], [1, 2, 3])
+            view = {node["id"]: node for node in walk(replies[3]["result"]["root"]) if node["stable_id"]}
+            self.assertEqual(view["details-title"]["text"], "Resumen de Último")
+            self.assertEqual(replies[5]["error"]["code"], "WINDOW_CLOSED")
+            self.assertEqual(session.process.wait(timeout=3), 0)
+        self.clean(session)
+
+    def test_fill_rejects_disabled_entries(self):
+        with self.start(fixture_mode="disabled-input", allow=("inspect", "fill", "close")) as session:
+            self.assertEqual(self.fill(session, "No", "input")["error"]["code"], "DISABLED")
+            _, view = self.inspect(session)
+            self.assertEqual(view["input"]["text"], "")
+            self.close(session)
+        self.clean(session)
+
+    def test_fill_application_error_is_not_acknowledged_as_success(self):
+        with self.start(fixture_mode="fill-error", allow=("fill", "close")) as session:
+            reply = self.fill(session, "Error del modelo", "input")
+            self.assertEqual(reply["error"]["code"], "NATIVE_ERROR")
+            self.assertEqual(reply["error"]["details"]["application_code"], 99)
+            self.assertEqual(session.process.wait(timeout=3), 1)
+        self.clean(session)
+
+    def test_fill_requires_its_own_grant_and_does_not_grant_text_reading(self):
+        with self.start() as session:
+            self.assertEqual(self.fill(session, "Sin permiso")["error"]["code"], "UNAUTHORIZED")
+            self.close(session)
+        self.clean(session)
+        with self.start(allow=("inspect", "fill", "close"), allow_text=False) as session:
+            self.assertIn("result", self.fill(session, "Dato privado"))
+            _, view = self.inspect(session)
+            self.assertIsNone(view["name-input"]["text"])
+            self.assertIsNone(view["name-input"]["accessibility_label"])
+            self.close(session)
+        self.clean(session)
+
+    def test_form_save_commits_draft_and_disables_duplicate_submission(self):
+        with self.start(fixture_mode="form") as session:
+            _, view = self.inspect(session)
+            self.assertFalse(view["save"]["enabled"])
+            self.assertEqual(self.click(session, "save")["error"]["code"], "DISABLED")
+            self.click(session, "trigger")
+            deadline = time.monotonic() + 3
+            while True:
+                _, view = self.inspect(session)
+                if view["save"]["enabled"]:
+                    break
+                self.assertLess(time.monotonic(), deadline)
+            self.assertEqual(view["value"]["text"], "")
+            self.click(session, "save")
+            _, view = self.inspect(session)
+            self.assertEqual(view["value"]["text"], "Ana María")
+            self.assertFalse(view["save"]["enabled"])
+            self.assertEqual(self.click(session, "save")["error"]["code"], "DISABLED")
+            self.close(session)
+        self.clean(session)
+
+    def test_form_reset_restores_field_and_saved_model(self):
+        with self.start(fixture_mode="form") as session:
+            self.click(session, "trigger")
+            deadline = time.monotonic() + 3
+            while True:
+                _, view = self.inspect(session)
+                if view["save"]["enabled"]:
+                    break
+                self.assertLess(time.monotonic(), deadline)
+            self.click(session, "reset")
+            _, view = self.inspect(session)
+            self.assertEqual(view["input"]["text"], "")
+            self.assertEqual(view["value"]["text"], "")
+            self.assertFalse(view["save"]["enabled"])
+            self.click(session, "trigger")
+            deadline = time.monotonic() + 3
+            while True:
+                _, view = self.inspect(session)
+                if view["save"]["enabled"]:
+                    break
+                self.assertLess(time.monotonic(), deadline)
+            self.click(session, "save")
+            self.click(session, "trigger")
+            deadline = time.monotonic() + 3
+            while True:
+                _, view = self.inspect(session)
+                if view["save"]["enabled"]:
+                    break
+                self.assertLess(time.monotonic(), deadline)
+            self.click(session, "reset")
+            _, view = self.inspect(session)
+            self.assertEqual(view["input"]["text"], "Ana María")
+            self.assertEqual(view["value"]["text"], "Ana María")
+            self.assertFalse(view["save"]["enabled"])
+            self.close(session)
+        self.clean(session)
+
+    def test_input_snapshots_reach_tarn_and_derive_visible_text(self):
+        with self.start(fixture_mode="input") as session:
+            deadline = time.monotonic() + 3
+            while True:
+                _, view = self.inspect(session)
+                if view["value"]["text"] == "Ana María":
+                    break
+                self.assertLess(time.monotonic(), deadline)
+            self.assertEqual(view["input"]["text"], "Ana María")
+            self.close(session)
+        self.clean(session)
+
+    def test_presentation_and_focus_restore(self):
+        with self.start(allow=("inspect", "click", "close", "screenshot"), allow_capture=True) as session:
+            session.request("ui.screenshot", {"window_id": "main"})
+            _, view = self.inspect(session)
+            self.assertTrue(view["home-add"]["focused"])
+            self.assertEqual(view["home-title"]["type"], "heading")
+            self.assertEqual(view["home-value"]["parent_id"], "home-summary")
+            self.assertIn("title-1", view["home-value"]["style_classes"])
+            self.assertIn("suggested-action", view["home-add"]["style_classes"])
+            self.assertNotIn("suggested-action", view["open-details"]["style_classes"])
+            self.assertEqual(view["home-add"]["accessibility_label"], "Incrementar el contador")
+            left, right = view["home-add"]["bounds"], view["open-details"]["bounds"]
+            self.assertIsNotNone(left)
+            self.assertIsNotNone(right)
+            self.assertEqual(left["y"], right["y"])
+            self.assertLessEqual(left["x"] + left["width"], right["x"])
+            self.click(session, "open-details")
+            _, view = self.inspect(session)
+            self.assertTrue(view["details-add"]["focused"])
+            self.click(session, "go-back")
+            _, view = self.inspect(session)
+            self.assertTrue(view["open-details"]["focused"])
+            self.click(session, "home-add")
+            _, view = self.inspect(session)
+            self.assertTrue(view["home-add"]["focused"])
+            self.close(session)
+        self.clean(session)
+
+    def test_accessible_metadata_respects_text_permission(self):
+        with self.start(allow_text=False) as session:
+            _, view = self.inspect(session)
+            for node in view.values():
+                self.assertIsNone(node["text"])
+                self.assertIsNone(node["accessibility_label"])
+                self.assertIsNone(node["accessibility_description"])
+            self.close(session)
+        self.clean(session)
+
+    def test_native_light_and_dark_themes(self):
+        captures = []
+        for theme in ("Adwaita", "Adwaita:dark"):
+            with self.start(env={"GTK_THEME": theme}, allow=("inspect", "close", "screenshot"), allow_capture=True) as session:
+                result = session.request("ui.screenshot", {"window_id": "main"})["result"]
+                captures.append(result["sha256"])
+                self.close(session)
+            self.clean(session)
+        self.assertNotEqual(*captures)
 
     def test_shared_state_and_hidden_targets(self):
         with self.start() as session:
@@ -135,7 +402,7 @@ class Navigation(unittest.TestCase):
         self.assertEqual(values, {"text_calls": "1", "page_calls": "1"})
 
     def test_view_errors_never_acknowledge_success_and_release_the_tree(self):
-        for mode, code in (("duplicate", 1), ("route", 1), ("error", 99)):
+        for mode, code in (("duplicate", 1), ("duplicate-enabled", 1), ("duplicate-list", 1), ("list-collision", 1), ("route", 1), ("error", 99)):
             with self.subTest(mode=mode):
                 with self.start(fixture_mode=mode) as session:
                     reply = self.click(session, "trigger")
@@ -149,7 +416,7 @@ class Navigation(unittest.TestCase):
             str(ROOT / ".build/launcher/tarn-ui"), "--mode", "mcp",
             "--binary", str(ROOT / ".build/navigation-dev/navigation"),
             "--library-path", str(ROOT / ".build/navigation-dev"),
-            "--allow", "inspect", "click", "close", "--allow-text",
+            "--allow", "inspect", "click", "fill", "close", "--allow-text",
         ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         buffer = bytearray()
         sequence = 0
@@ -187,12 +454,18 @@ class Navigation(unittest.TestCase):
                                    "clientInfo": {"name": "navigation-test", "version": "1"}})
             process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
             process.stdin.flush()
+            listing = request("tools/list", {})
+            fill_tool = next(tool for tool in listing["tools"] if tool["name"] == "ui.fill")
+            self.assertEqual(fill_tool["inputSchema"]["properties"]["text"]["maxLength"], 256)
             call("ui.start")
+            call("ui.fill", {"element_id": "name-input", "text": "Desde MCP"})
+            call("ui.click", {"element_id": "save-name"})
             call("ui.click", {"element_id": "home-add"})
             call("ui.click", {"element_id": "open-details"})
             visible = {node["id"]: node for node in walk(call("ui.inspect")["root"]) if node["stable_id"]}
             self.assertTrue(visible["details"]["visible"])
             self.assertEqual(visible["details-value"]["text"], "1")
+            self.assertEqual(visible["details-title"]["text"], "Resumen de Desde MCP")
             call("ui.click", {"element_id": "go-back"})
             visible = {node["id"]: node for node in walk(call("ui.inspect")["root"]) if node["stable_id"]}
             self.assertTrue(visible["home"]["visible"])

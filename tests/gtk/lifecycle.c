@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
         finish_process_diagnostic();
         return 0;
     }
-    g_assert_cmpuint(tarn_ui_gtk_abi(), ==, 6);
+    g_assert_cmpuint(tarn_ui_gtk_abi(), ==, 11);
     void *s = NULL;
     g_assert_cmpint(tarn_ui_gtk_create(NULL, "x", &s), ==, 1);
     g_assert_null(s);

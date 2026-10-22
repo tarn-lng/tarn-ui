@@ -15,7 +15,7 @@ struct DevChannel {
     GString *input, *output;
     unsigned lines;
     gboolean failed, ready, authorized, allow_text, timed_out;
-    gboolean inspect, click, close, screenshot, diagnostics, allow_capture, closed;
+    gboolean inspect, click, fill, close, screenshot, diagnostics, allow_capture, closed;
     const char *terminal;
     char *session_id, *pending_id, *close_id;
     uint64_t revision, sequence, pending_token;
@@ -183,14 +183,26 @@ static JsonObject *dev_widget(DevChannel *d, GtkWidget *widget, GtkWidget *root,
     g_type_class_unref(roles);
     const char *text = NULL;
     if (d->allow_text) {
-        if (GTK_IS_LABEL(widget)) text = gtk_label_get_text(GTK_LABEL(widget));
+        if (GTK_IS_ENTRY(widget)) text = gtk_editable_get_text(GTK_EDITABLE(widget));
+        else if (GTK_IS_LABEL(widget)) text = gtk_label_get_text(GTK_LABEL(widget));
         else if (GTK_IS_BUTTON(widget)) text = gtk_button_get_label(GTK_BUTTON(widget));
         else if (GTK_IS_WINDOW(widget)) text = gtk_window_get_title(GTK_WINDOW(widget));
     }
     dev_string(o, "text", text);
     dev_bool(o, "redacted", !d->allow_text);
-    dev_string(o, "accessibility_label", NULL);
-    dev_string(o, "accessibility_label_reason", "native property getter unavailable");
+    const char *a11y_label = g_object_get_data(G_OBJECT(widget), "tarn-ui-a11y-label");
+    const char *a11y_description = g_object_get_data(G_OBJECT(widget), "tarn-ui-a11y-description");
+    dev_string(o, "accessibility_label", d->allow_text ? a11y_label : NULL);
+    dev_string(o, "accessibility_description", d->allow_text ? a11y_description : NULL);
+    dev_string(o, "accessibility_label_reason", a11y_label ?
+               (d->allow_text ? "explicit adapter property; computed name unavailable" : "text access denied") : "native property getter unavailable");
+    dev_bool(o, "focusable", gtk_widget_get_focusable(widget));
+    dev_bool(o, "focused", gtk_window_get_focus(GTK_WINDOW(root)) == widget);
+    JsonArray *classes = json_array_new();
+    char **css = gtk_widget_get_css_classes(widget);
+    for (char **item = css; *item; ++item) json_array_add_string_element(classes, *item);
+    g_strfreev(css);
+    json_object_set_array_member(o, "style_classes", classes);
     dev_bool(o, "enabled", gtk_widget_is_sensitive(widget));
     gboolean visible = gtk_widget_is_visible(widget) && gtk_widget_get_mapped(widget);
     dev_bool(o, "visible", visible);
@@ -349,16 +361,24 @@ static void dev_request(Session *s, const char *record, gsize length) {
     }
     if (!d->authorized) { error = "UNAUTHORIZED"; goto done; }
     gboolean inspect = g_str_equal(method, "ui.inspect"), click = g_str_equal(method, "ui.click"), close = g_str_equal(method, "ui.close");
+    gboolean fill = g_str_equal(method, "ui.fill");
     gboolean capture = g_str_equal(method, "ui.screenshot"), diagnostics = g_str_equal(method, "ui.diagnostics");
-    if (!inspect && !click && !close && !capture && !diagnostics) { error = "UNSUPPORTED_OPERATION"; goto done; }
-    if ((inspect && !d->inspect) || (click && !d->click) || (close && !d->close) ||
+    if (!inspect && !click && !fill && !close && !capture && !diagnostics) { error = "UNSUPPORTED_OPERATION"; goto done; }
+    if ((inspect && !d->inspect) || (click && !d->click) || (fill && !d->fill) || (close && !d->close) ||
         (capture && (!d->screenshot || !d->allow_capture)) || (diagnostics && !d->diagnostics)) { error = "UNAUTHORIZED"; goto done; }
     const char *const action_fields[] = {"window_id", "element_id", NULL};
+    const char *const fill_fields[] = {"window_id", "element_id", "text", NULL};
     const char *const window_fields[] = {"window_id", NULL};
     const char *const capture_fields[] = {"window_id", "min_revision", NULL};
-    if (!dev_fields(params, capture ? capture_fields : click ? action_fields : window_fields)) goto done;
-    if (json_object_get_size(params) != (click ? 2 : 1) && !(capture && json_object_get_size(params) == 2)) goto done;
-    if (!dev_get_string(params, "window_id") || (click && !dev_get_string(params, "element_id"))) goto done;
+    if (!dev_fields(params, capture ? capture_fields : fill ? fill_fields : click ? action_fields : window_fields)) goto done;
+    if (json_object_get_size(params) != (fill ? 3 : click ? 2 : 1) && !(capture && json_object_get_size(params) == 2)) goto done;
+    if (!dev_get_string(params, "window_id") || ((click || fill) && !dev_get_string(params, "element_id"))) goto done;
+    if (fill) {
+        const char *text = dev_get_string(params, "text");
+        if (!text || !g_utf8_validate(text, -1, NULL) || g_utf8_strlen(text, -1) > 256) goto done;
+        /* GtkEntry is single-line; reject rather than silently transforming input. */
+        if (strchr(text, '\n') || strchr(text, '\r')) goto done;
+    }
     if (g_strcmp0(dev_get_string(params, "window_id"), "main") != 0) { error = "NOT_FOUND"; goto done; }
     if (s->closed || d->closed) { error = "WINDOW_CLOSED"; goto done; }
     if (!gtk_widget_get_mapped(GTK_WIDGET(s->window)) || gtk_widget_get_width(GTK_WIDGET(s->window)) <= 0) { error = "NOT_READY"; goto done; }
@@ -400,9 +420,10 @@ static void dev_request(Session *s, const char *record, gsize length) {
     } else {
         GtkWidget *target = dev_find(GTK_WIDGET(s->window), dev_get_string(params, "element_id"));
         if (!target) { error = "NOT_FOUND"; goto done; }
-        if (!GTK_IS_BUTTON(target)) { error = "WRONG_ELEMENT_TYPE"; goto done; }
+        if ((fill && !GTK_IS_ENTRY(target)) || (!fill && !GTK_IS_BUTTON(target))) { error = "WRONG_ELEMENT_TYPE"; goto done; }
         if (!gtk_widget_is_sensitive(target)) { error = "DISABLED"; goto done; }
         if (!gtk_widget_is_visible(target) || !gtk_widget_get_mapped(target)) { error = "HIDDEN"; goto done; }
+        if (fill && !gtk_editable_get_editable(GTK_EDITABLE(target))) { error = "DISABLED"; goto done; }
         if (s->queue_full || s->pending_increments >= 64) { error = "QUEUE_FULL"; goto done; }
         d->pending_id = g_strdup(id);
         d->pending_token = ++d->sequence;
@@ -410,7 +431,20 @@ static void dev_request(Session *s, const char *record, gsize length) {
         s->enqueue_token = d->pending_token;
         /* Native semantic activation: emits GTK's clicked signal synchronously.
          * The C callback only queues an event, carrying this action token. */
-        g_signal_emit_by_name(target, "clicked");
+        if (fill) {
+            gtk_widget_grab_focus(target);
+            /* Replace atomically: GTK may emit changed for deletion and insertion.
+             * Queue one final snapshot and acknowledge after Tarn applies its view,
+             * including equal-value writes, which still represent an operation. */
+            g_signal_handlers_block_by_func(target, entry_changed, s);
+            gtk_editable_set_text(GTK_EDITABLE(target), dev_get_string(params, "text"));
+            g_signal_handlers_unblock_by_func(target, entry_changed, s);
+            gtk_editable_set_position(GTK_EDITABLE(target), -1);
+            entry_changed(GTK_EDITABLE(target), s);
+        } else {
+            if (gtk_widget_get_focus_on_click(target)) gtk_widget_grab_focus(target);
+            g_signal_emit_by_name(target, "clicked");
+        }
         s->enqueue_token = 0;
         d->timer = g_timeout_add(2000, dev_timeout, d);
     }
@@ -556,6 +590,7 @@ static int dev_start(Session *s) {
     gboolean valid = unique;
     for (unsigned i = 0; parts[i]; ++i) {
         if (g_str_equal(parts[i], "inspect")) d->inspect = TRUE;
+        else if (g_str_equal(parts[i], "fill")) d->fill = TRUE;
         else if (g_str_equal(parts[i], "click")) d->click = TRUE;
         else if (g_str_equal(parts[i], "close")) d->close = TRUE;
         else if (g_str_equal(parts[i], "screenshot")) d->screenshot = TRUE;

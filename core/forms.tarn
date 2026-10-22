@@ -1,0 +1,27 @@
+import "string"
+
+// Local form state: saving commits the draft for the current session only.
+pub struct NameForm { draft string
+    saved string }
+pub fn NameForm.new() NameForm { return NameForm{draft: "", saved: ""} }
+pub fn NameForm.edit(&mut self, text &string) { self.draft = text.clone() }
+pub fn NameForm.can_submit(&self) bool {
+    normalized := string.trim(&self.draft)
+    return !normalized.is_empty() && !normalized.eq(&self.saved)
+}
+pub fn NameForm.submit(&mut self) bool {
+    if !self.can_submit() { return false }
+    self.saved = string.trim(&self.draft)
+    self.draft = self.saved.clone()
+    return true
+}
+pub fn NameForm.value(&self) &string { return &self.draft }
+pub fn NameForm.can_reset(&self) bool { return !self.draft.eq(&self.saved) }
+pub fn NameForm.reset(&mut self) { self.draft = self.saved.clone() }
+pub fn NameForm.name(&self) &string { return &self.saved }
+pub fn NameForm.feedback(&self) string {
+    normalized := string.trim(&self.draft)
+    if normalized.is_empty() { return "Escribe un nombre; no puede contener solo espacios." }
+    if normalized.eq(&self.saved) { return "Nombre guardado para esta sesión." }
+    return "Tienes cambios pendientes. Pulsa Guardar nombre."
+}

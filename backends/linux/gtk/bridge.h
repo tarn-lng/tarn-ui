@@ -2,7 +2,7 @@
 #define TARN_UI_GTK_BRIDGE_H
 #include <stdint.h>
 
-/* ABI 6: pointers are opaque; input strings are copied during each call.
+/* ABI 11: pointers are opaque; input strings are copied during each call.
  * All operations require the Linux process main thread. release consumes a
  * valid session on that thread, including one whose window is already closed.
  * Status: 0 success; 1 invalid input, 2 wrong thread, 3 session active,
@@ -28,6 +28,25 @@ int32_t tarn_ui_gtk_add_label(void *session, const char *page, const char *key, 
 int32_t tarn_ui_gtk_add_button(void *session, const char *page, const char *key, const char *text, uint32_t action);
 int32_t tarn_ui_gtk_set_text(void *session, const char *key, const char *text);
 int32_t tarn_ui_gtk_show_page(void *session, const char *key);
+int32_t tarn_ui_gtk_add_box(void *session, const char *parent, const char *key, uint32_t horizontal, uint32_t spacing);
+/* Text styles: 0 body, 1 heading (level 2), 2 prominent value. */
+int32_t tarn_ui_gtk_add_text(void *session, const char *parent, const char *key, const char *text, uint32_t style);
+int32_t tarn_ui_gtk_set_primary(void *session, const char *key, uint32_t primary);
+int32_t tarn_ui_gtk_set_accessible(void *session, const char *key, const char *label, const char *description);
+int32_t tarn_ui_gtk_focus(void *session, const char *key);
 /* After applying an Increment or keyed component action in Tarn. */
 int32_t tarn_ui_gtk_complete_event(void *session, int32_t status);
+/* Entry changes enqueue owned text snapshots, limited to 256 Unicode characters.
+ * event_text is borrowed until next()/release(); copy before either call. */
+int32_t tarn_ui_gtk_add_entry(void *session, const char *parent, const char *key, const char *text, uint32_t action);
+const char *tarn_ui_gtk_event_text(void *session);
+int32_t tarn_ui_gtk_set_enabled(void *session, const char *key, uint32_t enabled);
+/* Model write: no changed action; rejects invalid UTF-8 or >256 characters. */
+int32_t tarn_ui_gtk_set_input(void *session, const char *key, const char *text);
+/* Exclusive dynamic GtkBox region, keyed button rows. Errors require scope exit.
+ * begin(count), item in desired order, end removes absent rows. Stable keys keep
+ * widgets and action IDs. The completed registry remains bounded to 256 keys. */
+int32_t tarn_ui_gtk_list_begin(void *session, const char *parent, uint32_t count);
+int32_t tarn_ui_gtk_list_item(void *session, const char *key, const char *text, uint32_t action);
+int32_t tarn_ui_gtk_list_end(void *session);
 #endif

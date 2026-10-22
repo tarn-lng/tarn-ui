@@ -6,11 +6,20 @@ compiler="${TARN_BIN:-$root/../tarn/target/debug/tarn}"
 build="$root/.build/navigation-tests"
 bash "$root/scripts/build-navigation.sh" --dev
 mkdir -p "$build/source/core"
-cp "$root/core/navigation.tarn" "$root/core/session.tarn" "$root/core/components.tarn" "$build/source/core/"
+cp "$root/core/forms.tarn" "$root/core/navigation.tarn" "$root/core/session.tarn" "$root/core/components.tarn" "$build/source/core/"
+cp "$root/examples/navigation/tasks.tarn" "$build/source/tasks.tarn"
 cp "$root/tests/navigation/state.tarn" "$build/source/main.tarn"
 "$compiler" build "$build/source/main.tarn" -o "$build/state" --json > "$build/state.compiler.jsonl"
 if rg -q '"severity":"warning"' "$build/state.compiler.jsonl"; then cat "$build/state.compiler.jsonl" >&2; exit 1; fi
 "$build/state" > "$build/state.log" 2>&1
+cp "$root/tests/navigation/forms.tarn" "$build/source/forms-test.tarn"
+"$compiler" build "$build/source/forms-test.tarn" -o "$build/forms-test" --json > "$build/forms.compiler.jsonl"
+if rg -q '"severity":"warning"' "$build/forms.compiler.jsonl"; then cat "$build/forms.compiler.jsonl" >&2; exit 1; fi
+"$build/forms-test" > "$build/forms.log" 2>&1
+cp "$root/tests/navigation/tasks.tarn" "$build/source/tasks-test.tarn"
+"$compiler" build "$build/source/tasks-test.tarn" -o "$build/tasks-test" --json > "$build/tasks.compiler.jsonl"
+if rg -q '"severity":"warning"' "$build/tasks.compiler.jsonl"; then cat "$build/tasks.compiler.jsonl" >&2; exit 1; fi
+"$build/tasks-test" > "$build/tasks.log" 2>&1
 cc -std=c11 -Wall -Wextra -Werror -g -fPIC -shared -DTARN_UI_TESTING -DTARN_UI_DEVTOOLS \
     "$root/backends/linux/gtk/bridge.c" -o "$build/libtarn_ui_gtk.so" \
     $(pkg-config --cflags --libs gtk4 json-glib-1.0)

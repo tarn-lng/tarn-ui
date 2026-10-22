@@ -3,7 +3,7 @@
 Status: **architectural direction approved**, with the constraints below.
 Phase 5 component update (2026-10-22): keyed labels/buttons and retained native
 pages now support owned property views and a bounded Tarn route history.
-The native ABI is 6. A per-session registry borrows widgets from the native tree;
+The native ABI is 11. A per-session registry borrows widgets from the native tree;
 it is released with the scoped session. There is no global component registry or
 Tarn callback crossing the FFI boundary. See
 [components and navigation](../components-navigation.md).

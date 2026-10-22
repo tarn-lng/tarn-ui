@@ -16,6 +16,11 @@ extern "C" fn tarn_ui_gtk_add_label(raw *mut NativeSession, page *u8, key *u8, t
 extern "C" fn tarn_ui_gtk_add_button(raw *mut NativeSession, page *u8, key *u8, text *u8, action u32) i32
 extern "C" fn tarn_ui_gtk_set_text(raw *mut NativeSession, key *u8, text *u8) i32
 extern "C" fn tarn_ui_gtk_show_page(raw *mut NativeSession, key *u8) i32
+extern "C" fn tarn_ui_gtk_add_box(raw *mut NativeSession, parent *u8, key *u8, horizontal u32, spacing u32) i32
+extern "C" fn tarn_ui_gtk_add_text(raw *mut NativeSession, parent *u8, key *u8, text *u8, style u32) i32
+extern "C" fn tarn_ui_gtk_set_primary(raw *mut NativeSession, key *u8, primary u32) i32
+extern "C" fn tarn_ui_gtk_set_accessible(raw *mut NativeSession, key *u8, label *u8, description *u8) i32
+extern "C" fn tarn_ui_gtk_focus(raw *mut NativeSession, key *u8) i32
 
 pub struct Error { pub code i32 }
 pub enum Event {
@@ -40,7 +45,7 @@ fn c_string(text &string) Result<ffi.CString, Error> {
 pub unsafe fn run(title string, heading string,
     body mut fn(&mut Session) Result<void, Error>) Result<void, Error> {
     unsafe {
-        if tarn_ui_gtk_abi() != 6 { return Err(Error{code: 7}) }
+        if tarn_ui_gtk_abi() != 11 { return Err(Error{code: 7}) }
     }
     c_title := try c_string(&title)
     c_heading := try c_string(&heading)
@@ -122,6 +127,40 @@ pub fn Session.show_page(&mut self, key string) Result<void, Error> {
     unsafe { return checked(tarn_ui_gtk_show_page(self.native, name.as_ptr())) }
 }
 
+pub fn Session.add_box(&mut self, parent string, key string, horizontal bool, spacing u32) Result<void, Error> {
+    c_parent := try c_string(&parent)
+    c_key := try c_string(&key)
+    var direction: u32 = 0
+    if horizontal { direction = 1 }
+    unsafe { return checked(tarn_ui_gtk_add_box(self.native, c_parent.as_ptr(), c_key.as_ptr(), direction, spacing)) }
+}
+
+pub fn Session.add_text(&mut self, parent string, key string, text string, style u32) Result<void, Error> {
+    c_parent := try c_string(&parent)
+    c_key := try c_string(&key)
+    c_text := try c_string(&text)
+    unsafe { return checked(tarn_ui_gtk_add_text(self.native, c_parent.as_ptr(), c_key.as_ptr(), c_text.as_ptr(), style)) }
+}
+
+pub fn Session.set_primary(&mut self, key string, primary bool) Result<void, Error> {
+    name := try c_string(&key)
+    var value: u32 = 0
+    if primary { value = 1 }
+    unsafe { return checked(tarn_ui_gtk_set_primary(self.native, name.as_ptr(), value)) }
+}
+
+pub fn Session.set_accessible(&mut self, key string, label string, description string) Result<void, Error> {
+    name := try c_string(&key)
+    c_label := try c_string(&label)
+    c_description := try c_string(&description)
+    unsafe { return checked(tarn_ui_gtk_set_accessible(self.native, name.as_ptr(), c_label.as_ptr(), c_description.as_ptr())) }
+}
+
+pub fn Session.focus(&mut self, key string) Result<void, Error> {
+    name := try c_string(&key)
+    unsafe { return checked(tarn_ui_gtk_focus(self.native, name.as_ptr())) }
+}
+
 pub fn Session.enable_counter(&mut self, value i64) Result<void, Error> {
     var status: i32 = 0
     unsafe { status = tarn_ui_gtk_enable_counter(self.native, value) }
@@ -157,4 +196,56 @@ pub fn Session.complete_event(&mut self) Result<void, Error> {
     unsafe { status = tarn_ui_gtk_complete_event(self.native, 0) }
     if status != 0 { return Err(Error{code: status}) }
     return Ok(())
+}
+
+extern "C" fn tarn_ui_gtk_add_entry(raw *mut NativeSession, parent *u8, key *u8, text *u8, action u32) i32
+extern "C" fn tarn_ui_gtk_event_text(raw *mut NativeSession) *u8
+
+pub fn Session.add_entry(&mut self, parent string, key string, text string, action u32) Result<void, Error> {
+    c_parent := try c_string(&parent)
+    c_key := try c_string(&key)
+    c_text := try c_string(&text)
+    unsafe { return checked(tarn_ui_gtk_add_entry(self.native, c_parent.as_ptr(), c_key.as_ptr(), c_text.as_ptr(), action)) }
+}
+
+pub fn Session.event_text(&self) Result<string, Error> {
+    unsafe {
+        pointer := tarn_ui_gtk_event_text(self.native)
+        if ffi.is_null(pointer) { return Err(Error{code: 6}) }
+        match ffi.string_from_c(pointer) {
+            Some(text) => { return Ok(text) }
+            None => { return Err(Error{code: 1}) }
+        }
+    }
+}
+
+extern "C" fn tarn_ui_gtk_set_enabled(raw *mut NativeSession, key *u8, enabled u32) i32
+pub fn Session.set_enabled(&mut self, key string, enabled bool) Result<void, Error> {
+    name := try c_string(&key)
+    var value: u32 = 0
+    if enabled { value = 1 }
+    unsafe { return checked(tarn_ui_gtk_set_enabled(self.native, name.as_ptr(), value)) }
+}
+
+extern "C" fn tarn_ui_gtk_set_input(raw *mut NativeSession, key *u8, text *u8) i32
+pub fn Session.set_input(&mut self, key string, text string) Result<void, Error> {
+    name := try c_string(&key)
+    value := try c_string(&text)
+    unsafe { return checked(tarn_ui_gtk_set_input(self.native, name.as_ptr(), value.as_ptr())) }
+}
+
+extern "C" fn tarn_ui_gtk_list_begin(raw *mut NativeSession, parent *u8, count u32) i32
+extern "C" fn tarn_ui_gtk_list_item(raw *mut NativeSession, key *u8, text *u8, action u32) i32
+extern "C" fn tarn_ui_gtk_list_end(raw *mut NativeSession) i32
+pub fn Session.list_begin(&mut self, parent string, count u32) Result<void, Error> {
+    key := try c_string(&parent)
+    unsafe { return checked(tarn_ui_gtk_list_begin(self.native, key.as_ptr(), count)) }
+}
+pub fn Session.list_item(&mut self, key string, text string, action u32) Result<void, Error> {
+    name := try c_string(&key)
+    label := try c_string(&text)
+    unsafe { return checked(tarn_ui_gtk_list_item(self.native, name.as_ptr(), label.as_ptr(), action)) }
+}
+pub fn Session.list_end(&mut self) Result<void, Error> {
+    unsafe { return checked(tarn_ui_gtk_list_end(self.native)) }
 }

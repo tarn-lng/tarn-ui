@@ -13,7 +13,8 @@ if [[ ${1:-} == --dev ]]; then
     flags+=(-DTARN_UI_DEVTOOLS)
 fi
 mkdir -p "$build/source/core"
-cp "$root/core/session.tarn" "$root/core/components.tarn" "$root/core/navigation.tarn" "$build/source/core/"
+cp "$root/core/session.tarn" "$root/core/components.tarn" "$root/core/navigation.tarn" "$root/core/forms.tarn" "$build/source/core/"
+cp "$root/examples/navigation/tasks.tarn" "$build/source/tasks.tarn"
 cp "$root/examples/navigation/main.tarn" "$build/source/main.tarn"
 cc -std=c11 -Wall -Wextra -Werror -fPIC -shared "${flags[@]}" \
     "$root/backends/linux/gtk/bridge.c" -o "$build/libtarn_ui_gtk.so" \
@@ -24,10 +25,10 @@ if rg -q '"severity":"warning"' "$build/compiler.jsonl"; then cat "$build/compil
 {
     "$compiler" version
     pkg-config --modversion "${packages[@]}"
-    sha256sum "$compiler" "$root/core/session.tarn" "$root/core/components.tarn" "$root/core/navigation.tarn" \
-        "$root/examples/navigation/main.tarn" "$root/backends/linux/gtk/bridge.c" "$root/backends/linux/gtk/bridge.h" \
+    sha256sum "$compiler" "$root/core/session.tarn" "$root/core/components.tarn" "$root/core/navigation.tarn" "$root/core/forms.tarn" \
+        "$root/examples/navigation/main.tarn" "$root/examples/navigation/tasks.tarn" "$root/backends/linux/gtk/bridge.c" "$root/backends/linux/gtk/bridge.h" \
         "$build/libtarn_ui_gtk.so"
     if [[ ${1:-} == --dev ]]; then sha256sum "$root/backends/linux/gtk/devtools.inc"; fi
-    printf 'ABI=6\nLD_LIBRARY_PATH=%s\n' "$build"
+    printf 'ABI=11\nLD_LIBRARY_PATH=%s\n' "$build"
 } > "$build/provenance.txt"
 printf 'Built %s/navigation\n' "$build"

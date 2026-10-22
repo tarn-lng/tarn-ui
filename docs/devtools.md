@@ -135,6 +135,50 @@ lento haya impedido ejecutar el temporizador. En ese caso se cancela el canal.
 Un timeout o una desconexión no revierte acciones ya admitidas: no debe asumirse
 que es seguro repetirlas como si no hubieran ocurrido.
 
+### `ui.fill`
+
+Reemplaza el contenido de un `GtkEntry` identificado por clave estable. Requiere
+el permiso explícito `fill`; `click` no lo autoriza y `fill` no concede lectura de
+texto. Los binarios normales siguen sin incluir el canal de desarrollo.
+
+```json
+{"version":1,"request_id":"name1","method":"ui.fill","params":{"window_id":"main","element_id":"name-input","text":"Ana María"}}
+```
+
+El campo debe estar visible, habilitado y ser editable. `text` es obligatorio,
+puede estar vacío y admite hasta 256 caracteres Unicode; rechaza NUL, saltos de
+línea y retornos de carro. Los valores inválidos se rechazan antes de escribir,
+sin truncarlos. Un tipo incorrecto devuelve `WRONG_ELEMENT_TYPE`; un campo oculto
+`HIDDEN`; uno deshabilitado o no editable `DISABLED`. El campo recibe el foco
+nativo (en GTK, el foco concreto puede pertenecer a su hijo interno `GtkText`).
+
+La sustitución encola un único snapshot final con token, incluso si el valor
+coincide con el anterior. La respuesta llega después de que Tarn procese la
+edición, aplique la vista derivada y confirme el evento. Tiene las mismas reglas
+de revisión, orden, error de aplicación y timeout que `ui.click`. No simula
+pulsaciones, composición IME ni teclas de envío. La respuesta no devuelve el texto;
+para leerlo mediante `ui.inspect` sigue siendo necesario `--allow-text`.
+
+También se publica como herramienta MCP `ui.fill` solo cuando `fill` está
+concedido. Su esquema exige `element_id` y `text`, con `maxLength:256`.
+`window_id` puede omitirse ante el lanzador, que usa `main`.
+
+Para ejecutar el formulario real con este permiso:
+
+```bash
+bash scripts/build-navigation.sh --dev
+bash scripts/build-launcher.sh
+.build/launcher/tarn-ui --mode mcp \
+  --binary "$PWD/.build/navigation-dev/navigation" \
+  --library-path "$PWD/.build/navigation-dev" \
+  --allow inspect click fill close --allow-text
+```
+
+La integración `bash scripts/test-navigation.sh` prueba escribir, guardar,
+navegar, restablecer, valores vacíos e iguales, límites Unicode, permisos de
+escritura y lectura independientes, solicitudes en secuencia y errores de
+aplicación. El flujo de la demo usa protocolo y MCP, sin hooks de edición.
+
 ### `ui.close`
 
 Encola el cierre nativo y deja que Tarn devuelva el control al runner. Este

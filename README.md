@@ -2,7 +2,11 @@
 
 La fase 5 tiene [estado reactivo y vistas derivadas](docs/reactivity.md) y
 [componentes reutilizables con navegación](docs/components-navigation.md).
-Las dos pantallas comparten estado y conservan sus controles GTK al volver.
+Las pantallas comparten estado y conservan sus controles GTK al volver.
+La demo incluye una [lista dinámica editable](docs/dynamic-lists.md) que conserva
+la identidad de las filas al reordenarlas y libera las retiradas.
+El formulario permite guardar y restablecer un nombre; el agente puede probarlo
+mediante [`ui.fill` con permiso explícito](docs/devtools.md#uifill).
 [Próximos pasos y recordatorio de memoria aplazado](docs/roadmap.md).
 
 Contador nativo GTK4 con estado y lógica de aplicación en Tarn. El puente C

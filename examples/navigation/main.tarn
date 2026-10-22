@@ -1,68 +1,123 @@
 import "core/session"
 import "core/components"
 import "core/navigation"
+import "core/forms"
 import "string"
 import "os"
+import "tasks"
 
 // A reusable application component, instantiated with different stable keys.
 fn counter_value(key string, value i64) components.Node {
-    return components.label(key, string.from_i64(value))
+    return components.number(key, string.from_i64(value))
 }
 
 fn home_page(value i64) components.Page {
     var children: Vec<components.Node> = Vec.new()
-    children.push(components.label("home-title", "Contador"))
-    children.push(counter_value("home-value", value))
-    children.push(components.button("home-add", "Incrementar", 1))
-    children.push(components.button("open-details", "Ver resumen", 2))
+    var summary: Vec<components.Node> = Vec.new()
+    summary.push(components.heading("home-title", "Tu progreso"))
+    summary.push(counter_value("home-value", value))
+    children.push(components.column("home-summary", 6, summary))
+    var actions: Vec<components.Node> = Vec.new()
+    actions.push(components.primary_button("home-add", "Sumar 1", 1))
+    actions.push(components.button("open-details", "Ver resumen", 2))
+    children.push(components.row("home-actions", 12, actions))
+    children.push(components.label("name-label", "Nombre para tu contador"))
+    children.push(components.input("name-input", "", 4))
+    children.push(components.label("name-feedback", "Escribe un nombre para personalizar el resumen."))
+    children.push(components.primary_button("save-name", "Guardar nombre", 5))
+    children.push(components.button("reset-name", "Restablecer", 6))
+    children.push(components.button("open-tasks", "Abrir mi lista", 7))
     return components.Page{key: "home", children: children}
 }
 
 fn details_page(value i64) components.Page {
     var children: Vec<components.Node> = Vec.new()
-    children.push(components.label("details-title", "Resumen"))
-    children.push(counter_value("details-value", value))
-    children.push(components.label("details-parity", "El valor es par"))
-    children.push(components.button("details-add", "Sumar desde el resumen", 1))
-    children.push(components.button("go-back", "Volver al contador", 3))
+    var summary: Vec<components.Node> = Vec.new()
+    summary.push(components.heading("details-title", "Resumen del contador"))
+    summary.push(counter_value("details-value", value))
+    summary.push(components.label("details-parity", "El valor es par"))
+    children.push(components.column("details-summary", 6, summary))
+    var actions: Vec<components.Node> = Vec.new()
+    actions.push(components.primary_button("details-add", "Sumar 1", 1))
+    actions.push(components.button("go-back", "Volver al contador", 3))
+    children.push(components.row("details-actions", 12, actions))
     return components.Page{key: "details", children: children}
 }
 
-fn view(value i64, route &string) components.View {
+fn view(value i64, route &string, form &forms.NameForm, list &tasks.Model) components.View {
     var texts: Vec<components.Text> = Vec.new()
     texts.push(components.Text{key: "home-value", text: string.from_i64(value)})
     texts.push(components.Text{key: "details-value", text: string.from_i64(value)})
     var parity = "El valor es par"
     if value % 2 != 0 { parity = "El valor es impar" }
     texts.push(components.Text{key: "details-parity", text: parity})
-    return components.View{route: route.clone(), texts: texts}
+    feedback := form.feedback()
+    var title = "Resumen del contador"
+    if !form.name().is_empty() { title = "Resumen de " + form.name().clone() }
+    texts.push(components.Text{key: "name-feedback", text: feedback})
+    texts.push(components.Text{key: "details-title", text: title})
+    var enabled: Vec<components.Enabled> = Vec.new()
+    enabled.push(components.Enabled{key: "save-name", value: form.can_submit()})
+    enabled.push(components.Enabled{key: "reset-name", value: form.can_reset()})
+    var inputs: Vec<components.Text> = Vec.new()
+    inputs.push(components.Text{key: "name-input", text: form.value().clone()})
+    texts.push(components.Text{key: "tasks-count", text: string.from_u64(u64(list.count())) + " elementos"})
+    inputs.push(components.Text{key: "task-input", text: list.value().clone()})
+    enabled.push(components.Enabled{key: "task-add", value: list.can_add()})
+    enabled.push(components.Enabled{key: "task-edit", value: list.can_edit()})
+    enabled.push(components.Enabled{key: "task-remove", value: list.selected_id() != 0})
+    enabled.push(components.Enabled{key: "task-up", value: list.can_up()})
+    var lists: Vec<components.List> = Vec.new()
+    lists.push(components.List{key: "task-list", items: list.items()})
+    return components.View{route: route.clone(), texts: texts, enabled: enabled, inputs: inputs, lists: lists}
 }
 
 fn run(ui &mut session.Session) Result<void, session.Error> {
     var routes: Vec<string> = Vec.new()
     routes.push("home")
     routes.push("details")
+    routes.push("tasks")
     var navigator = try navigation.Navigator.new(routes, "home")
     var value: i64 = 0
+    var form = forms.NameForm.new()
+    var list = tasks.Model.new()
     try home_page(value).mount(ui)
     try details_page(value).mount(ui)
-    return components.drive(ui, view(value, navigator.current()),
-        fn(action u32) Result<components.View, session.Error> {
-                if action == 1 {
-                    if value == 9223372036854775807 { return Err(session.Error{code: 9}) }
-                    value = value + 1
-                } else if action == 2 {
-                    try navigator.push("details")
-                } else if action == 3 {
-                    navigator.back()
-                } else { return Err(session.Error{code: 1}) }
-                return Ok(view(value, navigator.current()))
+    try tasks.page().mount(ui)
+    try ui.set_accessible("task-input", "Texto de la fila", "Escribe para añadir una fila o editar la selección.")
+    try ui.set_accessible("home-add", "Incrementar el contador", "Suma uno al valor compartido entre las dos pantallas.")
+    try ui.set_accessible("open-details", "Ver resumen del contador", "Abre el resumen conservando el valor actual.")
+    try ui.set_accessible("details-add", "Incrementar desde el resumen", "Actualiza también el contador de la pantalla principal.")
+    try ui.set_accessible("go-back", "Volver al contador", "Regresa a la pantalla principal conservando el valor.")
+    try ui.set_accessible("name-input", "Nombre del contador", "Hasta 256 caracteres. Pulsa Guardar nombre para aplicar los cambios.")
+    try ui.set_accessible("save-name", "Guardar nombre del contador", "Aplica el nombre válido al resumen durante esta sesión.")
+    try ui.set_accessible("reset-name", "Restablecer nombre", "Recupera el último nombre guardado en esta sesión.")
+    return components.drive_input(ui, view(value, navigator.current(), &form, &list),
+        fn(action u32, text string) Result<components.View, session.Error> {
+            if action == 1 {
+                if value == 9223372036854775807 { return Err(session.Error{code: 9}) }
+                value = value + 1
+            } else if action == 2 {
+                try navigator.push("details")
+            } else if action == 3 {
+                navigator.back()
+            } else if action == 4 {
+                form.edit(&text)
+            } else if action == 5 {
+                form.submit()
+            } else if action == 6 {
+                form.reset()
+            } else if action == 7 { try navigator.push("tasks")
+            } else if action == 13 { navigator.back()
+            } else if action >= 8 { list.reduce(action, &text)
+            } else { return Err(session.Error{code: 1}) }
+            return Ok(view(value, navigator.current(), &form, &list))
         })
 }
 
 fn main() {
     unsafe {
-        match session.run("Tarn UI · navegación", "Componentes y navegación",
+        match session.run("Tarn UI · navegación", "Mi contador",
             fn(ui &mut session.Session) Result<void, session.Error> { return run(ui) }) {
             Ok(_) => { print("closed") }
             Err(error) => { print(error.code)

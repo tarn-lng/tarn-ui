@@ -1,4 +1,4 @@
-// Owned descriptions built with ordinary functions. Mount once per scoped session.
+// Owned descriptions: static pages plus scoped keyed dynamic list regions.
 import "core/session"
 
 pub struct Label { pub key string
@@ -7,32 +7,121 @@ pub struct Button { pub key string
     pub text string
     pub action u32 }
 pub enum Node { Text(Label)
-    Press(Button) }
+    Press(Button)
+    Heading(Label)
+    Value(Label)
+    Primary(Button)
+    Group(Container)
+    Input(Button) }
+pub struct Container { pub key string
+    pub horizontal bool
+    pub spacing u32
+    pub children Vec<Node> }
 pub struct Page { pub key string
     pub children Vec<Node> }
 pub struct Text { pub key string
     pub text string }
+pub struct Enabled { pub key string
+    pub value bool }
+pub struct List { pub key string
+    pub items Vec<Button> }
 pub struct View { pub route string
-    pub texts Vec<Text> }
+    pub texts Vec<Text>
+    pub enabled Vec<Enabled>
+    pub inputs Vec<Text>
+    pub lists Vec<List> }
 
 pub fn label(key string, text string) Node { return Node.Text(Label{key: key, text: text}) }
 pub fn button(key string, text string, action u32) Node {
     return Node.Press(Button{key: key, text: text, action: action})
 }
+pub fn input(key string, text string, action u32) Node {
+    return Node.Input(Button{key: key, text: text, action: action})
+}
+pub fn heading(key string, text string) Node { return Node.Heading(Label{key: key, text: text}) }
+pub fn number(key string, text string) Node { return Node.Value(Label{key: key, text: text}) }
+pub fn primary_button(key string, text string, action u32) Node {
+    return Node.Primary(Button{key: key, text: text, action: action})
+}
+pub fn row(key string, spacing u32, children Vec<Node>) Node {
+    return Node.Group(Container{key: key, horizontal: true, spacing: spacing, children: children})
+}
+pub fn column(key string, spacing u32, children Vec<Node>) Node {
+    return Node.Group(Container{key: key, horizontal: false, spacing: spacing, children: children})
+}
 
-pub fn Page.mount(&self, ui &mut session.Session) Result<void, session.Error> {
-    try ui.add_page(self.key.clone())
-    for child in self.children.as_slice() {
+fn mount(ui &mut session.Session, parent &string, children &[]Node, depth u32) Result<void, session.Error> {
+    for child in children {
         match child {
-            Node.Text(value) => { try ui.add_label(self.key.clone(), value.key.clone(), value.text.clone()) }
-            Node.Press(value) => { try ui.add_button(self.key.clone(), value.key.clone(), value.text.clone(), value.action) }
+            Node.Input(value) => { try ui.add_entry(parent.clone(), value.key.clone(), value.text.clone(), value.action) }
+            Node.Text(value) => { try ui.add_label(parent.clone(), value.key.clone(), value.text.clone()) }
+            Node.Press(value) => { try ui.add_button(parent.clone(), value.key.clone(), value.text.clone(), value.action) }
+            Node.Heading(value) => { try ui.add_text(parent.clone(), value.key.clone(), value.text.clone(), 1) }
+            Node.Value(value) => { try ui.add_text(parent.clone(), value.key.clone(), value.text.clone(), 2) }
+            Node.Primary(value) => {
+                try ui.add_button(parent.clone(), value.key.clone(), value.text.clone(), value.action)
+                try ui.set_primary(value.key.clone(), true)
+            }
+            Node.Group(value) => {
+                if depth >= 12 { return Err(session.Error{code: 1}) }
+                try ui.add_box(parent.clone(), value.key.clone(), value.horizontal, value.spacing)
+                try mount(ui, &value.key, value.children.as_slice(), depth + 1)
+            }
         }
     }
     return Ok(())
 }
 
+pub fn Page.mount(&self, ui &mut session.Session) Result<void, session.Error> {
+    try ui.add_page(self.key.clone())
+    return mount(ui, &self.key, self.children.as_slice(), 0)
+}
+
 fn View.validate(&self) Result<void, session.Error> {
     if self.route.is_empty() || self.texts.len() > 256 { return Err(session.Error{code: 1}) }
+    if self.enabled.len() > 256 { return Err(session.Error{code: 1}) }
+    var enabled_index: usize = 0
+    for value in self.enabled.as_slice() {
+        if value.key.is_empty() { return Err(session.Error{code: 1}) }
+        var previous: usize = 0
+        for previous < enabled_index {
+            if self.enabled.as_slice()[previous].key.eq(&value.key) { return Err(session.Error{code: 1}) }
+            previous = previous + 1
+        }
+        enabled_index = enabled_index + 1
+    }
+    if self.inputs.len() > 256 { return Err(session.Error{code: 1}) }
+    var input_index: usize = 0
+    for value in self.inputs.as_slice() {
+        if value.key.is_empty() { return Err(session.Error{code: 1}) }
+        var previous: usize = 0
+        for previous < input_index {
+            if self.inputs.as_slice()[previous].key.eq(&value.key) { return Err(session.Error{code: 1}) }
+            previous = previous + 1
+        }
+        input_index = input_index + 1
+    }
+    if self.lists.len() > 256 { return Err(session.Error{code: 1}) }
+    var list_index: usize = 0
+    for list in self.lists.as_slice() {
+        if list.key.is_empty() || list.items.len() > 256 { return Err(session.Error{code: 1}) }
+        var previous: usize = 0
+        for previous < list_index {
+            if self.lists.as_slice()[previous].key.eq(&list.key) { return Err(session.Error{code: 1}) }
+            previous = previous + 1
+        }
+        var item_index: usize = 0
+        for item in list.items.as_slice() {
+            if item.key.is_empty() || item.action < 1 || item.action > 1024 { return Err(session.Error{code: 1}) }
+            var before: usize = 0
+            for before < item_index {
+                if list.items.as_slice()[before].key.eq(&item.key) { return Err(session.Error{code: 1}) }
+                before = before + 1
+            }
+            item_index = item_index + 1
+        }
+        list_index = list_index + 1
+    }
     var index: usize = 0
     for value in self.texts.as_slice() {
         if value.key.is_empty() { return Err(session.Error{code: 1}) }
@@ -48,13 +137,23 @@ fn View.validate(&self) Result<void, session.Error> {
 
 fn View.apply(&self, ui &mut session.Session) Result<void, session.Error> {
     try self.validate()
+    try self.reconcile_lists(ui)
     for value in self.texts.as_slice() { try ui.set_text(value.key.clone(), value.text.clone()) }
+    for value in self.inputs.as_slice() { try ui.set_input(value.key.clone(), value.text.clone()) }
+    for value in self.enabled.as_slice() { try ui.set_enabled(value.key.clone(), value.value) }
     try ui.show_page(self.route.clone())
     return Ok(())
 }
 
 fn View.update(&self, previous &View, ui &mut session.Session) Result<void, session.Error> {
     try self.validate()
+    for list in self.lists.as_slice() {
+        var equal = false
+        for before in previous.lists.as_slice() {
+            if before.key.eq(&list.key) && list.same(before) { equal = true }
+        }
+        if !equal { try list.apply(ui) }
+    }
     for value in self.texts.as_slice() {
         var equal = false
         for before in previous.texts.as_slice() {
@@ -62,11 +161,25 @@ fn View.update(&self, previous &View, ui &mut session.Session) Result<void, sess
         }
         if !equal { try ui.set_text(value.key.clone(), value.text.clone()) }
     }
+    for value in self.enabled.as_slice() {
+        var equal = false
+        for before in previous.enabled.as_slice() {
+            if before.key.eq(&value.key) && before.value == value.value { equal = true }
+        }
+        if !equal { try ui.set_enabled(value.key.clone(), value.value) }
+    }
+    for value in self.inputs.as_slice() {
+        var equal = false
+        for before in previous.inputs.as_slice() {
+            if before.key.eq(&value.key) && before.text.eq(&value.text) { equal = true }
+        }
+        if !equal { try ui.set_input(value.key.clone(), value.text.clone()) }
+    }
     if !self.route.eq(&previous.route) { try ui.show_page(self.route.clone()) }
     return Ok(())
 }
 
-// Mounted topology is fixed; actions return owned property/route descriptions.
+// Pages stay mounted; actions return owned property, route and list descriptions.
 // The application callback owns its model and never receives native authority.
 pub fn drive(ui &mut session.Session, initial View,
     update mut fn(u32) Result<View, session.Error>) Result<void, session.Error> {
@@ -85,4 +198,45 @@ pub fn drive(ui &mut session.Session, initial View,
             }
         }
     }
+}
+
+// Entry changes carry an owned snapshot; button activations carry an empty string.
+pub fn drive_input(ui &mut session.Session, initial View,
+    update mut fn(u32, string) Result<View, session.Error>) Result<void, session.Error> {
+    var shown = initial
+    try shown.apply(ui)
+    for {
+        event := try ui.next_action()
+        match event {
+            session.Action.Closed => { return Ok(()) }
+            session.Action.Opened => {}
+            session.Action.Activate(action) => {
+                text := try ui.event_text()
+                next := try update(action, text)
+                try next.update(&shown, ui)
+                shown = next
+                try ui.complete_event()
+            }
+        }
+    }
+}
+
+fn List.same(&self, other &List) bool {
+    if self.items.len() != other.items.len() { return false }
+    var index: usize = 0
+    for item in self.items.as_slice() {
+        before := &other.items.as_slice()[index]
+        if !item.key.eq(&before.key) || !item.text.eq(&before.text) || item.action != before.action { return false }
+        index = index + 1
+    }
+    return true
+}
+fn List.apply(&self, ui &mut session.Session) Result<void, session.Error> {
+    try ui.list_begin(self.key.clone(), u32(self.items.len()))
+    for item in self.items.as_slice() { try ui.list_item(item.key.clone(), item.text.clone(), item.action) }
+    return ui.list_end()
+}
+fn View.reconcile_lists(&self, ui &mut session.Session) Result<void, session.Error> {
+    for list in self.lists.as_slice() { try list.apply(ui) }
+    return Ok(())
 }

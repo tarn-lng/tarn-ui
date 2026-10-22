@@ -1,7 +1,9 @@
 import "core/components"
+import "core/forms"
 import "core/session"
 import "os"
 import "string"
+extern "C" fn test_entry_edits() i32
 extern "C" fn test_clean() i32
 extern "C" fn test_component_text_calls() u32
 extern "C" fn test_page_calls() u32
@@ -9,7 +11,7 @@ extern "C" fn test_page_calls() u32
 fn view() components.View {
     var texts: Vec<components.Text> = Vec.new()
     texts.push(components.Text{key: "value", text: "0"})
-    return components.View{route: "home", texts: texts}
+    return components.View{route: "home", texts: texts, enabled: Vec.new(), inputs: Vec.new(), lists: Vec.new()}
 }
 
 fn main() {
@@ -20,12 +22,64 @@ fn main() {
             var children: Vec<components.Node> = Vec.new()
             children.push(components.label("value", "0"))
             children.push(components.button("trigger", "Action", 1))
+            if mode.eq(&"input") || mode.eq(&"form") || mode.eq(&"disabled-input") || mode.eq(&"fill-error") { children.push(components.input("input", "", 4)) }
+            if mode.eq(&"form") { children.push(components.primary_button("save", "Guardar", 5))
+                children.push(components.button("reset", "Restablecer", 6)) }
+            var empty: Vec<components.Node> = Vec.new()
+            children.push(components.column("fixture-list", 0, empty))
             page := components.Page{key: "home", children: children}
             try page.mount(ui)
+            if mode.eq(&"disabled-input") { try ui.set_enabled("input", false) }
+            if mode.eq(&"form") {
+                var form = forms.NameForm.new()
+                var initial = view()
+                initial.enabled.push(components.Enabled{key: "save", value: false})
+                return components.drive_input(ui, initial, fn(action u32, text string) Result<components.View, session.Error> {
+                    if action == 1 {
+                        unsafe { if test_entry_edits() != 1 { return Err(session.Error{code: 1}) } }
+                    } else if action == 4 { form.edit(&text) } else if action == 5 { form.submit() } else if action == 6 { form.reset() }
+                    var next = view()
+                    next.texts = Vec.new()
+                    next.texts.push(components.Text{key: "value", text: form.name().clone()})
+                    next.enabled.push(components.Enabled{key: "save", value: form.can_submit()})
+                    next.inputs.push(components.Text{key: "input", text: form.value().clone()})
+                    return Ok(next)
+                })
+            }
+            if mode.eq(&"input") {
+                unsafe { if test_entry_edits() != 1 { return Err(session.Error{code: 1}) } }
+                var edits: u32 = 0
+                return components.drive_input(ui, view(), fn(action u32, text string) Result<components.View, session.Error> {
+                    var next = view()
+                    if action == 4 {
+                        edits = edits + 1
+                        if edits == 1 && !text.eq(&"Ana") { return Err(session.Error{code: 1}) }
+                        if edits == 2 && !text.eq(&"Ana María") { return Err(session.Error{code: 1}) }
+                        next.texts = Vec.new()
+                        next.texts.push(components.Text{key: "value", text: text})
+                    }
+                    return Ok(next)
+                })
+            }
             return components.drive(ui, view(), fn(action u32) Result<components.View, session.Error> {
-                if mode.eq(&"error") { return Err(session.Error{code: 99}) }
+                if mode.eq(&"error") || mode.eq(&"fill-error") { return Err(session.Error{code: 99}) }
                 var next = view()
                 if mode.eq(&"duplicate") { next.texts.push(components.Text{key: "value", text: "wrong"}) }
+                if mode.eq(&"duplicate-enabled") {
+                    next.enabled.push(components.Enabled{key: "trigger", value: true})
+                    next.enabled.push(components.Enabled{key: "trigger", value: false})
+                }
+                if mode.eq(&"duplicate-list") {
+                    var items: Vec<components.Button> = Vec.new()
+                    items.push(components.Button{key: "row", text: "A", action: 2})
+                    items.push(components.Button{key: "row", text: "B", action: 3})
+                    next.lists.push(components.List{key: "fixture-list", items: items})
+                }
+                if mode.eq(&"list-collision") {
+                    var items: Vec<components.Button> = Vec.new()
+                    items.push(components.Button{key: "trigger", text: "Collision", action: 1})
+                    next.lists.push(components.List{key: "fixture-list", items: items})
+                }
                 if mode.eq(&"route") { next.route = "missing" }
                 return Ok(next)
             })
