@@ -14,6 +14,7 @@ if rg -q '"severity":"warning"' "$evidence/compiler.jsonl"; then
 fi
 "$evidence/probe" "$root" "$compiler" > "$evidence/success.json" 2> "$evidence/success.stderr"
 fixture=$(mktemp -d "$evidence/invalid.XXXXXXXX")
+printf '%s\n' "$fixture" > "$evidence/invalid-root.txt"
 mkdir -p "$fixture/core" "$fixture/examples/counter" "$fixture/backends/linux/gtk"
 cp "$root/core/session.tarn" "$fixture/core/"
 cp "$root/examples/counter/counter.tarn" "$fixture/examples/counter/"

@@ -61,9 +61,39 @@ El bootstrap reservado `session.authorize` acepta únicamente `session_id`.
 No se admiten campos adicionales, claves duplicadas, tipos incorrectos, UTF-8
 inválido, NUL, comentarios JSON ni versiones distintas de 1. La captura se autoriza con `--allow screenshot --allow-capture`; recibe
 `window_id` y opcionalmente `min_revision`. Espera un frame real y devuelve PNG,
-dimensiones, revisión y hash. No existen métodos de escritura de texto, shell
-o reconstrucción. `--mode mcp` usa el adaptador MCP stdio en Tarn; consulta el
+dimensiones, revisión y hash. El protocolo nativo no incluye escritura de texto,
+shell ni reconstrucción. `--mode mcp` usa el adaptador MCP stdio en Tarn; consulta el
 [contrato y sus pruebas](launcher-migration.md#mcp-stdio-boundary).
+
+En MCP, `project.build` está disponible únicamente con `--allow-build` y rutas
+absolutas configuradas al iniciar:
+
+```bash
+.build/launcher/tarn-ui --mode mcp --allow inspect click close \
+  --allow-text --allow-build --project-root "$PWD" \
+  --compiler "$PWD/../tarn/target/debug/tarn"
+```
+
+La llamada toma `arguments:{}` y ejecuta la receta fija del contador en Tarn.
+Devuelve el binario generado o los diagnósticos reales del compilador. Tras un
+build correcto, `ui.start` usa ese binario; un fallo conserva la selección anterior.
+Hay que cerrar la ventana antes de reconstruir. Esta autorización no concede
+acceso a capturas; esas conservan su permiso independiente.
+
+Para guardar capturas, incluye `screenshot` en `--allow`, añade `--allow-capture`
+y `--capture-dir /ruta/absoluta/directorio-nuevo`. El directorio debe ser nuevo
+y su padre debe existir. Se crea con 0700; los PNG se crean de forma exclusiva
+con 0600. Un directorio existente se rechaza. Sin `--capture-dir`, la captura se
+valida y se devuelve en MCP, pero no se guarda.
+
+Tarn comprueba Base64, SHA-256, sesión, revisión y estructura/dimensiones/CRC del
+PNG antes de escribir. El resultado guardado añade `artifact:{path,bytes,sha256}`
+y conserva el contenido de imagen MCP. Los archivos persisten después de cerrar
+la ventana. Una interrupción abrupta puede dejar un archivo parcial privado;
+no se promete persistencia atómica ante caída del sistema.
+
+La aceptación se reproduce con `bash scripts/test-mcp-build.sh`, seguida de
+`bash scripts/test-artifacts.sh` y `bash scripts/test-private-creation.sh`.
 
 ### `ui.inspect`
 

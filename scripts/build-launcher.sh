@@ -15,7 +15,7 @@ if rg -q '"severity":"warning"' "$build/compiler.jsonl"; then
 fi
 {
     "$compiler" version
-    sha256sum "$compiler" "$root/devtools/main.tarn" "$root/devtools/session.tarn" "$root/devtools/wire.tarn" "$root/devtools/mcp.tarn"
+    sha256sum "$compiler" "$root/devtools/main.tarn" "$root/devtools/session.tarn" "$root/devtools/wire.tarn" "$root/devtools/mcp.tarn" "$root/devtools/build.tarn" "$root/devtools/process_run.tarn" "$root/devtools/artifact.tarn"
     uname -sr
 } > "$build/provenance.txt"
 printf 'Built %s\n' "$build/tarn-ui"

@@ -22,7 +22,8 @@ bash scripts/build-launcher.sh
 The build script defaults to `../tarn/target/debug/tarn`; `TARN_BIN` selects an
 explicit compiler. The launcher defaults to `.build/counter-dev/counter` and
 accepts `--binary` and `--library-path` at startup. Tool requests cannot change
-those paths, execute builds or expand permissions. The GTK development example
+those paths or expand permissions. Builds require the separate startup grant
+described below. The GTK development example
 must already be built. Its existing backend remains unchanged by this migration.
 
 The build script rejects compiler warnings and records compiler/source hashes in
@@ -93,7 +94,9 @@ Screenshot additionally requires `--allow-capture`. Native text requires
 `structuredContent`, textual content and `isError`. Screenshots additionally
 carry the actual PNG as MCP image content with native revision, dimensions and
 SHA-256 metadata. `ui.close` is answered after successful child completion.
-There are no shell, build, path-selection, HTTP, resource or prompt tools.
+The optional `project.build` tool runs only the fixed counter recipe, using
+startup-configured absolute project/compiler paths. There are no shell,
+request-selected path, HTTP, resource or prompt tools.
 
 EOF closes an active native session through the same runner. Operation errors
 are MCP tool errors, distinct from JSON-RPC parse/method errors. Unknown
@@ -175,22 +178,25 @@ duplicate JSON, and extra bytes on protocol stdout. Readiness registrations are
 retired at pipe EOF and receive progress resets the idle timeout to preserve the
 Python socket behavior.
 
-This closes the launcher migration and the listed acceptance checks. A runtime
-project-build tool, saved screenshot artifact store and broader MCP transports
-are outside this launcher change. The known GTK render/LSan findings remain
+This closes the launcher migration and the listed acceptance checks. The runtime
+project-build follow-up is documented below. Private screenshot artifacts are now supported as described below;
+broader MCP transports remain outside this phase. The known GTK render/LSan findings remain
 separate and unresolved; this report does not turn their earlier failures green.
 
 ## Phase 4 follow-up: private captures and fixed project build
 
-Private capture persistence is pending a public stdlib capability. With the
-currently supplied compiler, `fs.create_dir` and `File.create_new` expose no
+Private creation permissions are resolved by ADR 0075. Before that update,
+`fs.create_dir` and `File.create_new` exposed no
 explicit creation mode. A focused executable probe under umask 022 produced
 0755 directories and 0644 files. Evidence is preserved under
 `.build/evidence/phase4-completion/`. Capture persistence requires atomic
 creation with directory mode 0700 and exclusive file mode 0600. No global umask
 change, permission utility, extra FFI or compiler modification was introduced.
-The user answered yes to incorporating this capability; its API and updated
-toolchain have not yet been supplied or validated here.
+The supplied compiler now exposes `fs.create_dir_with_mode` and
+`File.create_new_with_mode`. `bash scripts/test-private-creation.sh` compiled
+without warnings and passed: under test umask 022 it created 0700/0600 paths,
+preserved contents on AlreadyExists, and rejected privileged mode bits without
+creating paths. Evidence is in `private-creation.*` in the same directory.
 
 Independent build work now has ordinary Tarn modules `devtools/build.tarn` and
 `devtools/process_run.tarn`. They snapshot the fixed counter sources into a fresh
@@ -204,6 +210,85 @@ are currently rejected explicitly. Build roots and compiler paths must be absolu
 counter compiled with exit 0 and empty diagnostics; an isolated invalid project
 returned BUILD_FAILED with exit 1 and preserved the compiler's real E2001 record,
 including file, line and column. The test executable compiled without warnings.
-These modules are not yet exposed as an MCP tool. No new complete Cargo run or
-render/LSan success is claimed by these focused results. MCP integration, private
-artifact persistence and the complete build-to-capture acceptance remain pending.
+These modules are now exposed as the optional MCP `project.build` tool. Enable it
+with `--mode mcp --allow-build`, absolute `--project-root` and `--compiler` paths,
+and the normal UI grants. The tool accepts only an empty
+arguments object and appears in discovery only when authorized. It refuses builds
+during an active UI session with SESSION_ACTIVE. Successful builds select the new
+binary/library directory for subsequent `ui.start`; failed builds retain the
+previous selection. Compiler failures are `isError: true` tool results containing
+BUILD_FAILED, the command exit code and the original JSON diagnostics. Compiler
+output stays inside that response and never appears as raw MCP stdout.
+
+`bash scripts/test-mcp-build.sh` passed six MCP executable checks plus the two
+direct build checks, exit 0 and no compiler warnings. The six checks include the
+four existing protocol cases, build followed by launch/inspect/click/reinspect/
+PNG response/close, and actual E2001 propagation followed by starting the prior
+binary. The build-start check supplies an initially nonexistent executable, so
+success demonstrates use of the generated artifact. Discovery schema, argument
+injection rejection and active-session refusal are checked too. Logs are in
+`.build/launcher-tests/mcp-build.jsonl` and `mcp-build.stderr` (empty).
+
+### Private artifacts: completed with ADRs 0075 and 0076
+
+The supplied compiler exposes `encoding.base64_decode`, `encoding.hex` and
+`crypto.sha256`. The consolidated stdlib requirements above are resolved; no
+remaining compiler/stdlib blocker has been demonstrated for Phase 4.
+
+`devtools/artifact.tarn` validates screenshot responses in ordinary Tarn, even
+when persistence is disabled: session identity, minimum revision, format, bounded
+Base64 decoding (1 MiB), independent SHA-256 recomputation, nonzero dimensions
+up to 4096, PNG signature, first/unique IHDR, chunk bounds and CRCs, nonempty IDAT,
+and terminal IEND without trailing bytes. It compares IHDR dimensions with the
+native response. This validates the PNG container; it does not decompress pixels
+or claim general PNG conformance. The existing native GTK encoder produces the
+pixels. The saved real artifact was opened for visual inspection.
+
+Persistence is opt-in with startup `--capture-dir /absolute/fresh-directory`,
+requiring MCP mode and both screenshot/capture grants. RPC requests cannot choose
+a path. The first valid capture exclusively creates that directory with 0700;
+an existing directory is refused rather than assumed private. Each capture is
+exclusively created with 0600, written, synced and closed before success. Failed
+writes/sync/close remove the partial file; a cleanup failure is included in error
+details. Existing files are never overwritten. Invalid captures create no paths.
+Artifacts intentionally survive session shutdown. An abrupt process or machine
+crash can leave a private partial file; this is not a crash-atomic archive or a
+promise of directory-entry durability. No global umask change is made.
+
+The screenshot retains its MCP image content and adds structured `artifact`
+metadata (`path`, `bytes`, `sha256`) when saved. Verification/storage failures are
+structured tool errors, allowing the UI session to continue or close normally.
+No new C entry point, FFI, trusted module or runtime shell/Python was introduced.
+The native bridge still only queues application events and renders Tarn state.
+
+### Actual completion checks
+
+| Focused command | Actual result |
+| --- | --- |
+| `bash scripts/test-mcp-build.sh` | 2 direct build checks and 6 MCP scenarios passed, exit 0; includes build → launch generated binary → inspect N → acknowledged click → inspect N+1 → validate/save real PNG → close |
+| `bash scripts/test-artifacts.sh` | 19 executable checks passed, exit 0; invalid Base64/hash/signature/CRC/dimensions/session/revision, truncation/trailing bytes, decode budget, opt-in storage, no paths for invalid input, distinct paths, existing directory/file refusal and filesystem error propagation |
+| `bash scripts/test-private-creation.sh` | Passed, exit 0; actual 0700/0600 under test umask 022, exclusive creation and invalid permission rejection |
+| `bash scripts/test-devtools.sh` | 21 passed in 7.471 seconds, exit 0; includes capture failure and close during pending capture |
+
+The Tarn test/compiler JSON logs were warning-free. The saved acceptance PNG was
+6143 bytes, with SHA-256
+`227f29eb40781352e7f858b497b3d4210eacfdaae13fb8026fcdbf4a66000cab`;
+Tarn recomputation matched and the test harness independently recorded
+`sha256sum`. Host `stat` checks confirmed 0700 directory and 0600 captures.
+Evidence stays ignored under `.build/launcher-tests/`, `.build/artifact-tests/`
+and `.build/evidence/phase4-completion/`.
+
+The first 21-case native regression attempt failed in the historical pipeline
+case with ConnectionResetError. It sent close and the following inspection in
+separate writes, racing submission of that final request against native teardown.
+The isolated case passed; the test now submits the bounded six-record pipeline
+in a single write, matching its intended assertion about already queued requests.
+The subsequent 21-case run passed. No compiler or production native change was
+made to hide that failure.
+
+No complete Cargo suite was repeated: the user supplied focused fs/encoding/crypto
+results and reported a full integration run, and requested limited CPU use.
+Existing GTK render/LSan failures remain separate and unresolved; these focused
+results neither suppress them nor mark them passing. Phase 4's launcher/build/
+validated-private-capture acceptance is complete; it does not add reactive
+components, navigation, calendar UI, Plasma integration or other backends.

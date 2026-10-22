@@ -57,3 +57,33 @@ protocol harness helper in `../devtools/reference_session.py`. The public native
 entry point is `.build/launcher/tarn-ui`. See the [migration report](../../docs/launcher-migration.md)
 for resource/deadline mapping and actual results. Generated logs, compiler JSON,
 exit records and stderr are retained under `.build/launcher-tests/`.
+
+## Optional MCP project build
+
+Run `bash scripts/test-mcp-build.sh` with a GTK display. It runs two direct build
+checks and six MCP cases, including the four existing cases. The new cases verify
+authorized discovery with an empty argument schema, rejection of supplied command
+arguments, real compilation followed by starting the generated binary, refusal
+to build during an active UI session, and structured E2001 propagation without
+losing the previously selected executable. Build subprocess output must remain
+inside the MCP result. Evidence is stored in `.build/build-tests/` and
+`.build/launcher-tests/mcp-build.{jsonl,stderr}`. Shell scripts only stage and run
+tests; `project.build` itself uses ordinary Tarn process APIs directly.
+
+The build acceptance now saves an actual screenshot into a fresh private
+directory, recomputes its SHA-256 and compares all bytes with the MCP payload.
+The harness checks 0700/0600 modes and records an external sha256sum. It writes
+`saved-capture.path` for the following focused contracts:
+
+```bash
+bash scripts/test-artifacts.sh
+bash scripts/test-private-creation.sh
+```
+
+The artifact contract has 19 executable checks: valid PNG, corrupted encoding,
+digest, signature and CRC; incorrect dimensions/session/revision; truncation,
+trailing bytes and decode budget; invalid input creates no directory; repeated
+saves use distinct paths; persistence is opt-in; existing directories/files are
+refused and filesystem errors propagate. The permission probe uses public Tarn
+APIs with test umask 022. Neither script runs Cargo or GUI rendering. The existing
+native protocol suite separately covers capture failure and close while pending.

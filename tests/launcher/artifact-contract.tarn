@@ -1,0 +1,144 @@
+// Staged beside artifact.tarn and wire.tarn by test-artifacts.sh.
+import "artifact"
+import "wire"
+import "fs"
+import "os"
+import "json"
+import "encoding"
+import "crypto"
+import "path"
+
+fn bad() wire.Error { return wire.fail("TEST_FAILED", "test", "capture contract assertion failed") }
+fn read(filename &string) Result<Vec<u8>, wire.Error> {
+    match fs.read(filename) { Ok(bytes) => { return Ok(bytes) }
+        Err(error) => { return Err(wire.native("test", error)) } }
+}
+fn width(bytes &[]u8, at usize) u64 {
+    return u64(bytes[at]) * 16777216 + u64(bytes[at + 1]) * 65536 + u64(bytes[at + 2]) * 256 + u64(bytes[at + 3])
+}
+fn payload(bytes &[]u8, w u64, h u64) json.Value {
+    var value = wire.object()
+    wire.put(&mut value, "format", json.Value.Text("png"))
+    wire.put(&mut value, "session_id", json.Value.Text("test-session"))
+    wire.put(&mut value, "revision", wire.number(4))
+    wire.put(&mut value, "width", wire.number(i64(w)))
+    wire.put(&mut value, "height", wire.number(i64(h)))
+    wire.put(&mut value, "data_base64", json.Value.Text(encoding.base64_encode(bytes)))
+    digest := crypto.sha256(bytes)
+    wire.put(&mut value, "sha256", json.Value.Text(encoding.hex(&digest)))
+    return value
+}
+fn replace(value &mut json.Value, name &string, replacement json.Value) {
+    match value { json.Value.Object(members) => {
+        var index: usize = 0
+        for index < members.len() {
+            if members.as_slice()[index].key == name.clone() { members.as_mut_slice()[index].value = replacement
+                return }
+            index = index + 1
+        }
+    }
+        _ => {} }
+}
+fn report(name string, passed bool) Result<void, wire.Error> {
+    var result = wire.object()
+    wire.put(&mut result, "test", json.Value.Text(name))
+    wire.put(&mut result, "passed", json.Value.Bool(passed))
+    print(json.encode(&result))
+    if !passed { return Err(bad()) }
+    return Ok(())
+}
+fn reject(value &json.Value) bool {
+    match artifact.verify(value, "test-session", 4) { Ok(_) => { return false }
+        Err(error) => { return error.code == "INVALID_CAPTURE" } }
+}
+fn run() Result<void, wire.Error> {
+    var args: Vec<string>
+    match os.args() { Ok(values) => { args = values }
+        Err(error) => { return Err(wire.native("test", error)) } }
+    if args.len() != 3 { return Err(bad()) }
+    original := try read(&args.as_slice()[1])
+    w := width(original.as_slice(), 16)
+    h := width(original.as_slice(), 20)
+    valid := payload(original.as_slice(), w, h)
+    verified := try artifact.verify(&valid, "test-session", 4)
+    try report("capture_valid_png", verified.len() == original.len())
+    var modified = valid.clone()
+    replace(&mut modified, "data_base64", json.Value.Text("!AAA"))
+    try report("capture_rejects_invalid_base64", reject(&modified))
+    modified = valid.clone()
+    replace(&mut modified, "sha256", json.Value.Text("incorrect"))
+    try report("capture_rejects_hash_mismatch", reject(&modified))
+    try report("capture_rejects_dimension_mismatch", reject(&payload(original.as_slice(), w + 1, h)))
+    try report("capture_rejects_dimension_limit", reject(&payload(original.as_slice(), 4097, h)))
+    try report("capture_rejects_zero_dimension", reject(&payload(original.as_slice(), 0, h)))
+    var rejected = false
+    match artifact.verify(&valid, "other-session", 4) { Ok(_) => {}
+        Err(_) => { rejected = true } }
+    try report("capture_rejects_other_session", rejected)
+    rejected = false
+    match artifact.verify(&valid, "test-session", 5) { Ok(_) => {}
+        Err(_) => { rejected = true } }
+    try report("capture_rejects_stale_revision", rejected)
+    var damaged = try read(&args.as_slice()[1])
+    damaged.as_mut_slice()[0] = 0
+    try report("capture_rejects_signature_even_with_matching_hash", reject(&payload(damaged.as_slice(), w, h)))
+    damaged = try read(&args.as_slice()[1])
+    last := damaged.len() - 1
+    damaged.as_mut_slice()[last] = damaged.as_slice()[last] ^ 1
+    try report("capture_rejects_crc_even_with_matching_hash", reject(&payload(damaged.as_slice(), w, h)))
+    try report("capture_rejects_truncated_png", reject(&payload(&original.as_slice()[..original.len() - 1], w, h)))
+    damaged = try read(&args.as_slice()[1])
+    damaged.push(0)
+    try report("capture_rejects_trailing_bytes", reject(&payload(damaged.as_slice(), w, h)))
+    var oversized: Vec<u8> = Vec.new()
+    var index: usize = 0
+    for index < 1048577 { oversized.push(0)
+        index = index + 1 }
+    modified = valid.clone()
+    replace(&mut modified, "data_base64", json.Value.Text(encoding.base64_encode(oversized.as_slice())))
+    try report("capture_rejects_decode_budget", reject(&modified))
+    directory := args.as_slice()[2].clone()
+    var store = artifact.new(directory.clone())
+    modified = valid.clone()
+    replace(&mut modified, "sha256", json.Value.Text("incorrect"))
+    match store.capture(&modified, "test-session", 4) { Ok(_) => { return Err(bad()) }
+        Err(_) => {} }
+    match fs.exists(&directory) { Ok(exists) => { try report("invalid_capture_creates_no_directory", !exists) }
+        Err(error) => { return Err(wire.native("test", error)) } }
+    saved := try store.capture(&valid, "test-session", 4)
+    saved_again := try store.capture(&valid, "test-session", 4)
+    first := wire.field_text(&wire.get(&saved, "artifact"), "path")
+    second := wire.field_text(&wire.get(&saved_again, "artifact"), "path")
+    on_disk := try read(&first)
+    digest := crypto.sha256(on_disk.as_slice())
+    try report("private_store_preserves_bytes_and_unique_paths", first != second && encoding.hex(&digest) == wire.field_text(&valid, "sha256"))
+    var disabled = artifact.new("")
+    unsaved := try disabled.capture(&valid, "test-session", 4)
+    try report("capture_persistence_is_opt_in", wire.get(&unsaved, "artifact").is_null())
+    var collision = artifact.new(directory.clone())
+    rejected = false
+    match collision.capture(&valid, "test-session", 4) { Ok(_) => {}
+        Err(error) => { rejected = error.stage == "capture_directory" } }
+    try report("private_store_refuses_existing_directory", rejected)
+    var missing = artifact.new(path.join(&directory, "missing/child"))
+    rejected = false
+    match missing.capture(&valid, "test-session", 4) { Ok(_) => {}
+        Err(error) => { rejected = error.stage == "capture_directory" } }
+    try report("private_store_propagates_filesystem_error", rejected)
+    occupied := path.join(&directory, "capture-3.png")
+    match fs.write_text(&occupied, "existing") { Ok(_) => {}
+        Err(error) => { return Err(wire.native("test", error)) } }
+    rejected = false
+    match store.capture(&valid, "test-session", 4) { Ok(_) => {}
+        Err(error) => { rejected = error.stage == "capture_create" } }
+    var text: string
+    match fs.read_text(&occupied) { Ok(value) => { text = value }
+        Err(error) => { return Err(wire.native("test", error)) } }
+    try report("private_store_never_overwrites_existing_file", rejected && text == "existing")
+    return Ok(())
+}
+fn main() {
+    match run() { Ok(_) => {}
+        Err(error) => { print(json.encode(&wire.error_value(&error)))
+            os.exit(1) } }
+}

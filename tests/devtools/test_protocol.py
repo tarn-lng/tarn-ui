@@ -57,10 +57,15 @@ class Protocol(unittest.TestCase):
             self.assertGreater(nodes["counter"]["bounds"]["width"], 0)
             self.assertIsNone(nodes["counter"]["global_bounds"])
             initial = int(nodes["counter"]["text"])
-            ids = [s.send("ui.click", {"window_id": "main", "element_id": "increment"}) for _ in range(3)]
-            ids.append(s.send("ui.inspect", {"window_id": "main"}))
-            ids.append(s.send("ui.close", {"window_id": "main"}))
-            ids.append(s.send("ui.inspect", {"window_id": "main"}))
+            # Submit the bounded pipeline in one write. Separate send() calls
+            # race native close against submitting the final stale-window query;
+            # only requests already queued at close have a response guarantee.
+            requests = [("ui.click", {"window_id": "main", "element_id": "increment"}) for _ in range(3)]
+            requests.extend((method, {"window_id": "main"}) for method in ("ui.inspect", "ui.close", "ui.inspect"))
+            ids = [f"pipeline-{i}" for i in range(len(requests))]
+            records = [{"version": 1, "request_id": rid, "method": method, "params": params}
+                       for rid, (method, params) in zip(ids, requests)]
+            s.sock.sendall(b"".join(json.dumps(r, separators=(",", ":")).encode() + b"\n" for r in records))
             replies = [s.receive() for _ in ids]
             self.assertEqual([r["request_id"] for r in replies], ids)
             revisions = [r["result"]["revision"] for r in replies[:3]]
@@ -120,6 +125,19 @@ class Protocol(unittest.TestCase):
                 node = next(n for n in walk(self.inspect(s)["root"]) if n["id"] == "increment")
                 self.assertFalse(node["visible"] if mode == "hidden" else node["enabled"])
                 self.close(s)
+
+    def test_capture_failure_is_reported_without_closing_session(self):
+        with self.start("capture-failure", allow=("inspect", "close", "screenshot"), allow_capture=True) as s:
+            self.error(s.request("ui.screenshot", {"window_id": "main"}), "CAPTURE_UNAVAILABLE")
+            self.inspect(s)
+            self.close(s)
+        self.assertFalse(s.forced_cleanup)
+
+    def test_close_during_pending_capture_is_reported(self):
+        with self.start("capture-close", allow=("inspect", "close", "screenshot"), allow_capture=True) as s:
+            self.error(s.request("ui.screenshot", {"window_id": "main"}), "WINDOW_CLOSED")
+            self.assertEqual(s.process.wait(timeout=3), 0)
+        self.assertFalse(s.forced_cleanup)
 
     def test_malformed_records_and_duplicate_members(self):
         records = [b"{bad}\n", b"[]\n", b"\xff\n", b"\x00\n", b"{}\n",

@@ -7,6 +7,9 @@ import "time"
 import "json"
 import "string"
 import "os"
+import "fs"
+import "encoding"
+import "crypto"
 
 struct Client { child process.Child
     buffer Vec<u8> }
@@ -49,7 +52,7 @@ fn Client.read(&mut self) Result<json.Value, io.Error> {
                 Err(_) => { return Err(bad()) } }
         }
         duration := try start.elapsed()
-        if duration.as_millis() >= 10000 { return Err(io.Error.new(io.ErrorKind.TimedOut)) }
+        if duration.as_millis() >= 70000 { return Err(io.Error.new(io.ErrorKind.TimedOut)) }
         var count: usize = 0
         var blocked = false
         match &mut self.child.stdout {
@@ -65,7 +68,7 @@ fn Client.read(&mut self) Result<json.Value, io.Error> {
         if blocked {
             var events: Vec<net.Event> = Vec.new()
             events.push(net.Event.empty())
-            try poller.wait(events.as_mut_slice(), 10000 - i32(duration.as_millis()))
+            try poller.wait(events.as_mut_slice(), 70000 - i32(duration.as_millis()))
             continue
         }
         if count == 0 { return Err(io.Error.new(io.ErrorKind.UnexpectedEof)) }
@@ -130,9 +133,28 @@ fn protocol(client &mut Client, scenario &string) Result<bool, io.Error> {
     tools := get(&get(&listed, "result"), "tools").into_list()
     var expected_tools: usize = 6
     if scenario == &"restricted" { expected_tools = 3 }
+    building := scenario == &"build" || scenario == &"build-error"
+    if building { expected_tools = 7 }
     if tools.len() != expected_tools { return Ok(false) }
-    denied := try client.call("denied", "project.build", &json.Value.Object(Vec.new()))
-    if get(&denied, "error").i64("code").unwrap_or(0) != -32602 { return Ok(false) }
+    if building {
+        var found = false
+        for item in tools.as_slice() {
+            if item.text("name").unwrap_or("") == "project.build" {
+                schema := get(item, "inputSchema")
+                match get(&schema, "properties") {
+                    json.Value.Object(members) => { if !members.is_empty() { return Ok(false) } }
+                    _ => { return Ok(false) }
+                }
+                if schema.bool("additionalProperties").unwrap_or(true) { return Ok(false) }
+                found = true
+            }
+        }
+        if !found { return Ok(false) }
+    }
+    if !building {
+        denied := try client.call("denied", "project.build", &json.Value.Object(Vec.new()))
+        if get(&denied, "error").i64("code").unwrap_or(0) != -32602 { return Ok(false) }
+    }
     var empty_members: Vec<json.Member> = Vec.new()
     empty := json.Value.Object(empty_members)
     if scenario == &"restricted" {
@@ -143,8 +165,36 @@ fn protocol(client &mut Client, scenario &string) Result<bool, io.Error> {
         forbidden := try client.call("capture", "ui.screenshot", &empty)
         return Ok(get(&forbidden, "error").i64("code").unwrap_or(0) == -32602)
     }
+    if building {
+        var supplied: json.Value
+        match json.parse("{\"command\":\"false\"}") { Ok(value) => { supplied = value }
+            Err(_) => { return Err(bad()) } }
+        rejected := try client.call("override", "project.build", &supplied)
+        if get(&get(&get(&rejected, "result"), "structuredContent"), "error").text("code").unwrap_or("") != "INVALID_REQUEST" { return Ok(false) }
+        built := try client.call("build", "project.build", &empty)
+        if scenario == &"build-error" {
+            result := get(&built, "result")
+            error := get(&get(&result, "structuredContent"), "error")
+            details := get(&error, "details")
+            diagnostics := get(&details, "diagnostics").into_list()
+            if diagnostics.is_empty() { return Ok(false) }
+            ping := try client.ask("{\"jsonrpc\":\"2.0\",\"id\":\"alive\",\"method\":\"ping\"}", "alive")
+            // A failed build must preserve the previously configured executable.
+            recovered := try data(&try client.call("recover", "ui.start", &empty))
+            closed := try data(&try client.call("recover-close", "ui.close", &empty))
+            return Ok(result.bool("isError").unwrap_or(false) && error.text("code").unwrap_or("") == "BUILD_FAILED" &&
+                details.i64("exit_code").unwrap_or(0) == 1 && diagnostics.as_slice()[0].text("code").unwrap_or("") == "E2001" && get(&ping, "error").is_null() &&
+                recovered.text("event").unwrap_or("") == "ready" && closed.bool("closed").unwrap_or(false))
+        }
+        built_data := try data(&built)
+        if built_data.i64("exit_code").unwrap_or(-1) != 0 || built_data.text("binary").unwrap_or("").is_empty() { return Ok(false) }
+    }
     started := try client.call("start", "ui.start", &empty)
-    if scenario != &"normal" {
+    if building {
+        busy := try client.call("busy", "project.build", &empty)
+        if get(&get(&get(&busy, "result"), "structuredContent"), "error").text("code").unwrap_or("") != "SESSION_ACTIVE" { return Ok(false) }
+    }
+    if scenario != &"normal" && scenario != &"build" {
         result := get(&started, "result")
         if !result.bool("isError").unwrap_or(false) { return Ok(false) }
         error := get(&get(&result, "structuredContent"), "error")
@@ -184,6 +234,23 @@ fn protocol(client &mut Client, scenario &string) Result<bool, io.Error> {
     encoded := image.text("data_base64").unwrap_or("")
     if !string.starts_with(&encoded, "iVBORw0KGgo") ||
         content.as_slice()[1].text("data").unwrap_or("") != encoded { return Ok(false) }
+    if scenario == &"build" {
+        saved := get(&image, "artifact")
+        filename := saved.text("path").unwrap_or("")
+        bytes := try fs.read(&filename)
+        digest := crypto.sha256(bytes.as_slice())
+        if encoding.hex(&digest) != image.text("sha256").unwrap_or("") ||
+            encoding.base64_encode(bytes.as_slice()) != encoded || saved.u64("bytes").unwrap_or(0) != u64(bytes.len()) { return Ok(false) }
+        var evidence = json.Writer.new()
+        evidence.begin_object()
+        evidence.field_string("test", "saved_capture_integrity")
+        evidence.field_string("path", &filename)
+        evidence.field_string("sha256", &encoding.hex(&digest))
+        evidence.field_u64("bytes", u64(bytes.len()))
+        evidence.field_bool("passed", true)
+        evidence.end_object()
+        print(evidence.finish())
+    }
     closed := try data(&try client.call("close", "ui.close", &empty))
     ping := try client.ask("{\"jsonrpc\":\"2.0\",\"id\":\"done\",\"method\":\"ping\"}", "done")
     return Ok(closed.bool("closed").unwrap_or(false) && get(&ping, "error").is_null())
@@ -202,13 +269,22 @@ fn cleanup(owned process.Child) Result<process.Output, io.Error> {
     input_bytes: Vec<u8> := Vec.new()
     return child.communicate(input_bytes)
 }
-fn run_case(launcher &string, binary &string, library_path &string, scenario &string) Result<bool, io.Error> {
+fn run_case(launcher &string, binary &string, library_path &string, scenario &string, root &string, compiler &string) Result<bool, io.Error> {
     var deadline = "5000"
     if scenario == &"silent" { deadline = "200" }
     var command = process.Command.new(launcher.clone())
         .arg("--mode").arg("mcp").arg("--allow").arg("inspect").arg("close")
     if scenario != &"restricted" {
         command = command.arg("click").arg("screenshot").arg("diagnostics").arg("--allow-text").arg("--allow-capture")
+    }
+    if scenario == &"build" || scenario == &"build-error" {
+        command = command.arg("--allow-build").arg("--project-root").arg(root.clone()).arg("--compiler").arg(compiler.clone())
+        if scenario == &"build" {
+            var directory: string
+            match os.env("TARN_UI_TEST_CAPTURE_DIR") { Ok(Some(value)) => { directory = value }
+                _ => { return Err(bad()) } }
+            command = command.arg("--capture-dir").arg(directory)
+        }
     }
     command = command
         .arg("--binary").arg(binary.clone()).arg("--library-path").arg(library_path.clone())
@@ -242,12 +318,17 @@ fn main() {
         Err(_) => { os.exit(2)
             return } }
     args := arguments.as_slice()
-    if args.len() != 5 { os.exit(2)
+    if args.len() != 5 && args.len() != 8 { os.exit(2)
         return }
     var passed = true
-    if !report("mcp_native_counter_capture_close", run_case(&args[1], &args[2], &args[3], "normal")) { passed = false }
-    if !report("mcp_early_exit_keeps_child_output_private", run_case(&args[1], &args[4], &args[3], "early")) { passed = false }
-    if !report("mcp_timeout_cleanup_is_explicit", run_case(&args[1], &args[4], &args[3], "silent")) { passed = false }
-    if !report("mcp_grants_limit_tool_discovery", run_case(&args[1], &args[4], &args[3], "restricted")) { passed = false }
+    if !report("mcp_native_counter_capture_close", run_case(&args[1], &args[2], &args[3], "normal", "", "")) { passed = false }
+    if !report("mcp_early_exit_keeps_child_output_private", run_case(&args[1], &args[4], &args[3], "early", "", "")) { passed = false }
+    if !report("mcp_timeout_cleanup_is_explicit", run_case(&args[1], &args[4], &args[3], "silent", "", "")) { passed = false }
+    if !report("mcp_grants_limit_tool_discovery", run_case(&args[1], &args[4], &args[3], "restricted", "", "")) { passed = false }
+    if args.len() == 8 {
+        // An invalid initial binary proves ui.start uses the newly built artifact.
+        if !report("mcp_build_then_native_counter", run_case(&args[1], "/missing/initial-counter", &args[3], "build", &args[5], &args[6])) { passed = false }
+        if !report("mcp_build_preserves_compiler_error", run_case(&args[1], &args[2], &args[3], "build-error", &args[7], &args[6])) { passed = false }
+    }
     if !passed { os.exit(1) }
 }

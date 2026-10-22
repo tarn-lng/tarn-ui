@@ -1,0 +1,81 @@
+--- a/gsk/gskprivate.c
++++ b/gsk/gskprivate.c
+@@ -55,31 +55,46 @@
+   /* These requests often come in sequentially so keep the result
+    * around and re-use it if everything matches.
+    */
+-  static PangoFont *last_font;
++  static GWeakRef last_font;
+   static float last_scale;
+   static cairo_hint_metrics_t last_hint_metrics;
+   static cairo_hint_style_t last_hint_style;
+   static cairo_antialias_t last_antialias;
+-  static PangoFont *last_result;
++  static GWeakRef last_result;
++  PangoFont *cached_font;
++  PangoFont *cached_result;
++  PangoFont *result;
+ 
+-  if (last_result != NULL &&
+-      last_font == font &&
++  if (G_UNLIKELY (options == NULL))
++    {
++      options = cairo_font_options_create ();
++      g_weak_ref_init (&last_font, NULL);
++      g_weak_ref_init (&last_result, NULL);
++    }
++
++  cached_font = g_weak_ref_get (&last_font);
++  cached_result = g_weak_ref_get (&last_result);
++
++  if (cached_result != NULL &&
++      cached_font == font &&
+       last_scale == scale &&
+       last_hint_metrics == hint_metrics &&
+       last_hint_style == hint_style &&
+       last_antialias == antialias)
+-    return g_object_ref (last_result);
++    {
++      g_clear_object (&cached_font);
++      return cached_result;
++    }
++
++  g_clear_object (&cached_font);
++  g_clear_object (&cached_result);
+ 
+   last_scale = scale;
+   last_hint_metrics = hint_metrics;
+   last_hint_style = hint_style;
+   last_antialias = antialias;
+ 
+-  g_set_object (&last_font, font);
+-  g_clear_object (&last_result);
+-
+-  if (G_UNLIKELY (options == NULL))
+-    options = cairo_font_options_create ();
++  g_weak_ref_set (&last_font, font);
+ 
+   sf = pango_cairo_font_get_scaled_font (PANGO_CAIRO_FONT (font));
+   cairo_scaled_font_get_font_options (sf, options);
+@@ -99,7 +114,7 @@
+       cairo_font_options_get_antialias (options) == antialias &&
+       cairo_font_options_get_subpixel_order (options) == CAIRO_SUBPIXEL_ORDER_DEFAULT)
+     {
+-      last_result = g_object_ref (font);
++      g_weak_ref_set (&last_result, font);
+       return g_object_ref (font);
+     }
+ 
+@@ -114,9 +129,10 @@
+   pango_context_set_round_glyph_positions (context, hint_metrics == CAIRO_HINT_METRICS_ON);
+   pango_cairo_context_set_font_options (context, options);
+ 
+-  last_result = pango_font_map_reload_font (pango_font_get_font_map (font), font, scale, context, NULL);
++  result = pango_font_map_reload_font (pango_font_get_font_map (font), font, scale, context, NULL);
++  g_weak_ref_set (&last_result, result);
+ 
+-  return g_object_ref (last_result);
++  return result;
+ }
+ 
+ /*< private >

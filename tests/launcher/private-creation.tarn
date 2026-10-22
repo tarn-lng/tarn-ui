@@ -1,0 +1,50 @@
+// Public filesystem contract under the host's ordinary umask 022.
+import "fs"
+import "io"
+import "os"
+import "path"
+
+fn bad() io.Error { return io.Error.new(io.ErrorKind.InvalidData) }
+fn check(directory &string) Result<void, io.Error> {
+    try fs.create_dir_with_mode(directory, 0o700)
+    filename := path.join(directory, "capture.bin")
+    var file = try fs.File.create_new_with_mode(&filename, 0o600)
+    try file.write_all("private-capture-probe".bytes())
+    try file.sync_all()
+    try file.close()
+    match fs.File.create_new_with_mode(&filename, 0o600) {
+        Ok(_) => { return Err(bad()) }
+        Err(error) => { match error.kind { io.ErrorKind.AlreadyExists => {}
+            _ => { return Err(error) } } }
+    }
+    match fs.create_dir_with_mode(directory, 0o700) {
+        Ok(_) => { return Err(bad()) }
+        Err(error) => { match error.kind { io.ErrorKind.AlreadyExists => {}
+            _ => { return Err(error) } } }
+    }
+    invalid_file := path.join(directory, "invalid-file")
+    match fs.File.create_new_with_mode(&invalid_file, 0o4700) {
+        Ok(_) => { return Err(bad()) }
+        Err(error) => { match error.kind { io.ErrorKind.InvalidInput => {}
+            _ => { return Err(error) } } }
+    }
+    invalid_dir := path.join(directory, "invalid-dir")
+    match fs.create_dir_with_mode(&invalid_dir, 0o1777) {
+        Ok(_) => { return Err(bad()) }
+        Err(error) => { match error.kind { io.ErrorKind.InvalidInput => {}
+            _ => { return Err(error) } } }
+    }
+    if try fs.exists(&invalid_file) || try fs.exists(&invalid_dir) { return Err(bad()) }
+    if try fs.read_text(&filename) != "private-capture-probe" { return Err(bad()) }
+    return Ok(())
+}
+fn run() Result<void, io.Error> {
+    arguments := try os.args()
+    if arguments.len() != 2 { return Err(bad()) }
+    return check(&arguments.as_slice()[1])
+}
+fn main() {
+    match run() { Ok(_) => { print("private_creation_passed") }
+        Err(error) => { print(error.native_code())
+            os.exit(1) } }
+}

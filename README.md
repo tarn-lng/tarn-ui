@@ -21,6 +21,8 @@ El lanzador se compila con `bash scripts/build-launcher.sh` y se ejecuta con
 LeakSanitizer sigue fallando también con GTK sin el puente; el fallo se conserva.
 El lanzador y el adaptador MCP stdio ya usan Tarn y un socketpair privado;
 [compilación, permisos y resultados de migración](docs/launcher-migration.md).
+La fase 4 añade compilación fija por MCP y capturas PNG validadas en Tarn,
+con guardado privado opcional (directorio 0700 y archivos 0600).
 La captura requiere autorización explícita. No hay componentes reactivos,
 navegación ni backends móviles.
 

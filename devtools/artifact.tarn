@@ -1,0 +1,120 @@
+// Private capture persistence. No filesystem paths are accepted from RPC calls.
+import "fs"
+import "path"
+import "string"
+import "json"
+import "encoding"
+import "crypto"
+import "wire"
+
+pub struct Store { pub directory string
+    initialized bool
+    sequence u64 }
+pub fn new(directory string) Store {
+    return Store { directory: directory, initialized: false, sequence: 0 }
+}
+fn invalid(message string) wire.Error { return wire.fail("INVALID_CAPTURE", "capture", message) }
+fn be32(bytes &[]u8, at usize) u64 {
+    return u64(bytes[at]) * 16777216 + u64(bytes[at + 1]) * 65536 + u64(bytes[at + 2]) * 256 + u64(bytes[at + 3])
+}
+fn crc32(bytes &[]u8) u64 {
+    var crc: u32 = 0xffffffff
+    for byte in bytes {
+        crc = crc ^ u32(byte)
+        var bit: usize = 0
+        for bit < 8 {
+            if (crc & 1) != 0 { crc = (crc >> 1) ^ 0xedb88320 } else { crc = crc >> 1 }
+            bit = bit + 1
+        }
+    }
+    return u64(crc ^ 0xffffffff)
+}
+fn png(bytes &[]u8, width u64, height u64) Result<void, wire.Error> {
+    if bytes.len() < 45 || encoding.hex(&bytes[..8]) != "89504e470d0a1a0a" { return Err(invalid("invalid PNG signature or length")) }
+    var at: usize = 8
+    var header = false
+    var image = false
+    for at < bytes.len() {
+        if bytes.len() - at < 12 { return Err(invalid("truncated PNG chunk")) }
+        size := be32(bytes, at)
+        if size > u64(bytes.len() - at - 12) { return Err(invalid("PNG chunk exceeds payload")) }
+        end := at + 8 + usize(size)
+        kind := encoding.hex(&bytes[at + 4..at + 8])
+        if be32(bytes, end) != crc32(&bytes[at + 4..end]) { return Err(invalid("PNG chunk checksum mismatch")) }
+        if !header && kind != "49484452" { return Err(invalid("PNG must begin with IHDR")) }
+        if kind == "49484452" {
+            if header || size != 13 { return Err(invalid("invalid PNG IHDR")) }
+            if be32(bytes, at + 8) != width || be32(bytes, at + 12) != height { return Err(invalid("PNG dimensions disagree with response")) }
+            header = true
+        }
+        if kind == "49444154" && size > 0 { image = true }
+        if kind == "49454e44" {
+            if size != 0 || !image || end + 4 != bytes.len() { return Err(invalid("invalid PNG termination")) }
+            return Ok(())
+        }
+        at = end + 4
+    }
+    return Err(invalid("PNG has no IEND"))
+}
+pub fn verify(value &json.Value, session_id &string, minimum u64) Result<Vec<u8>, wire.Error> {
+    if wire.field_text(value, "format") != "png" || wire.field_text(value, "session_id") != session_id.clone() || session_id.is_empty() {
+        return Err(invalid("capture format or session mismatch"))
+    }
+    match value.u64("revision") { Some(revision) => { if revision < minimum { return Err(invalid("capture revision is stale")) } }
+        None => { return Err(invalid("capture revision missing")) } }
+    width := value.u64("width").unwrap_or(0)
+    height := value.u64("height").unwrap_or(0)
+    if width == 0 || height == 0 || width > 4096 || height > 4096 { return Err(invalid("capture dimensions exceed budget")) }
+    var bytes: Vec<u8>
+    match encoding.base64_decode(&wire.field_text(value, "data_base64"), 1048576) {
+        Ok(decoded) => { bytes = decoded }
+        Err(_) => { return Err(invalid("invalid or oversized Base64 capture")) }
+    }
+    digest := crypto.sha256(bytes.as_slice())
+    if encoding.hex(&digest) != wire.field_text(value, "sha256") { return Err(invalid("capture SHA-256 mismatch")) }
+    try png(bytes.as_slice(), width, height)
+    return Ok(bytes)
+}
+fn persist(filename &string, bytes &[]u8) Result<void, wire.Error> {
+    var file: fs.File
+    match fs.File.create_new_with_mode(filename, 0o600) {
+        Ok(value) => { file = value }
+        Err(error) => { return Err(wire.native("capture_create", error)) }
+    }
+    var failure: Option<wire.Error> = None
+    match file.write_all(bytes) { Ok(_) => {
+        match file.sync_all() { Ok(_) => {}
+            Err(error) => { failure = Some(wire.native("capture_sync", error)) } }
+    }
+        Err(error) => { failure = Some(wire.native("capture_write", error)) } }
+    match file.close() { Ok(_) => {}
+        Err(error) => { if failure.is_none() { failure = Some(wire.native("capture_close", error)) } } }
+    match failure { Some(mut_error) => {
+        var error = mut_error
+        match fs.remove_file(filename) { Ok(_) => {}
+            Err(cleanup) => { wire.put(&mut error.details, "cleanup", wire.error_value(&wire.native("capture_cleanup", cleanup))) } }
+        return Err(error)
+    }
+        None => { return Ok(()) } }
+}
+pub fn Store.capture(&mut self, value &json.Value, session_id &string, minimum u64) Result<json.Value, wire.Error> {
+    // Validate every screenshot, even when persistence is disabled.
+    bytes := try verify(value, session_id, minimum)
+    var result = value.clone()
+    if self.directory.is_empty() { return Ok(result) }
+    if !self.initialized {
+        if !path.is_absolute(&self.directory) { return Err(wire.fail("INVALID_ARGUMENT", "capture", "capture directory must be absolute")) }
+        // Refuse existing paths: their permissions and ownership are unverified.
+        match fs.create_dir_with_mode(&self.directory, 0o700) { Ok(_) => { self.initialized = true }
+            Err(error) => { return Err(wire.native("capture_directory", error)) } }
+    }
+    self.sequence = self.sequence + 1
+    filename := path.join(&self.directory, &("capture-" + &string.from_u64(self.sequence) + ".png"))
+    try persist(&filename, bytes.as_slice())
+    var saved = wire.object()
+    wire.put(&mut saved, "path", json.Value.Text(filename))
+    wire.put(&mut saved, "bytes", wire.number(i64(bytes.len())))
+    wire.put(&mut saved, "sha256", wire.get(value, "sha256"))
+    wire.put(&mut result, "artifact", saved)
+    return Ok(result)
+}

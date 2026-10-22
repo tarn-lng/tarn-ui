@@ -1,5 +1,6 @@
 // Native Tarn launcher. The child never inherits the launcher's protocol stdio.
 import "session"
+import "build"
 import "mcp"
 import "wire"
 import "json"
@@ -10,9 +11,12 @@ import "string"
 
 struct Options { config session.Config
     help bool
-    mode string }
+    mode string
+    allow_build bool
+    capture_directory string
+    recipe build.Config }
 fn usage() string {
-    return "tarn-ui --allow inspect click close [screenshot diagnostics] [--allow-text] [--allow-capture] [--binary PATH] [--library-path DIR] [--mode protocol|mcp]\n"
+    return "tarn-ui --allow inspect click close [screenshot diagnostics] [--allow-text] [--allow-capture] [--binary PATH] [--library-path DIR] [--mode protocol|mcp] [--allow-build --project-root DIR --compiler PATH] [--capture-dir NEW_DIR]\n"
 }
 fn argument(args &[]string, index usize) Result<string, wire.Error> {
     if index >= args.len() { return Err(wire.fail("INVALID_ARGUMENT", "configuration", "missing option value")) }
@@ -30,11 +34,25 @@ fn options(args &[]string) Result<Options, wire.Error> {
     var config = session.Config { binary: ".build/counter-dev/counter", library_path: "",
         grants: "", allow_text: false, allow_capture: false, io_timeout: 5000, close_timeout: 3000 }
     var mode = "protocol"
+    var allow_build = false
+    var capture_directory = ""
+    var recipe = build.Config { root: "", compiler: "" }
     var index: usize = 1
     var help = false
     for index < args.len() {
         option := args[index].clone()
         index = index + 1
+        if option == "--capture-dir" { capture_directory = try argument(args, index)
+            index = index + 1
+            continue }
+        if option == "--allow-build" { allow_build = true
+            continue }
+        if option == "--project-root" { recipe.root = try argument(args, index)
+            index = index + 1
+            continue }
+        if option == "--compiler" { recipe.compiler = try argument(args, index)
+            index = index + 1
+            continue }
         if option == "--help" { help = true
             continue }
         if option == "--allow-text" { config.allow_text = true
@@ -82,8 +100,15 @@ fn options(args &[]string) Result<Options, wire.Error> {
     if !help && config.grants.is_empty() {
         return Err(wire.fail("INVALID_ARGUMENT", "configuration", "--allow is required"))
     }
+    if allow_build && (mode != "mcp" || !path.is_absolute(&recipe.root) || !path.is_absolute(&recipe.compiler)) {
+        return Err(wire.fail("INVALID_ARGUMENT", "configuration", "--allow-build requires MCP mode and absolute --project-root and --compiler paths"))
+    }
+    if !capture_directory.is_empty() && (mode != "mcp" || !config.allow_capture ||
+        !string.contains(&("," + &config.grants + ","), ",screenshot,") || !path.is_absolute(&capture_directory)) {
+        return Err(wire.fail("INVALID_ARGUMENT", "configuration", "--capture-dir requires MCP mode, screenshot/capture grants and an absolute fresh directory"))
+    }
     if config.library_path.is_empty() { config.library_path = path.parent(&config.binary).unwrap_or(".") }
-    return Ok(Options { config: config, help: help, mode: mode })
+    return Ok(Options { config: config, help: help, mode: mode, allow_build: allow_build, recipe: recipe, capture_directory: capture_directory })
 }
 fn emit(output &mut console.Output, value &json.Value) Result<void, wire.Error> {
     record := json.encode(value) + "\n"
@@ -155,7 +180,7 @@ fn launch() u8 {
         match output.write_text(&usage()) { Ok(_) => { return 0 }
             Err(_) => { return 1 } } }
     if selected.mode == "mcp" {
-        match mcp.serve(&selected.config) {
+        match mcp.serve(&selected.config, &selected.recipe, selected.allow_build, &selected.capture_directory) {
             Ok(status) => { return status }
             Err(error) => { diagnostic(&error)
                 return 1 }

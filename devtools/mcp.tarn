@@ -1,6 +1,8 @@
 // MCP stdio adapter. All child ownership and transport remain in session.tarn.
-// Explicit protocol profile: 2025-11-25. No shell/build execution capability.
+// Explicit protocol profile: 2025-11-25. Fixed project builds require an explicit startup grant.
 import "session"
+import "build"
+import "artifact"
 import "wire"
 import "json"
 import "console"
@@ -18,6 +20,9 @@ struct Server {
     pending_id json.Value
     close_result json.Value
     failed bool
+    binary string
+    library_path string
+    captures artifact.Store
 }
 fn is_object(value &json.Value) bool {
     match value { json.Value.Object(_) => { return true }
@@ -39,7 +44,8 @@ fn fields(value &json.Value, allowed &string) bool {
         _ => { return false }
     }
 }
-fn permitted(config &session.Config, name &string) bool {
+fn permitted(config &session.Config, allow_build bool, name &string) bool {
+    if name == &"project.build" { return allow_build }
     if name == &"ui.start" { return true }
     if name == &"ui.screenshot" && !config.allow_capture { return false }
     methods := string.split(&config.grants, ",")
@@ -119,7 +125,7 @@ fn schema_type(kind &string) json.Value {
 fn tool(name &string) json.Value {
     var properties = wire.object()
     var required: Vec<json.Value> = Vec.new()
-    if name != &"ui.start" {
+    if name != &"ui.start" && name != &"project.build" {
         wire.put(&mut properties, "window_id", schema_type("string"))
     }
     if name == &"ui.click" {
@@ -137,7 +143,9 @@ fn tool(name &string) json.Value {
     wire.put(&mut schema, "additionalProperties", json.Value.Bool(false))
     var value = wire.object()
     wire.put(&mut value, "name", json.Value.Text(name.clone()))
-    wire.put(&mut value, "description", json.Value.Text("Authorized operation on the configured native Tarn application."))
+    var description = "Authorized operation on the configured native Tarn application."
+    if name == &"project.build" { description = "Compile the configured counter project using a fixed native recipe; close any running UI session first. Takes no arguments." }
+    wire.put(&mut value, "description", json.Value.Text(description))
     wire.put(&mut value, "inputSchema", schema)
     wire.put(&mut value, "outputSchema", schema_type("object"))
     var annotations = wire.object()
@@ -146,19 +154,20 @@ fn tool(name &string) json.Value {
     wire.put(&mut value, "annotations", annotations)
     return value
 }
-fn tools(config &session.Config) json.Value {
+fn tools(config &session.Config, allow_build bool) json.Value {
     var entries: Vec<json.Value> = Vec.new()
     entries.push(tool("ui.start"))
+    if allow_build { entries.push(tool("project.build")) }
     // Stable order independent of launch argument order or duplicate grants.
     candidates := string.split("ui.click,ui.close,ui.diagnostics,ui.inspect,ui.screenshot", ",")
     for name in candidates.as_slice() {
-        if permitted(config, name) { entries.push(tool(name)) }
+        if permitted(config, allow_build, name) { entries.push(tool(name)) }
     }
     var result = wire.object()
     wire.put(&mut result, "tools", json.Value.List(entries))
     return result
 }
-fn Server.common(&mut self, request &Request, config &session.Config) Result<bool, wire.Error> {
+fn Server.common(&mut self, request &Request, config &session.Config, allow_build bool) Result<bool, wire.Error> {
     if request.notification {
         if request.method == "notifications/initialized" && self.negotiated { self.initialized = true }
         return Ok(true)
@@ -194,7 +203,7 @@ fn Server.common(&mut self, request &Request, config &session.Config) Result<boo
     if request.method == "tools/list" {
         if !fields(&request.params, ",cursor,_meta,") || !wire.get(&request.params, "cursor").is_null() {
             try self.rpc_error(&request.id, -32602, "invalid tool cursor")
-        } else { try self.reply(&request.id, tools(config)) }
+        } else { try self.reply(&request.id, tools(config, allow_build)) }
         return Ok(true)
     }
     if request.method != "tools/call" { try self.rpc_error(&request.id, -32601, "method not found")
@@ -204,7 +213,7 @@ fn Server.common(&mut self, request &Request, config &session.Config) Result<boo
         try self.rpc_error(&request.id, -32602, "invalid tool call")
         return Ok(true)
     }
-    if !permitted(config, &wire.field_text(&request.params, "name")) {
+    if !permitted(config, allow_build, &wire.field_text(&request.params, "name")) {
         try self.rpc_error(&request.id, -32602, "unknown or unauthorized tool")
         return Ok(true)
     }
@@ -243,14 +252,18 @@ fn arguments(request &Request) json.Value {
     }
     return params
 }
-fn Server.active(&mut self, link &mut session.Channel, config &session.Config, start_id &json.Value) Result<void, wire.Error> {
+fn Server.active(&mut self, link &mut session.Channel, config &session.Config, allow_build bool, start_id &json.Value) Result<void, wire.Error> {
     try self.tool_result(start_id, link.ready.clone(), false)
     for {
         var request: Request
         match try self.read() { Some(value) => { request = value }
             None => { return Ok(()) } }
-        if try self.common(&request, config) { continue }
+        if try self.common(&request, config, allow_build) { continue }
         name := wire.field_text(&request.params, "name")
+        if name == "project.build" {
+            try self.tool_error(&request.id, &wire.fail("SESSION_ACTIVE", "build", "close the UI session before building"))
+            continue
+        }
         if name == "ui.start" {
             try self.tool_error(&request.id, &wire.fail("SESSION_ACTIVE", "launch", "session already running"))
             continue
@@ -263,7 +276,15 @@ fn Server.active(&mut self, link &mut session.Channel, config &session.Config, s
             try self.tool_result(&request.id, error, true)
             continue
         }
-        result := wire.get(&reply, "result")
+        var result = wire.get(&reply, "result")
+        if name == "ui.screenshot" {
+            params := arguments(&request)
+            match self.captures.capture(&result, &wire.field_text(&link.ready, "session_id"), params.u64("min_revision").unwrap_or(0)) {
+                Ok(verified) => { result = verified }
+                Err(error) => { try self.tool_error(&request.id, &error)
+                    continue }
+            }
+        }
         if name == "ui.close" {
             self.close_result = result
             return Ok(())
@@ -301,17 +322,33 @@ fn Server.completed(&mut self, outcome &session.Outcome) Result<void, wire.Error
     self.close_result = json.Value.Null
     return Ok(())
 }
-pub fn serve(config &session.Config) Result<u8, wire.Error> {
+pub fn serve(config &session.Config, recipe &build.Config, allow_build bool, capture_directory &string) Result<u8, wire.Error> {
     var server = Server { input: console.stdin().buffered(), output: console.stdout(),
         negotiated: false, initialized: false, pending_id: json.Value.Null,
-        close_result: json.Value.Null, failed: false }
+        close_result: json.Value.Null, failed: false, binary: config.binary.clone(), library_path: config.library_path.clone(), captures: artifact.new(capture_directory.clone()) }
     for {
         var request: Request
         match try server.read() { Some(value) => { request = value }
             None => { if server.failed { return Ok(2) }
                 return Ok(0) } }
-        if try server.common(&request, config) { continue }
+        if try server.common(&request, config, allow_build) { continue }
         name := wire.field_text(&request.params, "name")
+        if name == "project.build" {
+            params := request.params.get("arguments").unwrap_or(wire.object())
+            if !fields(&params, ",") {
+                try server.tool_error(&request.id, &wire.fail("INVALID_REQUEST", "build", "project.build takes no arguments"))
+                continue
+            }
+            match build.run(recipe) {
+                Ok(result) => {
+                    server.binary = wire.field_text(&result, "binary")
+                    server.library_path = wire.field_text(&result, "library_path")
+                    try server.tool_result(&request.id, result, false)
+                }
+                Err(error) => { try server.tool_error(&request.id, &error) }
+            }
+            continue
+        }
         if name != "ui.start" {
             try server.tool_error(&request.id, &wire.fail("NOT_READY", "launch", "start a UI session first"))
             continue
@@ -322,8 +359,11 @@ pub fn serve(config &session.Config) Result<u8, wire.Error> {
             continue
         }
         server.pending_id = request.id.clone()
-        match session.run(config, fn(link &mut session.Channel) Result<void, wire.Error> {
-                return server.active(link, config, &request.id)
+        selected := session.Config { binary: server.binary.clone(), library_path: server.library_path.clone(),
+            grants: config.grants.clone(), allow_text: config.allow_text, allow_capture: config.allow_capture,
+            io_timeout: config.io_timeout, close_timeout: config.close_timeout }
+        match session.run(&selected, fn(link &mut session.Channel) Result<void, wire.Error> {
+                return server.active(link, config, allow_build, &request.id)
         }) {
             Ok(outcome) => { try server.completed(&outcome) }
             Err(error) => {
