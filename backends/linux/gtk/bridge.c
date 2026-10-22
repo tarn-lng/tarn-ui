@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -12,11 +13,16 @@ typedef struct {
     GtkWindow *window; /* explicit ref in addition to GTK's toplevel ref */
     gulong close_handler, map_handler;
     gboolean opened, closed, delivered_closed;
-    GtkWidget *counter_label, *button; /* borrowed from the window's child tree */
+    GtkWidget *heading, *counter_label, *button; /* borrowed from the window's child tree */
+    GtkWidget *pages;
+    GHashTable *components; /* per-session borrowed widgets; the native tree owns them */
+    unsigned page_count;
+    gboolean pages_presented;
     gulong click_handler;
     unsigned pending_increments; /* queue length, never application state */
     gboolean queue_full;
     uint64_t increment_tokens[64], enqueue_token, dispatched_token;
+    int32_t event_codes[64];
     unsigned increment_head;
     int32_t application_error;
 #ifdef TARN_UI_DEVTOOLS
@@ -50,17 +56,27 @@ static void finalized(gpointer data, GObject *object) {
 #define FAIL_AT(stage) FALSE
 #endif
 
-uint32_t tarn_ui_gtk_abi(void) { return 4; }
+uint32_t tarn_ui_gtk_abi(void) { return 6; }
 
-static void clicked(GtkButton *button, gpointer data) {
-    (void)button;
-    Session *s = data;
+static void enqueue(Session *s, int32_t code) {
     if (s->closed || s->queue_full) return;
     if (s->pending_increments == 64) s->queue_full = TRUE;
     else {
-        s->increment_tokens[(s->increment_head + s->pending_increments) % 64] = s->enqueue_token;
+        unsigned slot = (s->increment_head + s->pending_increments) % 64;
+        s->increment_tokens[slot] = s->enqueue_token;
+        s->event_codes[slot] = code;
         ++s->pending_increments;
     }
+}
+
+static void clicked(GtkButton *button, gpointer data) {
+    (void)button;
+    enqueue(data, 3);
+}
+
+static void component_clicked(GtkButton *button, gpointer data) {
+    unsigned action = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(button), "tarn-ui-action"));
+    enqueue(data, 1000 + (int32_t)action);
 }
 
 static void mapped(GtkWidget *widget, gpointer data) {
@@ -85,6 +101,19 @@ static void dispose(Session *s) {
 #endif
     s->closed = TRUE;
     s->pending_increments = 0;
+    if (s->components) {
+        GHashTableIter iter;
+        gpointer widget;
+        g_hash_table_iter_init(&iter, s->components);
+        while (g_hash_table_iter_next(&iter, NULL, &widget)) {
+            unsigned disconnected = g_signal_handlers_disconnect_by_func(widget, component_clicked, s);
+#ifdef TARN_UI_TESTING
+            stats.disconnected += disconnected;
+#else
+            (void)disconnected;
+#endif
+        }
+    }
     if (s->click_handler) {
         g_signal_handler_disconnect(s->button, s->click_handler);
 #ifdef TARN_UI_TESTING
@@ -107,6 +136,7 @@ static void dispose(Session *s) {
         gtk_window_destroy(s->window);
         g_object_unref(s->window);
     }
+    g_clear_pointer(&s->components, g_hash_table_unref);
 #ifdef TARN_UI_DEVTOOLS
     dev_dispose(s, window_closed); /* close success follows native destruction */
 #endif
@@ -143,6 +173,7 @@ int32_t tarn_ui_gtk_create(const char *title, const char *heading, void **out) {
     gtk_window_set_title(s->window, title);
     gtk_window_set_default_size(s->window, 480, 240);
     GtkWidget *label = gtk_label_new(heading);
+    s->heading = label;
     UI_ID(label, "heading");
     gtk_widget_add_css_class(label, "title-1");
     gtk_widget_set_margin_start(label, 24);
@@ -196,10 +227,11 @@ int32_t tarn_ui_gtk_next(void *raw) {
             return 1;
         }
         if (s->pending_increments) {
+            int32_t code = s->event_codes[s->increment_head];
             s->dispatched_token = s->increment_tokens[s->increment_head];
             s->increment_head = (s->increment_head + 1) % 64;
             --s->pending_increments;
-            return 3;
+            return code;
         }
         g_main_context_iteration(NULL, TRUE);
     }
@@ -239,6 +271,23 @@ int32_t tarn_ui_gtk_set_counter(void *raw, int64_t value) {
     char text[32];
     snprintf(text, sizeof(text), "%" PRId64, value);
     gtk_label_set_text(GTK_LABEL(s->counter_label), text);
+#ifdef TARN_UI_TESTING
+    ++stats.counter_updates;
+#endif
+    return 0;
+}
+
+int32_t tarn_ui_gtk_set_heading(void *raw, const char *text) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    if (s->queue_full) return 8;
+    if (!text || !g_utf8_validate(text, -1, NULL)) return 1;
+    gtk_label_set_text(GTK_LABEL(s->heading), text);
+#ifdef TARN_UI_TESTING
+    ++stats.heading_updates;
+#endif
     return 0;
 }
 
@@ -259,7 +308,7 @@ int32_t tarn_ui_gtk_enable_counter(void *raw, int64_t value) {
     if (status) return status;
     Session *s = raw;
     if (s->closed) return 6;
-    if (s->counter_label) return 1;
+    if (s->counter_label || s->pages) return 1;
     GtkWidget *heading = gtk_window_get_child(s->window);
     g_object_ref(heading); /* keep alive while moving between parents */
     gtk_window_set_child(s->window, NULL);
@@ -298,8 +347,149 @@ int32_t tarn_ui_gtk_enable_counter(void *raw, int64_t value) {
     return status;
 }
 
+/* Scoped component registry: no widget or callback owner escapes the session. */
+static gboolean valid_key(const char *key) {
+    if (!key || !*key || strlen(key) > 128) return FALSE;
+    for (const char *p = key; *p; ++p)
+        if (!g_ascii_isalnum(*p) && *p != '-' && *p != '_') return FALSE;
+    return strcmp(key, "main") && strcmp(key, "heading") && strcmp(key, "content") && strcmp(key, "pages");
+}
+
+static void component_track(GtkWidget *widget) {
+#ifdef TARN_UI_TESTING
+    ++stats.components;
+    g_object_weak_ref(G_OBJECT(widget), finalized, &stats.components_finalized);
+#else
+    (void)widget;
+#endif
+}
+
+static int32_t component_admit(Session *s, const char *key) {
+    if (s->closed) return 6;
+    if (s->queue_full) return 8;
+    if (!valid_key(key) || s->counter_label || s->pages_presented) return 1;
+    if (s->components && (g_hash_table_contains(s->components, key) || g_hash_table_size(s->components) >= 256)) return 1;
+    return 0;
+}
+
+int32_t tarn_ui_gtk_add_page(void *raw, const char *key) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    status = component_admit(s, key);
+    if (status) return status;
+    if (s->page_count >= 32) return 1;
+    if (!s->pages) {
+        s->components = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+        GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+        UI_ID(root, "content");
+        component_track(root);
+        g_object_ref(s->heading);
+        gtk_window_set_child(s->window, NULL);
+        gtk_window_set_child(s->window, root);
+        gtk_box_append(GTK_BOX(root), s->heading);
+        g_object_unref(s->heading);
+        s->pages = gtk_stack_new();
+        UI_ID(s->pages, "pages");
+        component_track(s->pages);
+        gtk_stack_set_transition_type(GTK_STACK(s->pages), GTK_STACK_TRANSITION_TYPE_NONE);
+        gtk_box_append(GTK_BOX(root), s->pages);
+    }
+    GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(page, 24);
+    gtk_widget_set_margin_end(page, 24);
+    gtk_widget_set_margin_bottom(page, 24);
+    component_track(page);
+    /* UI_ID must reference the owned key, not a transient FFI string. */
+    char *owned = g_strdup(key);
+    g_hash_table_insert(s->components, owned, page);
+    UI_ID(page, owned);
+    gtk_stack_add_named(GTK_STACK(s->pages), page, key);
+    ++s->page_count;
+    return 0;
+}
+
+static int32_t component_add(void *raw, const char *page_key, const char *key, const char *text, uint32_t action) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    status = component_admit(s, key);
+    if (status) return status;
+    if (!page_key || !s->components || !text || !g_utf8_validate(text, -1, NULL)) return 1;
+    GtkWidget *page = g_hash_table_lookup(s->components, page_key);
+    if (!page || !GTK_IS_BOX(page) || gtk_widget_get_parent(page) != s->pages) return 1;
+    GtkWidget *widget = action ? gtk_button_new_with_label(text) : gtk_label_new(text);
+    component_track(widget);
+    if (!action) gtk_label_set_wrap(GTK_LABEL(widget), TRUE);
+    char *owned = g_strdup(key);
+    g_hash_table_insert(s->components, owned, widget);
+    UI_ID(widget, owned);
+    gtk_box_append(GTK_BOX(page), widget);
+    if (action) {
+        g_object_set_data(G_OBJECT(widget), "tarn-ui-action", GUINT_TO_POINTER(action));
+        g_signal_connect(widget, "clicked", G_CALLBACK(component_clicked), s);
+#ifdef TARN_UI_TESTING
+        ++stats.connected;
+#endif
+    }
+    return 0;
+}
+
+int32_t tarn_ui_gtk_add_label(void *raw, const char *page, const char *key, const char *text) {
+    return component_add(raw, page, key, text, 0);
+}
+
+int32_t tarn_ui_gtk_add_button(void *raw, const char *page, const char *key, const char *text, uint32_t action) {
+    if (!main_thread()) return 2;
+    if (!action || action > 1024) return 1;
+    return component_add(raw, page, key, text, action);
+}
+
+int32_t tarn_ui_gtk_set_text(void *raw, const char *key, const char *text) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    if (s->queue_full) return 8;
+    if (!key || !text || !s->components || !g_utf8_validate(text, -1, NULL)) return 1;
+    GtkWidget *widget = g_hash_table_lookup(s->components, key);
+#ifdef TARN_UI_TESTING
+    ++stats.component_text_calls;
+#endif
+    if (GTK_IS_LABEL(widget)) {
+        if (strcmp(gtk_label_get_text(GTK_LABEL(widget)), text)) gtk_label_set_text(GTK_LABEL(widget), text);
+    } else if (GTK_IS_BUTTON(widget)) {
+        if (strcmp(gtk_button_get_label(GTK_BUTTON(widget)), text)) gtk_button_set_label(GTK_BUTTON(widget), text);
+    } else return 1;
+    return 0;
+}
+
+int32_t tarn_ui_gtk_show_page(void *raw, const char *key) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    if (s->queue_full) return 8;
+    if (!key || !s->pages || !gtk_stack_get_child_by_name(GTK_STACK(s->pages), key)) return 1;
+    GtkWidget *page = gtk_stack_get_child_by_name(GTK_STACK(s->pages), key);
+#ifdef TARN_UI_TESTING
+    ++stats.page_calls;
+#endif
+    if (gtk_stack_get_visible_child(GTK_STACK(s->pages)) != page) gtk_stack_set_visible_child(GTK_STACK(s->pages), page);
+    if (s->pages_presented) return 0;
+    s->pages_presented = TRUE;
+#ifdef TARN_UI_DEVTOOLS
+    if (!s->dev) return dev_start(s);
+#endif
+    return 0;
+}
+
 #ifdef TARN_UI_TESTING
 TestStats test_stats(void) { return stats; }
+uint32_t test_counter_updates(void) { return stats.counter_updates; }
+uint32_t test_heading_updates(void) { return stats.heading_updates; }
+uint32_t test_component_text_calls(void) { return stats.component_text_calls; }
+uint32_t test_page_calls(void) { return stats.page_calls; }
 void test_fail_at(int stage) { fail_stage = stage; }
 GtkWindow *test_window(void *raw) {
     return validate(raw) == 0 ? ((Session *)raw)->window : NULL;
@@ -309,6 +499,7 @@ int32_t test_clean(void) {
         stats.windows == stats.windows_finalized &&
         stats.headings == stats.headings_finalized &&
         stats.counter_widgets == stats.counter_widgets_finalized &&
+        stats.components == stats.components_finalized &&
         stats.connected == stats.disconnected;
 }
 int32_t test_activate(int32_t count) {

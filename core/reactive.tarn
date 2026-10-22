@@ -1,0 +1,51 @@
+// Owned state and explicit effect boundaries; no global observers or stored callbacks.
+import "core/session"
+
+pub struct State<T: Eq> { value T
+    dirty bool }
+
+pub fn State<T>.new(value T) State<T> { return State{value: value, dirty: true} }
+pub fn State<T>.get(&self) &T { return &self.value }
+pub fn State<T>.is_dirty(&self) bool { return self.dirty }
+pub fn State<T>.set(&mut self, value T) bool {
+    if self.value.eq(&value) { return false }
+    self.value = value
+    self.dirty = true
+    return true
+}
+
+// Owned descriptions keep application callbacks independent of native authority.
+pub struct CounterView { pub value i64
+    pub heading string }
+
+// First binding: native counter controls retain identity throughout the session.
+// Call inside session.run; reducer and view receive owned numeric snapshots.
+pub fn drive_counter(ui &mut session.Session, state &mut State<i64>,
+    update mut fn(i64, session.Event) Result<i64, session.Error>,
+    view mut fn(i64) CounterView) Result<void, session.Error> {
+    var shown = view(state.value)
+    try ui.enable_counter(shown.value)
+    try ui.set_heading(shown.heading.clone())
+    state.dirty = false
+    for {
+        event := try ui.next_event()
+        var action = false
+        match event {
+            session.Event.Closed => { return Ok(()) }
+            session.Event.Opened => { state.set(try update(state.value, session.Event.Opened)) }
+            session.Event.Increment => {
+                state.set(try update(state.value, session.Event.Increment))
+                action = true
+            }
+        }
+        if state.dirty {
+            next := view(state.value)
+            if next.value != shown.value { try ui.set_counter(next.value) }
+            if next.heading != shown.heading { try ui.set_heading(next.heading.clone()) }
+            shown = next
+            state.dirty = false
+        }
+        // A no-op action still completes; failed reducers/views never acknowledge.
+        if action { try ui.complete_event() }
+    }
+}

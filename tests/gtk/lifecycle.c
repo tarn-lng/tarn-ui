@@ -5,6 +5,16 @@
 static gboolean captured;
 static const char *png;
 
+static void finish_process_diagnostic(void) {
+    if (g_strcmp0(g_getenv("TARN_UI_TEST_CLOSE_DISPLAY"), "1") != 0) return;
+    /* Process-end dependency diagnosis only; never a per-session operation. */
+    GdkDisplay *display = gdk_display_get_default();
+    gdk_display_sync(display);
+    gdk_gl_context_clear_current();
+    gdk_display_close(display);
+    g_print("diagnostic display close completed\n");
+}
+
 static gboolean deadline(gpointer data) {
     (void)data;
     g_error("GTK test deadline exceeded");
@@ -43,6 +53,7 @@ static gpointer wrong_thread(gpointer data) {
     g_assert_cmpint(tarn_ui_gtk_request_close(data), ==, 2);
     g_assert_cmpint(tarn_ui_gtk_release(data), ==, 2);
     g_assert_cmpint(tarn_ui_gtk_set_counter(data, 999), ==, 2);
+    g_assert_cmpint(tarn_ui_gtk_set_heading(data, "wrong thread"), ==, 2);
     g_assert_cmpint(tarn_ui_gtk_enable_counter(data, 999), ==, 2);
     return NULL;
 }
@@ -91,9 +102,10 @@ int main(int argc, char **argv) {
         }
         g_source_remove(watchdog);
         g_print("GTK-only control: %" G_GINT64_FORMAT " windows created/destroyed\n", cycles);
+        finish_process_diagnostic();
         return 0;
     }
-    g_assert_cmpuint(tarn_ui_gtk_abi(), ==, 4);
+    g_assert_cmpuint(tarn_ui_gtk_abi(), ==, 6);
     void *s = NULL;
     g_assert_cmpint(tarn_ui_gtk_create(NULL, "x", &s), ==, 1);
     g_assert_null(s);
@@ -126,6 +138,12 @@ int main(int argc, char **argv) {
         GtkWidget *heading = gtk_widget_get_first_child(gtk_window_get_child(window));
         g_assert_true(GTK_IS_LABEL(heading));
         g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(heading)), ==, "Hola desde Tarn");
+        g_assert_cmpint(tarn_ui_gtk_set_heading(s, "Estado derivado"), ==, 0);
+        g_assert_true(heading == gtk_widget_get_first_child(gtk_window_get_child(window)));
+        g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(heading)), ==, "Estado derivado");
+        g_assert_cmpint(tarn_ui_gtk_set_heading(s, "\xff"), ==, 1);
+        g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(heading)), ==, "Estado derivado");
+        g_assert_cmpint(tarn_ui_gtk_set_heading(s, "Hola desde Tarn"), ==, 0);
         if (i == 0) {
             GThread *thread = g_thread_new("wrong-ui-thread", wrong_thread, s);
             g_thread_join(thread);
@@ -153,6 +171,7 @@ int main(int argc, char **argv) {
         g_assert_cmpint(tarn_ui_gtk_next(s), ==, -6);
         g_assert_cmpint(test_activate(1), ==, 1); /* late signals cannot revive events */
         g_assert_cmpint(tarn_ui_gtk_set_counter(s, 99), ==, 6);
+        g_assert_cmpint(tarn_ui_gtk_set_heading(s, "closed"), ==, 6);
         g_assert_cmpint(tarn_ui_gtk_next(s), ==, -6);
         g_assert_cmpint(tarn_ui_gtk_release(s), ==, 0);
         g_assert_true(test_clean());
@@ -163,5 +182,6 @@ int main(int argc, char **argv) {
             stats.allocated, stats.freed, stats.windows, stats.windows_finalized,
             stats.headings, stats.headings_finalized, stats.connected, stats.disconnected);
     g_print("counter-widgets=%u/%u\n", stats.counter_widgets, stats.counter_widgets_finalized);
+    finish_process_diagnostic();
     return 0;
 }

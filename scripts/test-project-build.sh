@@ -16,7 +16,7 @@ fi
 fixture=$(mktemp -d "$evidence/invalid.XXXXXXXX")
 printf '%s\n' "$fixture" > "$evidence/invalid-root.txt"
 mkdir -p "$fixture/core" "$fixture/examples/counter" "$fixture/backends/linux/gtk"
-cp "$root/core/session.tarn" "$fixture/core/"
+cp "$root/core/session.tarn" "$root/core/reactive.tarn" "$fixture/core/"
 cp "$root/examples/counter/counter.tarn" "$fixture/examples/counter/"
 cp "$root/backends/linux/gtk/bridge.c" "$root/backends/linux/gtk/bridge.h" "$root/backends/linux/gtk/devtools.inc" "$fixture/backends/linux/gtk/"
 printf 'fn main() { missing_function() }\n' > "$fixture/examples/counter/main.tarn"

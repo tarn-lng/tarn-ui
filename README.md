@@ -1,5 +1,10 @@
 # Tarn UI
 
+La fase 5 tiene [estado reactivo y vistas derivadas](docs/reactivity.md) y
+[componentes reutilizables con navegación](docs/components-navigation.md).
+Las dos pantallas comparten estado y conservan sus controles GTK al volver.
+[Próximos pasos y recordatorio de memoria aplazado](docs/roadmap.md).
+
 Contador nativo GTK4 con estado y lógica de aplicación en Tarn. El puente C
 encola eventos y presenta los valores que recibe; Tarn procesa los clics.
 
@@ -19,12 +24,13 @@ Las pruebas puntuales de interacción, límites, errores y préstamos pasan.
 El lanzador se compila con `bash scripts/build-launcher.sh` y se ejecuta con
 `.build/launcher/tarn-ui --allow inspect click close --allow-text`.
 LeakSanitizer sigue fallando también con GTK sin el puente; el fallo se conserva.
+[Investigación actual de memoria y reproductor mínimo](docs/memory-status.md).
 El lanzador y el adaptador MCP stdio ya usan Tarn y un socketpair privado;
 [compilación, permisos y resultados de migración](docs/launcher-migration.md).
 La fase 4 añade compilación fija por MCP y capturas PNG validadas en Tarn,
 con guardado privado opcional (directorio 0700 y archivos 0600).
-La captura requiere autorización explícita. No hay componentes reactivos,
-navegación ni backends móviles.
+La captura requiere autorización explícita. Hay estado reactivo, componentes
+con claves y navegación básica. Los árboles dinámicos y backends móviles siguen pendientes.
 
 [ADR 0001](docs/adr/0001-native-ui-foundations.md) conserva la arquitectura y los
 contratos de seguridad. `evidence/` contiene informes históricos; sus registros

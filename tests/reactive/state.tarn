@@ -1,0 +1,20 @@
+import "core/reactive"
+import "core/session"
+import "counter"
+fn check(value bool) { if !value { panic("reactive state check failed") } }
+fn main() {
+    var text = reactive.State.new("uno")
+    check(!text.set("uno"))
+    check(text.set("dos") && text.get().eq(&"dos"))
+    check(!text.set("dos"))
+    var value: reactive.State<i64> = reactive.State.new(0)
+    check(value.set(1) && value.set(2) && value.set(3))
+    check(*value.get() == 3 && value.is_dirty())
+    check(counter.view(-2).heading == "Contador · par")
+    check(counter.view(-1).heading == "Contador · impar")
+    match counter.reduce(9223372036854775807, session.Event.Increment) {
+        Err(error) => { check(error.code == 9) }
+        Ok(_) => { panic("reactive reducer overflowed") }
+    }
+    print("PASS owned string state, equal writes, grouped changes, derived view and overflow")
+}

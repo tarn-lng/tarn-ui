@@ -9,7 +9,13 @@ extern "C" fn tarn_ui_gtk_release(raw *mut NativeSession) i32
 extern "C" fn tarn_ui_gtk_finish(raw *mut NativeSession, application_error i32) i32
 extern "C" fn tarn_ui_gtk_enable_counter(raw *mut NativeSession, value i64) i32
 extern "C" fn tarn_ui_gtk_set_counter(raw *mut NativeSession, value i64) i32
+extern "C" fn tarn_ui_gtk_set_heading(raw *mut NativeSession, text *u8) i32
 extern "C" fn tarn_ui_gtk_complete_event(raw *mut NativeSession, status i32) i32
+extern "C" fn tarn_ui_gtk_add_page(raw *mut NativeSession, key *u8) i32
+extern "C" fn tarn_ui_gtk_add_label(raw *mut NativeSession, page *u8, key *u8, text *u8) i32
+extern "C" fn tarn_ui_gtk_add_button(raw *mut NativeSession, page *u8, key *u8, text *u8, action u32) i32
+extern "C" fn tarn_ui_gtk_set_text(raw *mut NativeSession, key *u8, text *u8) i32
+extern "C" fn tarn_ui_gtk_show_page(raw *mut NativeSession, key *u8) i32
 
 pub struct Error { pub code i32 }
 pub enum Event {
@@ -17,6 +23,9 @@ pub enum Event {
     Closed
     Increment
 }
+pub enum Action { Opened
+    Closed
+    Activate(u32) }
 pub struct Session { native *mut NativeSession }
 
 fn c_string(text &string) Result<ffi.CString, Error> {
@@ -31,7 +40,7 @@ fn c_string(text &string) Result<ffi.CString, Error> {
 pub unsafe fn run(title string, heading string,
     body mut fn(&mut Session) Result<void, Error>) Result<void, Error> {
     unsafe {
-        if tarn_ui_gtk_abi() != 4 { return Err(Error{code: 7}) }
+        if tarn_ui_gtk_abi() != 6 { return Err(Error{code: 7}) }
     }
     c_title := try c_string(&title)
     c_heading := try c_string(&heading)
@@ -64,7 +73,53 @@ pub fn Session.next_event(&mut self) Result<Event, Error> {
     if event == 1 { return Ok(Event.Opened) }
     if event == 2 { return Ok(Event.Closed) }
     if event == 3 { return Ok(Event.Increment) }
+    if event > 0 { return Err(Error{code: 1}) }
     return Err(Error{code: -event})
+}
+
+pub fn Session.next_action(&mut self) Result<Action, Error> {
+    var event: i32 = 0
+    unsafe { event = tarn_ui_gtk_next(self.native) }
+    if event == 1 { return Ok(Action.Opened) }
+    if event == 2 { return Ok(Action.Closed) }
+    if event >= 1001 && event <= 2024 { return Ok(Action.Activate(u32(event - 1000))) }
+    if event > 0 { return Err(Error{code: 1}) }
+    return Err(Error{code: -event})
+}
+
+fn checked(status i32) Result<void, Error> {
+    if status != 0 { return Err(Error{code: status}) }
+    return Ok(())
+}
+
+pub fn Session.add_page(&mut self, key string) Result<void, Error> {
+    name := try c_string(&key)
+    unsafe { return checked(tarn_ui_gtk_add_page(self.native, name.as_ptr())) }
+}
+
+pub fn Session.add_label(&mut self, page string, key string, text string) Result<void, Error> {
+    parent := try c_string(&page)
+    name := try c_string(&key)
+    label := try c_string(&text)
+    unsafe { return checked(tarn_ui_gtk_add_label(self.native, parent.as_ptr(), name.as_ptr(), label.as_ptr())) }
+}
+
+pub fn Session.add_button(&mut self, page string, key string, text string, action u32) Result<void, Error> {
+    parent := try c_string(&page)
+    name := try c_string(&key)
+    label := try c_string(&text)
+    unsafe { return checked(tarn_ui_gtk_add_button(self.native, parent.as_ptr(), name.as_ptr(), label.as_ptr(), action)) }
+}
+
+pub fn Session.set_text(&mut self, key string, text string) Result<void, Error> {
+    name := try c_string(&key)
+    label := try c_string(&text)
+    unsafe { return checked(tarn_ui_gtk_set_text(self.native, name.as_ptr(), label.as_ptr())) }
+}
+
+pub fn Session.show_page(&mut self, key string) Result<void, Error> {
+    name := try c_string(&key)
+    unsafe { return checked(tarn_ui_gtk_show_page(self.native, name.as_ptr())) }
 }
 
 pub fn Session.enable_counter(&mut self, value i64) Result<void, Error> {
@@ -77,6 +132,14 @@ pub fn Session.enable_counter(&mut self, value i64) Result<void, Error> {
 pub fn Session.set_counter(&mut self, value i64) Result<void, Error> {
     var status: i32 = 0
     unsafe { status = tarn_ui_gtk_set_counter(self.native, value) }
+    if status != 0 { return Err(Error{code: status}) }
+    return Ok(())
+}
+
+pub fn Session.set_heading(&mut self, text string) Result<void, Error> {
+    c_text := try c_string(&text)
+    var status: i32 = 0
+    unsafe { status = tarn_ui_gtk_set_heading(self.native, c_text.as_ptr()) }
     if status != 0 { return Err(Error{code: status}) }
     return Ok(())
 }

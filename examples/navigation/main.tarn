@@ -1,0 +1,72 @@
+import "core/session"
+import "core/components"
+import "core/navigation"
+import "string"
+import "os"
+
+// A reusable application component, instantiated with different stable keys.
+fn counter_value(key string, value i64) components.Node {
+    return components.label(key, string.from_i64(value))
+}
+
+fn home_page(value i64) components.Page {
+    var children: Vec<components.Node> = Vec.new()
+    children.push(components.label("home-title", "Contador"))
+    children.push(counter_value("home-value", value))
+    children.push(components.button("home-add", "Incrementar", 1))
+    children.push(components.button("open-details", "Ver resumen", 2))
+    return components.Page{key: "home", children: children}
+}
+
+fn details_page(value i64) components.Page {
+    var children: Vec<components.Node> = Vec.new()
+    children.push(components.label("details-title", "Resumen"))
+    children.push(counter_value("details-value", value))
+    children.push(components.label("details-parity", "El valor es par"))
+    children.push(components.button("details-add", "Sumar desde el resumen", 1))
+    children.push(components.button("go-back", "Volver al contador", 3))
+    return components.Page{key: "details", children: children}
+}
+
+fn view(value i64, route &string) components.View {
+    var texts: Vec<components.Text> = Vec.new()
+    texts.push(components.Text{key: "home-value", text: string.from_i64(value)})
+    texts.push(components.Text{key: "details-value", text: string.from_i64(value)})
+    var parity = "El valor es par"
+    if value % 2 != 0 { parity = "El valor es impar" }
+    texts.push(components.Text{key: "details-parity", text: parity})
+    return components.View{route: route.clone(), texts: texts}
+}
+
+fn run(ui &mut session.Session) Result<void, session.Error> {
+    var routes: Vec<string> = Vec.new()
+    routes.push("home")
+    routes.push("details")
+    var navigator = try navigation.Navigator.new(routes, "home")
+    var value: i64 = 0
+    try home_page(value).mount(ui)
+    try details_page(value).mount(ui)
+    return components.drive(ui, view(value, navigator.current()),
+        fn(action u32) Result<components.View, session.Error> {
+                if action == 1 {
+                    if value == 9223372036854775807 { return Err(session.Error{code: 9}) }
+                    value = value + 1
+                } else if action == 2 {
+                    try navigator.push("details")
+                } else if action == 3 {
+                    navigator.back()
+                } else { return Err(session.Error{code: 1}) }
+                return Ok(view(value, navigator.current()))
+        })
+}
+
+fn main() {
+    unsafe {
+        match session.run("Tarn UI · navegación", "Componentes y navegación",
+            fn(ui &mut session.Session) Result<void, session.Error> { return run(ui) }) {
+            Ok(_) => { print("closed") }
+            Err(error) => { print(error.code)
+                os.exit(1) }
+        }
+    }
+}

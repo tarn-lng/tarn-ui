@@ -16,7 +16,7 @@ build="${TARN_UI_BUILD_DIR:-$build}"
 compiler="${TARN_BIN:-$root/.build/verified-da3173c/debug/tarn}"
 bash "$root/scripts/checkout-tarn.sh"
 mkdir -p "$build/source/core"
-cp "$root/core/session.tarn" "$build/source/core/session.tarn"
+cp "$root/core/session.tarn" "$root/core/reactive.tarn" "$build/source/core/"
 cp "$root/examples/counter/main.tarn" "$build/source/main.tarn"
 cp "$root/examples/counter/counter.tarn" "$build/source/counter.tarn"
 # pkg-config output is split into cc arguments, never eval'd or passed to Tarn.
@@ -30,11 +30,11 @@ LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" \
     "$compiler" --version
     pkg-config --modversion "${packages[@]}"
     sha256sum "$root/backends/linux/gtk/bridge.c" \
-        "$root/backends/linux/gtk/bridge.h" "$root/core/session.tarn" \
+        "$root/backends/linux/gtk/bridge.h" "$root/core/session.tarn" "$root/core/reactive.tarn" \
         "$compiler" "$build/libtarn_ui_gtk.so"
     sha256sum "$root/examples/counter/counter.tarn" "$root/examples/counter/main.tarn"
     if [[ ${1:-} == --dev ]]; then sha256sum "$root/backends/linux/gtk/devtools.inc"; fi
-    printf 'ABI=4\nLIBRARY_PATH=%s\nLD_LIBRARY_PATH=%s\n' "$build" "$build"
+    printf 'ABI=6\nLIBRARY_PATH=%s\nLD_LIBRARY_PATH=%s\n' "$build" "$build"
 } > "$build/provenance.txt"
 printf 'Built %s\n' "$build/counter"
 if [[ ${1:-} == --dev ]]; then

@@ -1,0 +1,88 @@
+// Owned descriptions built with ordinary functions. Mount once per scoped session.
+import "core/session"
+
+pub struct Label { pub key string
+    pub text string }
+pub struct Button { pub key string
+    pub text string
+    pub action u32 }
+pub enum Node { Text(Label)
+    Press(Button) }
+pub struct Page { pub key string
+    pub children Vec<Node> }
+pub struct Text { pub key string
+    pub text string }
+pub struct View { pub route string
+    pub texts Vec<Text> }
+
+pub fn label(key string, text string) Node { return Node.Text(Label{key: key, text: text}) }
+pub fn button(key string, text string, action u32) Node {
+    return Node.Press(Button{key: key, text: text, action: action})
+}
+
+pub fn Page.mount(&self, ui &mut session.Session) Result<void, session.Error> {
+    try ui.add_page(self.key.clone())
+    for child in self.children.as_slice() {
+        match child {
+            Node.Text(value) => { try ui.add_label(self.key.clone(), value.key.clone(), value.text.clone()) }
+            Node.Press(value) => { try ui.add_button(self.key.clone(), value.key.clone(), value.text.clone(), value.action) }
+        }
+    }
+    return Ok(())
+}
+
+fn View.validate(&self) Result<void, session.Error> {
+    if self.route.is_empty() || self.texts.len() > 256 { return Err(session.Error{code: 1}) }
+    var index: usize = 0
+    for value in self.texts.as_slice() {
+        if value.key.is_empty() { return Err(session.Error{code: 1}) }
+        var previous: usize = 0
+        for previous < index {
+            if self.texts.as_slice()[previous].key.eq(&value.key) { return Err(session.Error{code: 1}) }
+            previous = previous + 1
+        }
+        index = index + 1
+    }
+    return Ok(())
+}
+
+fn View.apply(&self, ui &mut session.Session) Result<void, session.Error> {
+    try self.validate()
+    for value in self.texts.as_slice() { try ui.set_text(value.key.clone(), value.text.clone()) }
+    try ui.show_page(self.route.clone())
+    return Ok(())
+}
+
+fn View.update(&self, previous &View, ui &mut session.Session) Result<void, session.Error> {
+    try self.validate()
+    for value in self.texts.as_slice() {
+        var equal = false
+        for before in previous.texts.as_slice() {
+            if before.key.eq(&value.key) && before.text.eq(&value.text) { equal = true }
+        }
+        if !equal { try ui.set_text(value.key.clone(), value.text.clone()) }
+    }
+    if !self.route.eq(&previous.route) { try ui.show_page(self.route.clone()) }
+    return Ok(())
+}
+
+// Mounted topology is fixed; actions return owned property/route descriptions.
+// The application callback owns its model and never receives native authority.
+pub fn drive(ui &mut session.Session, initial View,
+    update mut fn(u32) Result<View, session.Error>) Result<void, session.Error> {
+    var shown = initial
+    try shown.apply(ui)
+    for {
+        event := try ui.next_action()
+        match event {
+            session.Action.Closed => { return Ok(()) }
+            session.Action.Opened => {}
+            session.Action.Activate(action) => {
+                next := try update(action)
+                try next.update(&shown, ui)
+                shown = next
+                try ui.complete_event()
+            }
+        }
+    }
+}

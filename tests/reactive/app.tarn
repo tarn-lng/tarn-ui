@@ -1,0 +1,60 @@
+import "core/session"
+import "core/reactive"
+import "counter"
+import "os"
+import "string"
+extern "C" fn test_clean() i32
+extern "C" fn test_counter_updates() u32
+extern "C" fn test_heading_updates() u32
+
+fn main() {
+    mode := os.env("TARN_UI_REACTIVE_MODE").unwrap_or(None).unwrap_or("")
+    var state: reactive.State<i64> = reactive.State.new(0)
+    if mode.eq(&"batch") { state.set(1)
+        state.set(2)
+        state.set(3) }
+    if mode.eq(&"overflow") { state.set(9223372036854775807) }
+    var renders: i64 = 0
+    var updates: i64 = 0
+    var status: u8 = 0
+    unsafe {
+        match session.run("Reactividad", "Contador", fn(ui &mut session.Session) Result<void, session.Error> {
+            return reactive.drive_counter(ui, &mut state,
+                fn(value i64, event session.Event) Result<i64, session.Error> {
+                    match event {
+                        session.Event.Increment => {
+                            updates = updates + 1
+                            if mode.eq(&"noop") { return Ok(value) }
+                            if mode.eq(&"error") { return Err(session.Error{code: 99}) }
+                            return counter.reduce(value, session.Event.Increment)
+                        }
+                        _ => { return Ok(value) }
+                    }
+                },
+                fn(value i64) reactive.CounterView {
+                    renders = renders + 1
+                    if mode.eq(&"badheading") && value > 0 {
+                        var bytes: Vec<u8> = Vec.new()
+                        bytes.push(0)
+                        return reactive.CounterView{value: value, heading: string.from_utf8(bytes.as_slice()).unwrap_or("")}
+                    }
+                    if mode.eq(&"projection") { return reactive.CounterView{value: value / 2, heading: "Agrupado"} }
+                    return counter.view(value)
+                })
+        }) {
+            Ok(_) => {}
+            Err(error) => { print(error.code)
+                status = 1 }
+        }
+        if test_clean() != 1 { panic("reactive session resources leaked") }
+    }
+    print("renders=" + &string.from_i64(renders))
+    print("updates=" + &string.from_i64(updates))
+    print("state=" + &string.from_i64(*state.get()))
+    if state.is_dirty() { print("dirty=1") } else { print("dirty=0") }
+    unsafe {
+        print("counter_writes=" + &string.from_u64(u64(test_counter_updates())))
+        print("heading_writes=" + &string.from_u64(u64(test_heading_updates())))
+    }
+    os.exit(status)
+}

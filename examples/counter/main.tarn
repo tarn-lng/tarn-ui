@@ -1,23 +1,15 @@
 import "core/session"
+import "core/reactive"
 import "os"
 import "counter"
 
 fn main() {
-    var value: i64 = 0
+    var state: reactive.State<i64> = reactive.State.new(0)
     unsafe {
         match session.run("Tarn UI", "Hola desde Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
-            try ui.enable_counter(value)
-            for {
-                event := try ui.next_event()
-                match event {
-                    session.Event.Opened => { print("opened") }
-                    session.Event.Closed => { return Ok(()) }
-                    session.Event.Increment => {
-                        try counter.increment(ui, &mut value)
-                        try ui.complete_event()
-                    }
-                }
-            }
+            return reactive.drive_counter(ui, &mut state,
+                fn(value i64, event session.Event) Result<i64, session.Error> { return counter.reduce(value, event) },
+                fn(value i64) reactive.CounterView { return counter.view(value) })
         }) {
             Ok(_) => { print("closed") }
             Err(error) => {

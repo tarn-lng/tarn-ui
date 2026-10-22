@@ -1,6 +1,18 @@
 # ADR 0001: native UI foundations and scoped GTK4 feasibility
 
 Status: **architectural direction approved**, with the constraints below.
+Phase 5 component update (2026-10-22): keyed labels/buttons and retained native
+pages now support owned property views and a bounded Tarn route history.
+The native ABI is 6. A per-session registry borrows widgets from the native tree;
+it is released with the scoped session. There is no global component registry or
+Tarn callback crossing the FFI boundary. See
+[components and navigation](../components-navigation.md).
+Phase 5 update (2026-10-22): the user authorized reactive UI work and deferred
+Mesa/EGL investigation. The first implementation uses owned state, numeric
+reducers and owned counter view descriptions, preserving native widget identity
+and scoped cleanup. No callbacks receive native authority. See
+[reactivity](../reactivity.md) and [the current roadmap](../roadmap.md).
+Earlier phase-only authorization paragraphs below are historical.
 Phase 3 update (2026-10-21): the user authorized inspect/click/close development
 control after accepting Phase 2. The optional build uses an inherited private
 Unix socket capability, explicit operation/text grants and session binding.

@@ -1,0 +1,42 @@
+import "core/components"
+import "core/session"
+import "os"
+import "string"
+extern "C" fn test_clean() i32
+extern "C" fn test_component_text_calls() u32
+extern "C" fn test_page_calls() u32
+
+fn view() components.View {
+    var texts: Vec<components.Text> = Vec.new()
+    texts.push(components.Text{key: "value", text: "0"})
+    return components.View{route: "home", texts: texts}
+}
+
+fn main() {
+    mode := os.env("TARN_UI_VIEW_MODE").unwrap_or(None).unwrap_or("")
+    var status: u8 = 0
+    unsafe {
+        match session.run("View fixture", "Views", fn(ui &mut session.Session) Result<void, session.Error> {
+            var children: Vec<components.Node> = Vec.new()
+            children.push(components.label("value", "0"))
+            children.push(components.button("trigger", "Action", 1))
+            page := components.Page{key: "home", children: children}
+            try page.mount(ui)
+            return components.drive(ui, view(), fn(action u32) Result<components.View, session.Error> {
+                if mode.eq(&"error") { return Err(session.Error{code: 99}) }
+                var next = view()
+                if mode.eq(&"duplicate") { next.texts.push(components.Text{key: "value", text: "wrong"}) }
+                if mode.eq(&"route") { next.route = "missing" }
+                return Ok(next)
+            })
+        }) {
+            Ok(_) => {}
+            Err(error) => { print(error.code)
+                status = 1 }
+        }
+        if test_clean() != 1 { panic("component view leaked resources") }
+        print("text_calls=" + &string.from_u64(u64(test_component_text_calls())))
+        print("page_calls=" + &string.from_u64(u64(test_page_calls())))
+    }
+    os.exit(status)
+}

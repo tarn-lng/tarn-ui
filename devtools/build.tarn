@@ -101,6 +101,7 @@ pub fn run(config &Config) Result<json.Value, wire.Error> {
     try mkdir(&path.join(&output, "source/core"))
     try mkdir(&path.join(&output, "native"))
     try snapshot(&config.root, &output, "core/session.tarn", "source/core/session.tarn")
+    try snapshot(&config.root, &output, "core/reactive.tarn", "source/core/reactive.tarn")
     try snapshot(&config.root, &output, "examples/counter/main.tarn", "source/main.tarn")
     try snapshot(&config.root, &output, "examples/counter/counter.tarn", "source/counter.tarn")
     try snapshot(&config.root, &output, "backends/linux/gtk/bridge.c", "native/bridge.c")

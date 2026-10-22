@@ -1,0 +1,40 @@
+import "core/navigation"
+import "core/session"
+fn check(value bool) { if !value { panic("navigation state check failed") } }
+fn routes() Vec<string> {
+    var result: Vec<string> = Vec.new()
+    result.push("home")
+    result.push("details")
+    return result
+}
+fn run() Result<void, session.Error> {
+    var nav = try navigation.Navigator.new(routes(), "home")
+    check(nav.depth() == 1 && !nav.back())
+    check(!(try nav.push("home")) && nav.depth() == 1)
+    check(try nav.push("details"))
+    check(nav.current().eq(&"details") && nav.depth() == 2)
+    match nav.push("missing") { Err(error) => { check(error.code == 1) }
+        Ok(_) => { panic("unknown route accepted") } }
+    check(nav.depth() == 2 && nav.back() && nav.current().eq(&"home"))
+    var count: usize = 1
+    for count < 64 {
+        if count % 2 == 1 { try nav.push("details") } else { try nav.push("home") }
+        count = count + 1
+    }
+    match nav.push("home") { Err(error) => { check(error.code == 10) }
+        Ok(_) => { panic("unbounded route history") } }
+    check(nav.depth() == 64)
+    for nav.back() {}
+    check(nav.depth() == 1 && nav.current().eq(&"home"))
+    match navigation.Navigator.new(routes(), "missing") { Err(error) => { check(error.code == 1) }
+        Ok(_) => { panic("unknown initial route") } }
+    var duplicates = routes()
+    duplicates.push("home")
+    match navigation.Navigator.new(duplicates, "home") { Err(error) => { check(error.code == 1) }
+        Ok(_) => { panic("duplicate routes accepted") } }
+    return Ok(())
+}
+fn main() {
+    match run() { Ok(_) => { print("PASS route validation, root back, repeated route, bounded history and unwind") }
+        Err(error) => { panic("unexpected navigation error") } }
+}

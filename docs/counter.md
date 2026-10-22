@@ -1,5 +1,10 @@
 # Contador nativo: fase 2
 
+> Estado actual: el ejemplo usa [el enlace reactivo](reactivity.md), con ABI 6
+> y encabezado par/impar derivado. El flujo imperativo y las versiones de ABI
+> descritos abajo son antecedentes de las fases 2–3. `counter.increment` se
+> conserva para las fixtures y sus pruebas de compatibilidad.
+
 Actualización de fase 3: la ABI vigente es 3 y el ejemplo confirma cada evento
 aplicado con `complete_event`. El canal opcional se documenta en
 [la guía de desarrollo](devtools.md); sin `--dev`, el contador no expone transporte.

@@ -4,7 +4,7 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 build="$root/.build/devtools-memory"
 compiler="${TARN_BIN:-$root/.build/verified-da3173c/debug/tarn}"
 mkdir -p "$build/source/core" "$root/.build/evidence/phase3"
-cp "$root/core/session.tarn" "$build/source/core/session.tarn"
+cp "$root/core/session.tarn" "$root/core/reactive.tarn" "$build/source/core/"
 cp "$root/examples/counter/counter.tarn" "$build/source/counter.tarn"
 cp "$root/tests/devtools/app.tarn" "$build/source/main.tarn"
 cc -std=c11 -Wall -Wextra -Werror -g -fPIC -shared \

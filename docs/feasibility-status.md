@@ -1,5 +1,16 @@
 # Feasibility gate: full baseline pending
 
+> Current project status (2026-10-22): Phase 4 launcher/build/private-capture
+> acceptance is complete; see [the final results](launcher-migration.md).
+> The render/LSan failure remains open, with a fresh dependency comparison in
+> [memory status](memory-status.md). The phase authorization and baseline notes
+> below are historical and do not describe the current implementation milestone.
+
+> Phase 5 update: [the first reactive counter binding](reactivity.md) is now
+> implemented. Memory diagnosis is deferred in [the roadmap](roadmap.md).
+> Keyed native components and two-page navigation are also implemented; see
+> [the component results](components-navigation.md).
+
 Latest authorized milestone: Phase 3 development control. See
 [actual Phase 3 results](phase3-results.md); this does not claim a green full
 baseline or resolution of the renderer's LeakSanitizer findings.

@@ -1,0 +1,219 @@
+"""Real GTK pages, scoped action delivery and retained application state."""
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import select
+import subprocess
+import sys
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/devtools"))
+from reference_session import Session
+
+
+def walk(node):
+    yield node
+    for child in node["children"]:
+        yield from walk(child)
+
+
+class Navigation(unittest.TestCase):
+    def start(self, fixture_mode=None, **options):
+        binary = ".build/navigation-dev/navigation" if fixture_mode is None else ".build/navigation-tests/views"
+        return Session(binary=ROOT / binary, allow_text=True,
+                       env={"G_DEBUG": "fatal-warnings", "TARN_UI_VIEW_MODE": fixture_mode or ""}, **options)
+
+    def inspect(self, session):
+        result = session.request("ui.inspect", {"window_id": "main"})["result"]
+        return result, {node["id"]: node for node in walk(result["root"]) if node["stable_id"]}
+
+    def click(self, session, key):
+        return session.request("ui.click", {"window_id": "main", "element_id": key})
+
+    def close(self, session):
+        self.assertTrue(session.request("ui.close", {"window_id": "main"})["result"]["closed"])
+        self.assertEqual(session.process.wait(timeout=3), 0)
+
+    def clean(self, session):
+        self.assertFalse(session.forced_cleanup)
+        self.assertEqual(session.stderr, b"")
+
+    def test_shared_state_and_hidden_targets(self):
+        with self.start() as session:
+            initial, view = self.inspect(session)
+            self.assertTrue(view["home"]["visible"])
+            self.assertFalse(view["details"]["visible"])
+            self.assertEqual(view["home-value"]["text"], "0")
+            self.assertEqual(self.click(session, "details-add")["error"]["code"], "HIDDEN")
+            self.assertEqual(self.click(session, "home-add")["result"]["revision"], 1)
+            self.assertEqual(self.click(session, "open-details")["result"]["revision"], 2)
+            snapshot, view = self.inspect(session)
+            self.assertEqual(snapshot["session_id"], initial["session_id"])
+            self.assertTrue(view["details"]["visible"])
+            self.assertFalse(view["home"]["visible"])
+            self.assertEqual(view["details-value"]["text"], "1")
+            self.assertEqual(view["details-parity"]["text"], "El valor es impar")
+            self.assertEqual(view["details-add"]["native_type"], "GtkButton")
+            self.assertEqual(self.click(session, "home-add")["error"]["code"], "HIDDEN")
+            self.click(session, "details-add")
+            self.click(session, "go-back")
+            _, view = self.inspect(session)
+            self.assertTrue(view["home"]["visible"])
+            self.assertEqual(view["home-value"]["text"], "2")
+            self.assertEqual(view["details-value"]["text"], "2")
+            self.assertEqual(view["details-parity"]["text"], "El valor es par")
+            self.close(session)
+        self.clean(session)
+
+    def test_repeated_navigation_preserves_keys_and_state(self):
+        with self.start() as session:
+            _, before = self.inspect(session)
+            for _ in range(10):
+                self.click(session, "home-add")
+                self.click(session, "open-details")
+                self.click(session, "go-back")
+            snapshot, after = self.inspect(session)
+            self.assertEqual(set(before), set(after))
+            self.assertEqual(after["home-value"]["text"], "10")
+            self.assertEqual(snapshot["revision"], 30)
+            self.close(session)
+        self.clean(session)
+
+    def test_capture_matches_active_page(self):
+        with self.start(allow=("inspect", "click", "close", "screenshot"), allow_capture=True) as session:
+            captures = []
+            for name in ("home", "details"):
+                if name == "details":
+                    self.click(session, "home-add")
+                    self.click(session, "open-details")
+                result = session.request("ui.screenshot", {"window_id": "main"})["result"]
+                png = base64.b64decode(result["data_base64"], validate=True)
+                self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertEqual(hashlib.sha256(png).hexdigest(), result["sha256"])
+                (ROOT / f".build/navigation-tests/{name}.png").write_bytes(png)
+                captures.append(png)
+            self.assertNotEqual(*captures)
+            self.close(session)
+        self.clean(session)
+
+    def test_navigation_pipeline_closes_in_order(self):
+        with self.start() as session:
+            requests = [("ui.click", {"window_id": "main", "element_id": "open-details"}),
+                        ("ui.click", {"window_id": "main", "element_id": "go-back"}),
+                        ("ui.close", {"window_id": "main"}),
+                        ("ui.inspect", {"window_id": "main"})]
+            records = [{"version": 1, "request_id": str(index), "method": method, "params": params}
+                       for index, (method, params) in enumerate(requests)]
+            session.sock.sendall(b"".join(json.dumps(record).encode() + b"\n" for record in records))
+            replies = [session.receive() for _ in records]
+            self.assertEqual([reply["request_id"] for reply in replies], ["0", "1", "2", "3"])
+            self.assertEqual([reply["result"]["revision"] for reply in replies[:2]], [1, 2])
+            self.assertTrue(replies[2]["result"]["closed"])
+            self.assertEqual(replies[3]["error"]["code"], "WINDOW_CLOSED")
+            self.assertEqual(session.process.wait(timeout=3), 0)
+        self.clean(session)
+
+    def test_component_actions_keep_operation_grants(self):
+        with self.start(allow=("inspect", "close")) as session:
+            self.assertEqual(self.click(session, "open-details")["error"]["code"], "UNAUTHORIZED")
+            _, view = self.inspect(session)
+            self.assertTrue(view["home"]["visible"])
+            self.close(session)
+        self.clean(session)
+
+    def test_equal_view_skips_all_native_property_and_route_calls(self):
+        with self.start(fixture_mode="noop") as session:
+            for revision in range(1, 4):
+                self.assertEqual(self.click(session, "trigger")["result"]["revision"], revision)
+            self.close(session)
+        self.clean(session)
+        values = dict(line.split("=", 1) for line in session.stdout.decode().splitlines() if "=" in line)
+        self.assertEqual(values, {"text_calls": "1", "page_calls": "1"})
+
+    def test_view_errors_never_acknowledge_success_and_release_the_tree(self):
+        for mode, code in (("duplicate", 1), ("route", 1), ("error", 99)):
+            with self.subTest(mode=mode):
+                with self.start(fixture_mode=mode) as session:
+                    reply = self.click(session, "trigger")
+                    self.assertEqual(reply["error"]["details"]["application_code"], code)
+                    self.assertEqual(session.process.wait(timeout=3), 1)
+                self.clean(session)
+                self.assertIn(b"text_calls=1", session.stdout)
+
+    def test_mcp_launcher_drives_navigation_and_back(self):
+        process = subprocess.Popen([
+            str(ROOT / ".build/launcher/tarn-ui"), "--mode", "mcp",
+            "--binary", str(ROOT / ".build/navigation-dev/navigation"),
+            "--library-path", str(ROOT / ".build/navigation-dev"),
+            "--allow", "inspect", "click", "close", "--allow-text",
+        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        buffer = bytearray()
+        sequence = 0
+
+        def request(method, params):
+            nonlocal sequence
+            sequence += 1
+            process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": sequence,
+                                            "method": method, "params": params}).encode() + b"\n")
+            process.stdin.flush()
+            deadline = time.monotonic() + 10
+            while b"\n" not in buffer:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([process.stdout], [], [], max(0, remaining))[0]:
+                    raise TimeoutError("MCP response deadline")
+                chunk = os.read(process.stdout.fileno(), 8192)
+                if not chunk:
+                    raise EOFError("MCP stdout closed")
+                buffer.extend(chunk)
+                if len(buffer) > 8 * 1024 * 1024:
+                    raise ValueError("MCP response budget")
+            line, _, rest = buffer.partition(b"\n")
+            buffer[:] = rest
+            reply = json.loads(line)
+            self.assertEqual(reply["id"], sequence)
+            return reply["result"]
+
+        def call(name, arguments=None):
+            result = request("tools/call", {"name": name, "arguments": arguments or {}})
+            self.assertFalse(result["isError"], result)
+            return result["structuredContent"]
+
+        try:
+            request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                                   "clientInfo": {"name": "navigation-test", "version": "1"}})
+            process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            process.stdin.flush()
+            call("ui.start")
+            call("ui.click", {"element_id": "home-add"})
+            call("ui.click", {"element_id": "open-details"})
+            visible = {node["id"]: node for node in walk(call("ui.inspect")["root"]) if node["stable_id"]}
+            self.assertTrue(visible["details"]["visible"])
+            self.assertEqual(visible["details-value"]["text"], "1")
+            call("ui.click", {"element_id": "go-back"})
+            visible = {node["id"]: node for node in walk(call("ui.inspect")["root"]) if node["stable_id"]}
+            self.assertTrue(visible["home"]["visible"])
+            self.assertEqual(visible["home-value"]["text"], "1")
+            self.assertTrue(call("ui.close")["closed"])
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=5), 0)
+            self.assertEqual(process.stderr.read(), b"")
+            self.assertEqual(bytes(buffer) + process.stdout.read(), b"")
+        finally:
+            if not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            process.stdout.close()
+            process.stderr.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

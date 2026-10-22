@@ -439,7 +439,8 @@ static gboolean dev_pump(Session *s) {
     }
     if (!d->ready) {
         if (!gtk_widget_get_mapped(GTK_WIDGET(s->window)) || !dev_allocated(GTK_WIDGET(s->window)) ||
-            !dev_allocated(s->counter_label) || !dev_allocated(s->button)) return FALSE;
+            (s->counter_label && (!dev_allocated(s->counter_label) || !dev_allocated(s->button))) ||
+            (s->pages && !dev_allocated(gtk_stack_get_visible_child(GTK_STACK(s->pages))))) return FALSE;
         JsonObject *o = dev_result(d);
         dev_int(o, "version", 1); dev_string(o, "event", "ready");
         dev_wire(d, o); d->ready = TRUE; return TRUE;

@@ -1,0 +1,42 @@
+// Route state belongs to Tarn. Hidden pages remain mounted until session teardown.
+import "core/session"
+
+pub struct Navigator { routes Vec<string>
+    history Vec<string> }
+
+pub fn Navigator.new(routes Vec<string>, initial string) Result<Navigator, session.Error> {
+    if routes.is_empty() || routes.len() > 32 { return Err(session.Error{code: 1}) }
+    var found = false
+    var index: usize = 0
+    for route in routes.as_slice() {
+        if route.is_empty() { return Err(session.Error{code: 1}) }
+        if route.eq(&initial) { found = true }
+        var other: usize = 0
+        for other < index {
+            if route.eq(&routes.as_slice()[other]) { return Err(session.Error{code: 1}) }
+            other = other + 1
+        }
+        index = index + 1
+    }
+    if !found { return Err(session.Error{code: 1}) }
+    var history: Vec<string> = Vec.new()
+    history.push(initial)
+    return Ok(Navigator{routes: routes, history: history})
+}
+
+pub fn Navigator.current(&self) &string { return &self.history.as_slice()[self.history.len() - 1] }
+pub fn Navigator.depth(&self) usize { return self.history.len() }
+pub fn Navigator.push(&mut self, route string) Result<bool, session.Error> {
+    if self.current().eq(&route) { return Ok(false) }
+    var found = false
+    for allowed in self.routes.as_slice() { if allowed.eq(&route) { found = true } }
+    if !found { return Err(session.Error{code: 1}) }
+    if self.history.len() >= 64 { return Err(session.Error{code: 10}) }
+    self.history.push(route)
+    return Ok(true)
+}
+pub fn Navigator.back(&mut self) bool {
+    if self.history.len() == 1 { return false }
+    self.history.pop()
+    return true
+}

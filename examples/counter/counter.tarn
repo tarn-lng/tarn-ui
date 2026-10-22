@@ -1,4 +1,21 @@
 import "core/session"
+import "core/reactive"
+
+// Pure reducer and derived view; neither receives native authority.
+pub fn reduce(value i64, event session.Event) Result<i64, session.Error> {
+    match event {
+        session.Event.Increment => {
+            if value == 9223372036854775807 { return Err(session.Error{code: 9}) }
+            return Ok(value + 1)
+        }
+        _ => { return Ok(value) }
+    }
+}
+
+pub fn view(value i64) reactive.CounterView {
+    if value % 2 == 0 { return reactive.CounterView{value: value, heading: "Contador · par"} }
+    return reactive.CounterView{value: value, heading: "Contador · impar"}
+}
 
 // Application logic: no native state, aborting arithmetic or C-side increment.
 pub fn increment(ui &mut session.Session, value &mut i64) Result<void, session.Error> {

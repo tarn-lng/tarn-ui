@@ -8,7 +8,7 @@ compiler="${TARN_BIN:-$root/.build/verified-da3173c/debug/tarn}"
     echo 'Usage: test-gtk.sh [--build-only]' >&2; exit 2;
 }
 mkdir -p "$build/source/core" "$evidence"
-cp "$root/core/session.tarn" "$build/source/core/session.tarn"
+cp "$root/core/session.tarn" "$root/core/reactive.tarn" "$build/source/core/"
 cp "$root/tests/gtk/counter-smoke.tarn" "$build/source/main.tarn"
 cp "$root/examples/counter/counter.tarn" "$build/source/counter.tarn"
 cc -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \

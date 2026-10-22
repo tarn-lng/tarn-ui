@@ -2,12 +2,15 @@
 
 ```text
 tarn-ui/
-  core/                      API semántica y runner de sesión
+  core/                      API semántica, estado reactivo y runner de sesión
   backends/linux/gtk/        puente C privado y cabecera ABI
   examples/counter/          programa y lógica de aplicación en Tarn
+  examples/navigation/       dos pantallas con componentes reutilizables y estado compartido
   devtools/                  lanzador, canal y adaptador MCP en Tarn
   tests/
     gtk/                     ciclo de vida, integración y compile-fail de la API
+    reactive/                estado, vistas derivadas y enlace nativo del contador
+    navigation/              rutas, identidad de componentes, limpieza y aceptación MCP
     compiler/                reproducciones de préstamos y sesión sin GTK
     devtools/                protocolo, permisos y sonda de memoria del canal
     launcher/                aceptación Tarn y referencias del lanzador anterior
