@@ -5,9 +5,13 @@ La fase 5 tiene [estado reactivo y vistas derivadas](docs/reactivity.md) y
 Las pantallas comparten estado y conservan sus controles GTK al volver.
 La demo incluye una [lista dinámica editable](docs/dynamic-lists.md) que conserva
 la identidad de las filas al reordenarlas y libera las retiradas.
+Las [opciones condicionales](docs/dynamic-regions.md) montan y retiran un bloque
+con campo, encabezado y botones conservando su estado en Tarn.
 El formulario permite guardar y restablecer un nombre; el agente puede probarlo
 mediante [`ui.fill` con permiso explícito](docs/devtools.md#uifill).
 [Próximos pasos y recordatorio de memoria aplazado](docs/roadmap.md).
+La [revisión de fase 5](docs/phase5-review.md) mantiene abiertos los casos de
+listas largas y etiquetas extensas que exceden la pantalla.
 
 Contador nativo GTK4 con estado y lógica de aplicación en Tarn. El puente C
 encola eventos y presenta los valores que recibe; Tarn procesa los clics.
