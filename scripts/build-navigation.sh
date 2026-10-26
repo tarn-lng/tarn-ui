@@ -29,6 +29,6 @@ if rg -q '"severity":"warning"' "$build/compiler.jsonl"; then cat "$build/compil
         "$root/examples/navigation/main.tarn" "$root/examples/navigation/tasks.tarn" "$root/backends/linux/gtk/bridge.c" "$root/backends/linux/gtk/bridge.h" \
         "$build/libtarn_ui_gtk.so"
     if [[ ${1:-} == --dev ]]; then sha256sum "$root/backends/linux/gtk/devtools.inc"; fi
-    printf 'ABI=11\nLD_LIBRARY_PATH=%s\n' "$build"
+    printf 'ABI=12\nLD_LIBRARY_PATH=%s\n' "$build"
 } > "$build/provenance.txt"
 printf 'Built %s/navigation\n' "$build"

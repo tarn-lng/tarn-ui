@@ -69,7 +69,9 @@ fn view(value i64, route &string, form &forms.NameForm, list &tasks.Model) compo
     enabled.push(components.Enabled{key: "task-up", value: list.can_up()})
     var lists: Vec<components.List> = Vec.new()
     lists.push(components.List{key: "task-list", items: list.items()})
-    return components.View{route: route.clone(), texts: texts, enabled: enabled, inputs: inputs, lists: lists}
+    var regions: Vec<components.Region> = Vec.new()
+    regions.push(list.region())
+    return components.View{route: route.clone(), texts: texts, enabled: enabled, inputs: inputs, lists: lists, regions: regions}
 }
 
 fn run(ui &mut session.Session) Result<void, session.Error> {

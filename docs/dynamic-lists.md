@@ -11,7 +11,7 @@ bash scripts/run-navigation.sh
 bash scripts/test-navigation.sh
 ```
 
-La ABI vigente es **11**. Recompilar aplicación y biblioteca juntas.
+La ABI vigente es **12**. Recompilar aplicación y biblioteca juntas.
 
 ## Descripción en Tarn
 
@@ -25,7 +25,7 @@ rows.push(components.Button{key: "item-42", text: "Revisar propuesta", action: 1
 var lists: Vec<components.List> = Vec.new()
 lists.push(components.List{key: "items", items: rows})
 return components.View{route: "home", texts: Vec.new(), enabled: Vec.new(),
-    inputs: Vec.new(), lists: lists}
+    inputs: Vec.new(), lists: lists, regions: Vec.new()}
 ```
 
 Las vistas existentes requieren `lists: Vec.new()` si no contienen listas.
@@ -76,8 +76,9 @@ reconciliación interrumpida y sus estructuras auxiliares.
   IDs retirados ni permite que el contador de acciones desborde.
 
 Esta primera implementación reconcilia filas seleccionables dentro de cajas
-reservadas. No reconcilia árboles arbitrarios, subárboles de controles mixtos,
-cambios de tipo por clave ni listas virtualizadas. Las páginas y los demás
+reservadas. Para subárboles mixtos y bloques condicionales, usar
+[`View.regions`](dynamic-regions.md). No admite cambios de tipo por clave ni
+listas virtualizadas. Las páginas y los demás
 grupos mantienen su topología fija. No introduce un renderizador propio.
 
 ## Verificación

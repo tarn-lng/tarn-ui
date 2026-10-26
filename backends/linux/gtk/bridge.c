@@ -21,6 +21,8 @@ typedef struct {
     GHashTable *list_seen;
     gboolean list_focus_removed;
     unsigned list_expected;
+    gboolean tree_mode;
+    GHashTable *tree_last;
     gboolean pages_presented;
     gulong click_handler;
     unsigned pending_increments; /* queue length, never application state */
@@ -61,7 +63,7 @@ static void finalized(gpointer data, GObject *object) {
 #define FAIL_AT(stage) FALSE
 #endif
 
-uint32_t tarn_ui_gtk_abi(void) { return 11; }
+uint32_t tarn_ui_gtk_abi(void) { return 12; }
 
 static void enqueue(Session *s, int32_t code) {
     if (s->closed || s->queue_full) return;
@@ -118,6 +120,7 @@ static void dispose(Session *s) {
     for (unsigned i = 0; i < 64; ++i) g_clear_pointer(&s->event_texts[i], g_free);
     g_clear_pointer(&s->dispatched_text, g_free);
     g_clear_pointer(&s->list_seen, g_hash_table_unref);
+    g_clear_pointer(&s->tree_last, g_hash_table_unref);
     if (s->components) {
         GHashTableIter iter;
         gpointer widget;
@@ -434,7 +437,7 @@ int32_t tarn_ui_gtk_add_page(void *raw, const char *key) {
 static GtkWidget *component_parent(Session *s, const char *key) {
     if (!key || !s->components) return NULL;
     GtkWidget *parent = g_hash_table_lookup(s->components, key);
-    if (!parent || !GTK_IS_BOX(parent) || g_object_get_data(G_OBJECT(parent), "tarn-ui-list") || !gtk_widget_is_ancestor(parent, s->pages)) return NULL;
+    if (!parent || !GTK_IS_BOX(parent) || (g_object_get_data(G_OBJECT(parent), "tarn-ui-list") || g_object_get_data(G_OBJECT(parent), "tarn-ui-tree") || g_object_get_data(G_OBJECT(parent), "tarn-ui-tree-kind")) || !gtk_widget_is_ancestor(parent, s->pages)) return NULL;
     unsigned depth = 0;
     for (GtkWidget *p = parent; p && p != s->pages; p = gtk_widget_get_parent(p)) ++depth;
     return depth <= 16 ? parent : NULL;
@@ -534,6 +537,8 @@ int32_t tarn_ui_gtk_set_accessible(void *raw, const char *key, const char *label
     int32_t status = component_lookup(raw, key, &widget);
     if (status) return status;
     if (!label || !*label || !description || !g_utf8_validate(label, -1, NULL) || !g_utf8_validate(description, -1, NULL)) return 1;
+    if (g_strcmp0(g_object_get_data(G_OBJECT(widget), "tarn-ui-a11y-label"), label) == 0 &&
+        g_strcmp0(g_object_get_data(G_OBJECT(widget), "tarn-ui-a11y-description"), description) == 0) return 0;
     gtk_accessible_update_property(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_PROPERTY_LABEL, label,
                                    GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, description, -1);
     /* Explicit adapter properties, not a claim of a computed accessible-name getter. */
@@ -562,7 +567,7 @@ int32_t tarn_ui_gtk_focus(void *raw, const char *key) {
     if (status) return status;
     Session *s = raw;
     GtkWidget *page = gtk_stack_get_visible_child(GTK_STACK(s->pages));
-    if (!can_focus(widget) || !gtk_widget_is_ancestor(widget, page) || !gtk_widget_get_focusable(widget)) return 1;
+    if (!can_focus(widget) || !gtk_widget_is_ancestor(widget, page)) return 1;
     return gtk_widget_grab_focus(widget) ? 0 : 1;
 }
 
@@ -746,7 +751,7 @@ int32_t tarn_ui_gtk_list_begin(void *raw, const char *parent_key, uint32_t count
     int32_t status = component_lookup(raw, parent_key, &parent);
     if (status) return status;
     Session *s = raw;
-    if (s->list_parent || !GTK_IS_BOX(parent) || count > 256) return 1;
+    if (s->list_parent || !GTK_IS_BOX(parent) || (g_object_get_data(G_OBJECT(parent), "tarn-ui-tree") || g_object_get_data(G_OBJECT(parent), "tarn-ui-tree-kind")) || count > 256) return 1;
     if (!g_object_get_data(G_OBJECT(parent), "tarn-ui-list") && gtk_widget_get_first_child(parent)) return 1;
     unsigned old_count = 0;
     for (GtkWidget *child = gtk_widget_get_first_child(parent); child; child = gtk_widget_get_next_sibling(child)) ++old_count;
@@ -766,7 +771,7 @@ int32_t tarn_ui_gtk_list_item(void *raw, const char *key, const char *text, uint
     Session *s = raw;
     if (s->closed) return 6;
     if (s->queue_full) return 8;
-    if (!s->list_parent || !valid_key(key) || !text || !g_utf8_validate(text, -1, NULL) || action < 1 || action > 1024 || g_hash_table_contains(s->list_seen, key)) return 1;
+    if (!s->list_parent || s->tree_mode || !valid_key(key) || !text || !g_utf8_validate(text, -1, NULL) || action < 1 || action > 1024 || g_hash_table_contains(s->list_seen, key)) return 1;
     if (g_hash_table_size(s->list_seen) >= s->list_expected) return 1;
     GtkWidget *widget = g_hash_table_lookup(s->components, key);
     if (widget) {
@@ -802,7 +807,7 @@ int32_t tarn_ui_gtk_list_end(void *raw) {
     Session *s = raw;
     if (s->closed) return 6;
     if (s->queue_full) return 8;
-    if (!s->list_parent || g_hash_table_size(s->list_seen) != s->list_expected) return 1;
+    if (!s->list_parent || s->tree_mode || g_hash_table_size(s->list_seen) != s->list_expected) return 1;
     GtkWidget *child = gtk_widget_get_first_child(s->list_parent);
     while (child) {
         GtkWidget *next = gtk_widget_get_next_sibling(child);
@@ -838,5 +843,159 @@ int32_t tarn_ui_gtk_list_end(void *raw) {
     }
     s->list_parent = s->list_previous = NULL;
     g_clear_pointer(&s->list_seen, g_hash_table_unref);
+    return 0;
+}
+
+/* Whole-region traversal: parents precede children; keys cannot move parents or
+ * change native type. Native GTK internals never enter the keyed registry. */
+int32_t tarn_ui_gtk_tree_begin(void *raw, const char *key, uint32_t count) {
+    GtkWidget *root = NULL;
+    int32_t status = component_lookup(raw, key, &root);
+    if (status) return status;
+    Session *s = raw;
+    if (s->list_parent || !GTK_IS_BOX(root) || count > 256 || g_object_get_data(G_OBJECT(root), "tarn-ui-list")) return 1;
+    if (!g_object_get_data(G_OBJECT(root), "tarn-ui-tree") && gtk_widget_get_first_child(root)) return 1;
+    /* A nested owned group cannot become a separately controlled region. */
+    if (g_object_get_data(G_OBJECT(root), "tarn-ui-tree-kind")) return 1;
+    unsigned old_count = 0;
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init(&iter, s->components);
+    while (g_hash_table_iter_next(&iter, NULL, &value))
+        if (gtk_widget_is_ancestor(value, root)) ++old_count;
+    if (g_hash_table_size(s->components) - old_count + count > 256) return 1;
+    g_object_set_data(G_OBJECT(root), "tarn-ui-tree", GINT_TO_POINTER(1));
+    s->list_parent = root;
+    s->list_expected = count;
+    s->list_focus_removed = FALSE;
+    s->tree_mode = TRUE;
+    s->list_seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    s->tree_last = g_hash_table_new(g_direct_hash, g_direct_equal);
+    return 0;
+}
+
+int32_t tarn_ui_gtk_tree_node(void *raw, const char *parent_key, const char *key, uint32_t kind,
+                             const char *text, uint32_t action, uint32_t spacing) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    if (s->queue_full) return 8;
+    if (!s->tree_mode || !s->list_parent || !valid_key(key) || !text || !g_utf8_validate(text, -1, NULL) || kind > 7 || spacing > 64 ||
+        g_hash_table_contains(s->list_seen, key) || g_hash_table_size(s->list_seen) >= s->list_expected) return 1;
+    if (kind >= 3 && kind <= 5) { if (action < 1 || action > 1024) return 1; }
+    else if (action) return 1;
+    if (kind == 5 && g_utf8_strlen(text, -1) > 256) return 1;
+    GtkWidget *parent = parent_key ? g_hash_table_lookup(s->components, parent_key) : NULL;
+    if (!parent || !GTK_IS_BOX(parent) || (parent != s->list_parent &&
+        (!g_hash_table_contains(s->list_seen, parent_key) || !gtk_widget_is_ancestor(parent, s->list_parent)))) return 1;
+    unsigned depth = 0;
+    for (GtkWidget *p = parent; p != s->list_parent; p = gtk_widget_get_parent(p)) if (++depth > 12) return 1;
+    if (kind >= 6 && depth >= 12) return 1;
+    GtkWidget *widget = g_hash_table_lookup(s->components, key);
+    if (widget) {
+        if (gtk_widget_get_parent(widget) != parent || GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(widget), "tarn-ui-tree-kind")) != kind + 1 ||
+            GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(widget), "tarn-ui-action")) != action) return 1;
+    } else {
+        if (g_hash_table_size(s->components) >= 512) return 1;
+        if (kind >= 6) widget = gtk_box_new(kind == 7 ? GTK_ORIENTATION_HORIZONTAL : GTK_ORIENTATION_VERTICAL, (int)spacing);
+        else if (kind == 5) { widget = gtk_entry_new(); gtk_entry_set_max_length(GTK_ENTRY(widget), 256); }
+        else if (kind == 3 || kind == 4) widget = gtk_button_new_with_label(text);
+        else if (kind == 1) {
+            widget = g_object_new(GTK_TYPE_LABEL, "accessible-role", GTK_ACCESSIBLE_ROLE_HEADING, "label", text, NULL);
+            gtk_accessible_update_property(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_PROPERTY_LEVEL, 2, -1);
+            gtk_widget_add_css_class(widget, "title-2");
+        } else widget = gtk_label_new(text);
+        if (kind == 2) gtk_widget_add_css_class(widget, "title-1");
+        if (kind == 4) gtk_widget_add_css_class(widget, "suggested-action");
+        if (kind <= 2) gtk_label_set_wrap(GTK_LABEL(widget), TRUE);
+        component_track(widget);
+        g_hash_table_insert(s->components, g_strdup(key), widget);
+#ifdef TARN_UI_DEVTOOLS
+        g_object_set_data_full(G_OBJECT(widget), "tarn-ui-id", g_strdup(key), g_free);
+#endif
+        g_object_set_data(G_OBJECT(widget), "tarn-ui-tree-kind", GUINT_TO_POINTER(kind + 1));
+        g_object_set_data(G_OBJECT(widget), "tarn-ui-action", GUINT_TO_POINTER(action));
+        gtk_box_append(GTK_BOX(parent), widget);
+        if (kind >= 3 && kind <= 5) {
+            if (kind == 5) g_signal_connect(widget, "changed", G_CALLBACK(entry_changed), s);
+            else g_signal_connect(widget, "clicked", G_CALLBACK(component_clicked), s);
+#ifdef TARN_UI_TESTING
+            ++stats.connected;
+#endif
+        }
+    }
+    if (kind >= 6) {
+        if (gtk_box_get_spacing(GTK_BOX(widget)) != (int)spacing) gtk_box_set_spacing(GTK_BOX(widget), (int)spacing);
+    } else if (kind == 5) {
+        status = tarn_ui_gtk_set_input(raw, key, text);
+        if (status) return status;
+    } else if (kind >= 3) {
+        if (strcmp(gtk_button_get_label(GTK_BUTTON(widget)), text)) gtk_button_set_label(GTK_BUTTON(widget), text);
+    } else if (strcmp(gtk_label_get_text(GTK_LABEL(widget)), text)) gtk_label_set_text(GTK_LABEL(widget), text);
+    GtkWidget *previous = g_hash_table_lookup(s->tree_last, parent);
+    if (gtk_widget_get_prev_sibling(widget) != previous) gtk_box_reorder_child_after(GTK_BOX(parent), widget, previous);
+    g_hash_table_insert(s->tree_last, parent, widget);
+    g_hash_table_add(s->list_seen, g_strdup(key));
+    return 0;
+}
+
+static void tree_remove(Session *s, GtkWidget *parent, GtkWidget *child) {
+    GtkWidget *focus = gtk_window_get_focus(s->window);
+    if (focus == child || (focus && gtk_widget_is_ancestor(focus, child))) s->list_focus_removed = TRUE;
+    for (GtkWidget *page = gtk_widget_get_first_child(s->pages); page; page = gtk_widget_get_next_sibling(page)) {
+        GtkWidget *saved = g_object_get_data(G_OBJECT(page), "tarn-ui-last-focus");
+        if (saved == child || (saved && gtk_widget_is_ancestor(saved, child)))
+            g_object_set_data(G_OBJECT(page), "tarn-ui-last-focus", NULL);
+    }
+    GHashTableIter iter;
+    gpointer value;
+    g_hash_table_iter_init(&iter, s->components);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        GtkWidget *widget = value;
+        if (widget != child && !gtk_widget_is_ancestor(widget, child)) continue;
+        unsigned disconnected = g_signal_handlers_disconnect_by_func(widget, component_clicked, s);
+        disconnected += g_signal_handlers_disconnect_by_func(widget, entry_changed, s);
+#ifdef TARN_UI_TESTING
+        stats.disconnected += disconnected;
+#else
+        (void)disconnected;
+#endif
+        g_hash_table_iter_remove(&iter);
+    }
+    gtk_box_remove(GTK_BOX(parent), child);
+}
+static void tree_prune(Session *s, GtkWidget *parent) {
+    GtkWidget *child = gtk_widget_get_first_child(parent);
+    while (child) {
+        GtkWidget *next = gtk_widget_get_next_sibling(child);
+        gboolean keep = FALSE;
+        GHashTableIter iter;
+        gpointer key, value;
+        g_hash_table_iter_init(&iter, s->components);
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+            if (value == child) { keep = g_hash_table_contains(s->list_seen, key); break; }
+        }
+        if (!keep) tree_remove(s, parent, child);
+        else if (GTK_IS_BOX(child)) tree_prune(s, child);
+        child = next;
+    }
+}
+int32_t tarn_ui_gtk_tree_end(void *raw) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    if (s->queue_full) return 8;
+    if (!s->tree_mode || !s->list_parent || g_hash_table_size(s->list_seen) != s->list_expected) return 1;
+    tree_prune(s, s->list_parent);
+    if (s->list_focus_removed) {
+        GtkWidget *target = first_focusable(gtk_stack_get_visible_child(GTK_STACK(s->pages)));
+        if (target) gtk_widget_grab_focus(target);
+    }
+    s->list_parent = NULL;
+    s->tree_mode = FALSE;
+    g_clear_pointer(&s->list_seen, g_hash_table_unref);
+    g_clear_pointer(&s->tree_last, g_hash_table_unref);
     return 0;
 }

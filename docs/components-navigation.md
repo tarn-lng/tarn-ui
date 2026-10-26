@@ -12,7 +12,7 @@ bash scripts/run-navigation.sh
 Se requiere el SDK GTK4 y el compilador suministrado en
 `../tarn/target/debug/tarn`, o un `TARN_BIN` explícito. `--dev` compila aparte en
 `.build/navigation-dev`, con el canal opcional y sus permisos habituales.
-La compilación normal no incluye ese canal. La ABI nativa vigente es **11**;
+La compilación normal no incluye ese canal. La ABI nativa vigente es **12**;
 biblioteca y aplicación deben recompilarse juntas.
 
 ## Descripciones y actualización
@@ -43,7 +43,8 @@ de aplicar propiedades, evitando diferencias ambiguas entre la descripción y GT
 
 Los textos son parches de propiedades: omitir una clave no elimina su widget
 ni reinicia su contenido. Las filas de `View.lists` admiten reconciliación
-y desmontaje dinámicos; los demás árboles siguen estáticos. No hay ejecución
+y desmontaje dinámicos; [`View.regions`](dynamic-regions.md) permite bloques
+condicionales y subárboles mixtos dentro de cajas reservadas. No hay ejecución
 asíncrona de efectos en esta entrega. El montaje queda cerrado después de la primera llamada a `show_page`.
 
 ## Rutas y ciclo de vida
@@ -97,7 +98,7 @@ Verificaciones realizadas:
   También comprueba montaje parcial, límites de páginas/componentes, orden de
   acciones diferentes, acceso desde otro hilo, UTF-8, duplicados y cierre con
   cola llena. La limpieza se verifica después de cada sesión de límites.
-- Veintiuna pruebas de integración: estado compartido, rechazo de botones ocultos,
+- Veintidós pruebas de integración: estado compartido, rechazo de botones ocultos,
   navegación repetida, capturas reales de ambas páginas con hash independiente,
   pipeline de acciones/cierre, permisos, vistas sin cambios, errores de vista
   con limpieza y navegación real a través de MCP. Algunos casos agrupan varios

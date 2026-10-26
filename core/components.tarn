@@ -12,7 +12,15 @@ pub enum Node { Text(Label)
     Value(Label)
     Primary(Button)
     Group(Container)
-    Input(Button) }
+    Input(Button)
+    Field(Field) }
+pub struct Field { pub key string
+    pub text string
+    pub action u32
+    pub label string
+    pub description string }
+pub struct Region { pub key string
+    pub children Vec<Node> }
 pub struct Container { pub key string
     pub horizontal bool
     pub spacing u32
@@ -29,30 +37,38 @@ pub struct View { pub route string
     pub texts Vec<Text>
     pub enabled Vec<Enabled>
     pub inputs Vec<Text>
-    pub lists Vec<List> }
+    pub lists Vec<List>
+    pub regions Vec<Region> }
 
-pub fn label(key string, text string) Node { return Node.Text(Label{key: key, text: text}) }
+pub fn label(key string, text string) Node { return Node.Text(Label { key: key, text: text }) }
 pub fn button(key string, text string, action u32) Node {
-    return Node.Press(Button{key: key, text: text, action: action})
+    return Node.Press(Button { key: key, text: text, action: action })
 }
 pub fn input(key string, text string, action u32) Node {
-    return Node.Input(Button{key: key, text: text, action: action})
+    return Node.Input(Button { key: key, text: text, action: action })
 }
-pub fn heading(key string, text string) Node { return Node.Heading(Label{key: key, text: text}) }
-pub fn number(key string, text string) Node { return Node.Value(Label{key: key, text: text}) }
+pub fn field(key string, text string, action u32, accessible_label string, description string) Node {
+    return Node.Field(Field { key: key, text: text, action: action, label: accessible_label, description: description })
+}
+pub fn heading(key string, text string) Node { return Node.Heading(Label { key: key, text: text }) }
+pub fn number(key string, text string) Node { return Node.Value(Label { key: key, text: text }) }
 pub fn primary_button(key string, text string, action u32) Node {
-    return Node.Primary(Button{key: key, text: text, action: action})
+    return Node.Primary(Button { key: key, text: text, action: action })
 }
 pub fn row(key string, spacing u32, children Vec<Node>) Node {
-    return Node.Group(Container{key: key, horizontal: true, spacing: spacing, children: children})
+    return Node.Group(Container { key: key, horizontal: true, spacing: spacing, children: children })
 }
 pub fn column(key string, spacing u32, children Vec<Node>) Node {
-    return Node.Group(Container{key: key, horizontal: false, spacing: spacing, children: children})
+    return Node.Group(Container { key: key, horizontal: false, spacing: spacing, children: children })
 }
 
 fn mount(ui &mut session.Session, parent &string, children &[]Node, depth u32) Result<void, session.Error> {
     for child in children {
         match child {
+            Node.Field(value) => {
+                try ui.add_entry(parent.clone(), value.key.clone(), value.text.clone(), value.action)
+                try ui.set_accessible(value.key.clone(), value.label.clone(), value.description.clone())
+            }
             Node.Input(value) => { try ui.add_entry(parent.clone(), value.key.clone(), value.text.clone(), value.action) }
             Node.Text(value) => { try ui.add_label(parent.clone(), value.key.clone(), value.text.clone()) }
             Node.Press(value) => { try ui.add_button(parent.clone(), value.key.clone(), value.text.clone(), value.action) }
@@ -63,7 +79,7 @@ fn mount(ui &mut session.Session, parent &string, children &[]Node, depth u32) R
                 try ui.set_primary(value.key.clone(), true)
             }
             Node.Group(value) => {
-                if depth >= 12 { return Err(session.Error{code: 1}) }
+                if depth >= 12 { return Err(session.Error { code: 1 }) }
                 try ui.add_box(parent.clone(), value.key.clone(), value.horizontal, value.spacing)
                 try mount(ui, &value.key, value.children.as_slice(), depth + 1)
             }
@@ -78,44 +94,51 @@ pub fn Page.mount(&self, ui &mut session.Session) Result<void, session.Error> {
 }
 
 fn View.validate(&self) Result<void, session.Error> {
-    if self.route.is_empty() || self.texts.len() > 256 { return Err(session.Error{code: 1}) }
-    if self.enabled.len() > 256 { return Err(session.Error{code: 1}) }
+    if self.regions.len() > 256 { return Err(session.Error { code: 1 }) }
+    var region_keys: Vec<string> = Vec.new()
+    for region in self.regions.as_slice() {
+        try unique_key(&region.key, &mut region_keys)
+        var keys: Vec<string> = Vec.new()
+        try validate_nodes(region.children.as_slice(), 0, &mut keys)
+    }
+    if self.route.is_empty() || self.texts.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.enabled.len() > 256 { return Err(session.Error { code: 1 }) }
     var enabled_index: usize = 0
     for value in self.enabled.as_slice() {
-        if value.key.is_empty() { return Err(session.Error{code: 1}) }
+        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
         var previous: usize = 0
         for previous < enabled_index {
-            if self.enabled.as_slice()[previous].key.eq(&value.key) { return Err(session.Error{code: 1}) }
+            if self.enabled.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
             previous = previous + 1
         }
         enabled_index = enabled_index + 1
     }
-    if self.inputs.len() > 256 { return Err(session.Error{code: 1}) }
+    if self.inputs.len() > 256 { return Err(session.Error { code: 1 }) }
     var input_index: usize = 0
     for value in self.inputs.as_slice() {
-        if value.key.is_empty() { return Err(session.Error{code: 1}) }
+        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
         var previous: usize = 0
         for previous < input_index {
-            if self.inputs.as_slice()[previous].key.eq(&value.key) { return Err(session.Error{code: 1}) }
+            if self.inputs.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
             previous = previous + 1
         }
         input_index = input_index + 1
     }
-    if self.lists.len() > 256 { return Err(session.Error{code: 1}) }
+    if self.lists.len() > 256 { return Err(session.Error { code: 1 }) }
     var list_index: usize = 0
     for list in self.lists.as_slice() {
-        if list.key.is_empty() || list.items.len() > 256 { return Err(session.Error{code: 1}) }
+        if list.key.is_empty() || list.items.len() > 256 { return Err(session.Error { code: 1 }) }
         var previous: usize = 0
         for previous < list_index {
-            if self.lists.as_slice()[previous].key.eq(&list.key) { return Err(session.Error{code: 1}) }
+            if self.lists.as_slice()[previous].key.eq(&list.key) { return Err(session.Error { code: 1 }) }
             previous = previous + 1
         }
         var item_index: usize = 0
         for item in list.items.as_slice() {
-            if item.key.is_empty() || item.action < 1 || item.action > 1024 { return Err(session.Error{code: 1}) }
+            if item.key.is_empty() || item.action < 1 || item.action > 1024 { return Err(session.Error { code: 1 }) }
             var before: usize = 0
             for before < item_index {
-                if list.items.as_slice()[before].key.eq(&item.key) { return Err(session.Error{code: 1}) }
+                if list.items.as_slice()[before].key.eq(&item.key) { return Err(session.Error { code: 1 }) }
                 before = before + 1
             }
             item_index = item_index + 1
@@ -124,10 +147,10 @@ fn View.validate(&self) Result<void, session.Error> {
     }
     var index: usize = 0
     for value in self.texts.as_slice() {
-        if value.key.is_empty() { return Err(session.Error{code: 1}) }
+        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
         var previous: usize = 0
         for previous < index {
-            if self.texts.as_slice()[previous].key.eq(&value.key) { return Err(session.Error{code: 1}) }
+            if self.texts.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
             previous = previous + 1
         }
         index = index + 1
@@ -137,6 +160,7 @@ fn View.validate(&self) Result<void, session.Error> {
 
 fn View.apply(&self, ui &mut session.Session) Result<void, session.Error> {
     try self.validate()
+    try self.reconcile_regions(ui)
     try self.reconcile_lists(ui)
     for value in self.texts.as_slice() { try ui.set_text(value.key.clone(), value.text.clone()) }
     for value in self.inputs.as_slice() { try ui.set_input(value.key.clone(), value.text.clone()) }
@@ -147,6 +171,7 @@ fn View.apply(&self, ui &mut session.Session) Result<void, session.Error> {
 
 fn View.update(&self, previous &View, ui &mut session.Session) Result<void, session.Error> {
     try self.validate()
+    try self.reconcile_regions(ui)
     for list in self.lists.as_slice() {
         var equal = false
         for before in previous.lists.as_slice() {
@@ -238,5 +263,73 @@ fn List.apply(&self, ui &mut session.Session) Result<void, session.Error> {
 }
 fn View.reconcile_lists(&self, ui &mut session.Session) Result<void, session.Error> {
     for list in self.lists.as_slice() { try list.apply(ui) }
+    return Ok(())
+}
+
+fn unique_key(key &string, keys &mut Vec<string>) Result<void, session.Error> {
+    if key.is_empty() || keys.len() >= 256 { return Err(session.Error { code: 1 }) }
+    for previous in keys.as_slice() { if previous.eq(key) { return Err(session.Error { code: 1 }) } }
+    keys.push(key.clone())
+    return Ok(())
+}
+fn validate_action(action u32) Result<void, session.Error> {
+    if action < 1 || action > 1024 { return Err(session.Error { code: 1 }) }
+    return Ok(())
+}
+fn validate_nodes(children &[]Node, depth u32, keys &mut Vec<string>) Result<void, session.Error> {
+    for child in children {
+        match child {
+            Node.Text(value) => { try unique_key(&value.key, keys) }
+            Node.Heading(value) => { try unique_key(&value.key, keys) }
+            Node.Value(value) => { try unique_key(&value.key, keys) }
+            Node.Press(value) => { try unique_key(&value.key, keys)
+                try validate_action(value.action) }
+            Node.Primary(value) => { try unique_key(&value.key, keys)
+                try validate_action(value.action) }
+            Node.Input(value) => { try unique_key(&value.key, keys)
+                try validate_action(value.action) }
+            Node.Field(value) => { try unique_key(&value.key, keys)
+                try validate_action(value.action)
+                if value.label.is_empty() { return Err(session.Error { code: 1 }) } }
+            Node.Group(value) => {
+                if depth >= 12 || value.spacing > 64 { return Err(session.Error { code: 1 }) }
+                try unique_key(&value.key, keys)
+                try validate_nodes(value.children.as_slice(), depth + 1, keys)
+            }
+        }
+    }
+    return Ok(())
+}
+fn tree_nodes(ui &mut session.Session, parent &string, children &[]Node) Result<void, session.Error> {
+    for child in children {
+        match child {
+            Node.Text(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 0, value.text.clone(), 0, 0) }
+            Node.Heading(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 1, value.text.clone(), 0, 0) }
+            Node.Value(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 2, value.text.clone(), 0, 0) }
+            Node.Press(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 3, value.text.clone(), value.action, 0) }
+            Node.Primary(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 4, value.text.clone(), value.action, 0) }
+            Node.Input(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 5, value.text.clone(), value.action, 0) }
+            Node.Field(value) => {
+                try ui.tree_node(parent.clone(), value.key.clone(), 5, value.text.clone(), value.action, 0)
+                try ui.set_accessible(value.key.clone(), value.label.clone(), value.description.clone())
+            }
+            Node.Group(value) => {
+                var kind: u32 = 6
+                if value.horizontal { kind = 7 }
+                try ui.tree_node(parent.clone(), value.key.clone(), kind, "", 0, value.spacing)
+                try tree_nodes(ui, &value.key, value.children.as_slice())
+            }
+        }
+    }
+    return Ok(())
+}
+fn View.reconcile_regions(&self, ui &mut session.Session) Result<void, session.Error> {
+    for region in self.regions.as_slice() {
+        var keys: Vec<string> = Vec.new()
+        try validate_nodes(region.children.as_slice(), 0, &mut keys)
+        try ui.tree_begin(region.key.clone(), u32(keys.len()))
+        try tree_nodes(ui, &region.key, region.children.as_slice())
+        try ui.tree_end()
+    }
     return Ok(())
 }

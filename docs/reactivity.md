@@ -39,7 +39,7 @@ pendiente y el error vuelve al runner para cerrar la sesión; no hay rollback ni
 atomicidad entre varios setters. El clic nunca se confirma como exitoso en ese
 caso. El límite i64 conserva el error 9 sin abortar ni desbordar.
 
-Esta entrega introdujo ABI 5 con `Session.set_heading`; la ABI vigente es **11**
+Esta entrega introdujo ABI 5 con `Session.set_heading`; la ABI vigente es **12**
 tras incorporar componentes y páginas. El puente valida hilo,
 cierre, cola y UTF-8, y conserva la etiqueta original al actualizar su texto.
 Hay que recompilar biblioteca y aplicación juntas. El número de versión del
@@ -81,4 +81,5 @@ del sistema, sin aplicar el parche experimental de Fontconfig. La investigación
 de sanitizadores está [aplazada y registrada](roadmap.md).
 
 Las [listas dinámicas](dynamic-lists.md) añaden reconciliación de filas con claves
-a las vistas de componentes; los árboles arbitrarios siguen pendientes.
+a las vistas de componentes; las [regiones mixtas](dynamic-regions.md) permiten
+subárboles y ramas condicionales con claves estables.

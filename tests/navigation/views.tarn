@@ -11,7 +11,17 @@ extern "C" fn test_page_calls() u32
 fn view() components.View {
     var texts: Vec<components.Text> = Vec.new()
     texts.push(components.Text{key: "value", text: "0"})
-    return components.View{route: "home", texts: texts, enabled: Vec.new(), inputs: Vec.new(), lists: Vec.new()}
+    return components.View{route: "home", texts: texts, enabled: Vec.new(), inputs: Vec.new(), lists: Vec.new(), regions: Vec.new()}
+}
+
+fn initial_view(mode &string) components.View {
+    var result = view()
+    if mode.eq(&"tree-kind") {
+        var children: Vec<components.Node> = Vec.new()
+        children.push(components.label("branch", "Initial label"))
+        result.regions.push(components.Region{key: "fixture-list", children: children})
+    }
+    return result
 }
 
 fn main() {
@@ -19,15 +29,15 @@ fn main() {
     var status: u8 = 0
     unsafe {
         match session.run("View fixture", "Views", fn(ui &mut session.Session) Result<void, session.Error> {
-            var children: Vec<components.Node> = Vec.new()
-            children.push(components.label("value", "0"))
-            children.push(components.button("trigger", "Action", 1))
-            if mode.eq(&"input") || mode.eq(&"form") || mode.eq(&"disabled-input") || mode.eq(&"fill-error") { children.push(components.input("input", "", 4)) }
-            if mode.eq(&"form") { children.push(components.primary_button("save", "Guardar", 5))
-                children.push(components.button("reset", "Restablecer", 6)) }
+            var mounted_children: Vec<components.Node> = Vec.new()
+            mounted_children.push(components.label("value", "0"))
+            mounted_children.push(components.button("trigger", "Action", 1))
+            if mode.eq(&"input") || mode.eq(&"form") || mode.eq(&"disabled-input") || mode.eq(&"fill-error") { mounted_children.push(components.input("input", "", 4)) }
+            if mode.eq(&"form") { mounted_children.push(components.primary_button("save", "Guardar", 5))
+                mounted_children.push(components.button("reset", "Restablecer", 6)) }
             var empty: Vec<components.Node> = Vec.new()
-            children.push(components.column("fixture-list", 0, empty))
-            page := components.Page{key: "home", children: children}
+            mounted_children.push(components.column("fixture-list", 0, empty))
+            page := components.Page{key: "home", children: mounted_children}
             try page.mount(ui)
             if mode.eq(&"disabled-input") { try ui.set_enabled("input", false) }
             if mode.eq(&"form") {
@@ -61,7 +71,7 @@ fn main() {
                     return Ok(next)
                 })
             }
-            return components.drive(ui, view(), fn(action u32) Result<components.View, session.Error> {
+            return components.drive(ui, initial_view(&mode), fn(action u32) Result<components.View, session.Error> {
                 if mode.eq(&"error") || mode.eq(&"fill-error") { return Err(session.Error{code: 99}) }
                 var next = view()
                 if mode.eq(&"duplicate") { next.texts.push(components.Text{key: "value", text: "wrong"}) }
@@ -79,6 +89,34 @@ fn main() {
                     var items: Vec<components.Button> = Vec.new()
                     items.push(components.Button{key: "trigger", text: "Collision", action: 1})
                     next.lists.push(components.List{key: "fixture-list", items: items})
+                }
+                if mode.eq(&"tree-duplicate") {
+                    var children: Vec<components.Node> = Vec.new()
+                    children.push(components.label("branch", "A"))
+                    children.push(components.button("branch", "B", 2))
+                    next.regions.push(components.Region{key: "fixture-list", children: children})
+                }
+                if mode.eq(&"tree-collision") {
+                    var children: Vec<components.Node> = Vec.new()
+                    children.push(components.label("trigger", "Collision"))
+                    next.regions.push(components.Region{key: "fixture-list", children: children})
+                }
+                if mode.eq(&"tree-kind") {
+                    var children: Vec<components.Node> = Vec.new()
+                    children.push(components.button("branch", "Changed kind", 2))
+                    next.regions.push(components.Region{key: "fixture-list", children: children})
+                }
+                if mode.eq(&"tree-depth") {
+                    var children: Vec<components.Node> = Vec.new()
+                    children.push(components.label("leaf", "Too deep"))
+                    var depth: u64 = 0
+                    for depth < 13 {
+                        var parent: Vec<components.Node> = Vec.new()
+                        parent.push(components.column("depth-" + &string.from_u64(depth), 0, children))
+                        children = parent
+                        depth = depth + 1
+                    }
+                    next.regions.push(components.Region{key: "fixture-list", children: children})
                 }
                 if mode.eq(&"route") { next.route = "missing" }
                 return Ok(next)

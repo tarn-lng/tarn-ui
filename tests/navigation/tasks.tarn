@@ -30,5 +30,15 @@ fn main() {
         model.reduce(9, &"") }
     model.reduce(9, &"")
     check(model.count() == 32 && !model.can_add())
+    model.reduce(14, &"")
+    opened := model.region()
+    check(opened.children.len() == 2)
+    model.reduce(15, &"Nota persistente")
+    model.reduce(17, &"")
+    closed := model.region()
+    check(closed.children.len() == 1)
+    model.reduce(14, &"")
+    reopened := model.region()
+    check(reopened.children.len() == 2)
     print("PASS stable IDs, reorder, edit, removal, stale action and bounded model")
 }

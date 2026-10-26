@@ -2,7 +2,7 @@
 #define TARN_UI_GTK_BRIDGE_H
 #include <stdint.h>
 
-/* ABI 11: pointers are opaque; input strings are copied during each call.
+/* ABI 12: pointers are opaque; input strings are copied during each call.
  * All operations require the Linux process main thread. release consumes a
  * valid session on that thread, including one whose window is already closed.
  * Status: 0 success; 1 invalid input, 2 wrong thread, 3 session active,
@@ -49,4 +49,9 @@ int32_t tarn_ui_gtk_set_input(void *session, const char *key, const char *text);
 int32_t tarn_ui_gtk_list_begin(void *session, const char *parent, uint32_t count);
 int32_t tarn_ui_gtk_list_item(void *session, const char *key, const char *text, uint32_t action);
 int32_t tarn_ui_gtk_list_end(void *session);
+/* Mixed region nodes: body=0, heading=1, value=2, button=3, primary=4,
+ * input=5, column=6, row=7. Preorder, fixed kind/parent/action per stable key. */
+int32_t tarn_ui_gtk_tree_begin(void *session, const char *key, uint32_t count);
+int32_t tarn_ui_gtk_tree_node(void *session, const char *parent, const char *key, uint32_t kind, const char *text, uint32_t action, uint32_t spacing);
+int32_t tarn_ui_gtk_tree_end(void *session);
 #endif

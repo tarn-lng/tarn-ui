@@ -44,6 +44,49 @@ class Navigation(unittest.TestCase):
         self.assertFalse(session.forced_cleanup)
         self.assertEqual(session.stderr, b"")
 
+    def test_conditional_mixed_subtree_preserves_model_and_removes_controls(self):
+        with self.start(allow=("inspect", "click", "fill", "close", "screenshot"), allow_capture=True) as session:
+            self.click(session, "open-tasks")
+            _, view = self.inspect(session)
+            self.assertEqual(view["options-state"]["text"], "Opciones cerradas")
+            self.assertNotIn("options-content", view)
+            self.click(session, "show-options")
+            _, view = self.inspect(session)
+            self.assertEqual(view["options-title"]["type"], "heading")
+            self.assertEqual(view["options-note"]["accessibility_label"], "Nota de la lista")
+            self.assertEqual(view["options-note"]["parent_id"], "options-content")
+            self.assertEqual(view["options-clear"]["parent_id"], "options-actions")
+            self.fill(session, "Una nota con acentos: café", "options-note")
+            _, view = self.inspect(session)
+            self.assertEqual(view["options-preview"]["text"], "Nota: Una nota con acentos: café")
+            self.assertTrue(any(node["focused"] for node in walk(view["options-note"])))
+            self.click(session, "tasks-back")
+            self.click(session, "open-tasks")
+            _, view = self.inspect(session)
+            self.assertEqual(view["options-note"]["text"], "Una nota con acentos: café")
+            result = session.request("ui.screenshot", {"window_id": "main"})["result"]
+            (ROOT / ".build/navigation-tests/options.png").write_bytes(base64.b64decode(result["data_base64"]))
+            self.click(session, "options-close")
+            _, view = self.inspect(session)
+            self.assertEqual(view["options-state"]["text"], "Opciones cerradas")
+            self.assertNotIn("options-content", view)
+            self.assertNotIn("options-note", view)
+            self.assertNotIn("options-actions", view)
+            self.assertEqual(self.fill(session, "No existe", "options-note")["error"]["code"], "NOT_FOUND")
+            self.assertEqual(self.click(session, "options-clear")["error"]["code"], "NOT_FOUND")
+            for _ in range(5):
+                self.click(session, "show-options")
+                _, view = self.inspect(session)
+                self.assertEqual(view["options-note"]["text"], "Una nota con acentos: café")
+                self.click(session, "options-close")
+            self.click(session, "show-options")
+            self.click(session, "options-clear")
+            _, view = self.inspect(session)
+            self.assertEqual(view["options-note"]["text"], "")
+            self.assertEqual(view["options-preview"]["text"], "Nota: ")
+            self.close(session)
+        self.clean(session)
+
     def test_dynamic_list_add_edit_reorder_remove_and_navigation(self):
         with self.start(allow=("inspect", "click", "fill", "close", "screenshot"), allow_capture=True) as session:
             self.click(session, "open-tasks")
@@ -402,7 +445,7 @@ class Navigation(unittest.TestCase):
         self.assertEqual(values, {"text_calls": "1", "page_calls": "1"})
 
     def test_view_errors_never_acknowledge_success_and_release_the_tree(self):
-        for mode, code in (("duplicate", 1), ("duplicate-enabled", 1), ("duplicate-list", 1), ("list-collision", 1), ("route", 1), ("error", 99)):
+        for mode, code in (("duplicate", 1), ("duplicate-enabled", 1), ("duplicate-list", 1), ("list-collision", 1), ("tree-duplicate", 1), ("tree-collision", 1), ("tree-kind", 1), ("tree-depth", 1), ("route", 1), ("error", 99)):
             with self.subTest(mode=mode):
                 with self.start(fixture_mode=mode) as session:
                     reply = self.click(session, "trigger")

@@ -24,17 +24,24 @@ aplazando la investigación de memoria para evitar que bloquee el producto.
   formulario real de extremo a extremo sin hooks de edición.
 - Implementado: primera reconciliación de listas con claves estables, edición,
   reordenamiento y eliminación de filas nativas, con pruebas de identidad y limpieza.
-- Siguiente dentro de la fase 5: ampliar la reconciliación a bloques condicionales
-  y subárboles de controles mixtos; las listas actuales contienen botones de fila.
-- Pendiente de cierre de fase 5: revisar sus criterios de identidad, disposición,
-  accesibilidad y ciclo de vida sobre los componentes dinámicos.
+- Implementado: regiones mixtas con grupos anidados, ramas condicionales y campos
+  accesibles; conservación de identidad, desmontaje recursivo y recuperación del
+  estado desde Tarn, con pruebas de límites y limpieza.
+- Revisión de cierre realizada: [matriz y mediciones](phase5-review.md). La fase
+  sigue abierta: 32 filas producen una ventana de 480×1589 y una etiqueta de 256
+  caracteres una de 3249×472 en un monitor de 1366×768, sin área de desplazamiento.
+- Siguiente dentro de la fase 5: resolver desplazamiento y tamaño vertical, después
+  etiquetas largas; completar pruebas de teclado y propiedades accesibles de
+  campos dinámicos, y contrastar fidelidad de capturas y legibilidad de temas
+  antes de repetir la revisión de cierre.
 - La plantilla de proyecto es una propuesta para la preview, separada del siguiente
   bloque técnico del plan original. La fase 6 continúa siendo preparación móvil.
 
 Las entregas están documentadas en [reactivity.md](reactivity.md) y
 [componentes y navegación](components-navigation.md). La composición actual
 usa páginas de topología fija con [regiones de listas dinámicas](dynamic-lists.md);
-la reconciliación general de árboles queda pendiente.
+las [regiones mixtas](dynamic-regions.md) añaden subárboles condicionales. Los
+cambios de tipo o padre por clave y la virtualización siguen fuera de alcance.
 
 ## Recordatorio aplazado: Mesa/EGL
 

@@ -2,6 +2,7 @@
 #include "../gtk/test_hooks.h"
 
 static gpointer wrong_thread(gpointer session) {
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 0), ==, 2);
     g_assert_cmpint(tarn_ui_gtk_list_begin(session, "rows", 0), ==, 2);
     g_assert_cmpint(tarn_ui_gtk_set_enabled(session, "add", 0), ==, 2);
     g_assert_cmpint(tarn_ui_gtk_set_input(session, "name", "wrong"), ==, 2);
@@ -240,6 +241,120 @@ int main(void) {
     g_assert_cmpint(tarn_ui_gtk_release(session), ==, 0);
     g_assert_true(test_clean());
     g_print("full dynamic replacement and capacity bounds cleaned\n");
+
+    /* Mixed conditional subtree: retain shared nodes, dispose every descendant. */
+    g_assert_cmpint(tarn_ui_gtk_create("Mixed", "Mixed", &session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_page(session, "home"), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_page(session, "details"), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_box(session, "home", "region", 0, 6), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_show_page(session, "home"), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 6), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "summary", 0, "Shared", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "group", 6, "", 0, 8), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "title", 1, "Heading", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "field", 5, "Initial", 31, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "actions", 7, "", 0, 4), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "actions", "apply", 4, "Apply", 32, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+    root = gtk_window_get_child(test_window(session));
+    stack = gtk_widget_get_last_child(root);
+    home = gtk_stack_get_child_by_name(GTK_STACK(stack), "home");
+    GtkWidget *region = gtk_widget_get_first_child(home);
+    GtkWidget *summary = gtk_widget_get_first_child(region);
+    GtkWidget *group = gtk_widget_get_last_child(region);
+    title = gtk_widget_get_first_child(group);
+    entry = gtk_widget_get_next_sibling(title);
+    GtkWidget *actions = gtk_widget_get_last_child(group);
+    button = gtk_widget_get_first_child(actions);
+    gtk_test_accessible_assert_role(title, GTK_ACCESSIBLE_ROLE_HEADING);
+    gtk_test_accessible_assert_property(title, GTK_ACCESSIBLE_PROPERTY_LEVEL, 2);
+    g_assert_true(gtk_widget_has_css_class(button, "suggested-action"));
+    g_object_ref(entry);
+    g_object_ref(button);
+    for (int i = 0; i < 20; ++i) {
+        g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 6), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "summary", 0, "Updated", 0, 0), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "group", 6, "", 0, 12), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "title", 1, "Heading", 0, 0), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "actions", 7, "", 0, 8), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_node(session, "actions", "apply", 4, "Apply", 32, 0), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "field", 5, "Model update", 31, 0), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+        g_assert_true(gtk_widget_get_first_child(region) == summary);
+        g_assert_true(gtk_widget_get_last_child(group) == entry);
+        g_assert_true(gtk_widget_get_first_child(actions) == button);
+    }
+    g_assert_cmpint(gtk_box_get_spacing(GTK_BOX(group)), ==, 12);
+    g_assert_cmpint(tarn_ui_gtk_focus(session, "field"), ==, 0); /* Entry delegates focus to GtkText. */
+    g_assert_true(gtk_widget_grab_focus(entry));
+    g_assert_cmpint(tarn_ui_gtk_show_page(session, "details"), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 1), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "summary", 0, "Closed", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+    g_assert_true(gtk_widget_get_first_child(region) == summary);
+    g_assert_true(gtk_widget_get_last_child(region) == summary);
+    g_assert_cmpint(tarn_ui_gtk_set_input(session, "field", "Gone"), ==, 1);
+    gtk_editable_set_text(GTK_EDITABLE(entry), "Detached");
+    g_signal_emit_by_name(button, "clicked");
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 2), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "summary", 0, "Reopened", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "field", 5, "Restored", 31, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+    g_assert_true(gtk_widget_get_last_child(region) != entry);
+    g_assert_cmpint(tarn_ui_gtk_show_page(session, "home"), ==, 0);
+    /* Only a deliberately queued retained entry event may be delivered. */
+    GtkWidget *replacement = gtk_widget_get_last_child(region);
+    int edit_position = 8;
+    gtk_editable_insert_text(GTK_EDITABLE(replacement), "!", -1, &edit_position);
+    event = tarn_ui_gtk_next(session);
+    if (event == 1) event = tarn_ui_gtk_next(session);
+    g_assert_cmpint(event, ==, 1031);
+    g_assert_cmpstr(tarn_ui_gtk_event_text(session), ==, "Restored!");
+    g_object_unref(entry);
+    g_object_unref(button);
+    g_assert_cmpint(tarn_ui_gtk_release(session), ==, 0);
+    g_assert_true(test_clean());
+    g_print("mixed subtree identity, roles, model writes, removal and retained signal disconnection checked\n");
+
+    g_assert_cmpint(tarn_ui_gtk_create("Tree capacity", "Mixed", &session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_page(session, "home"), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_box(session, "home", "region", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 255), ==, 1);
+    for (unsigned generation = 0; generation < 2; ++generation) {
+        char group_key[32];
+        snprintf(group_key, sizeof(group_key), "group-%u", generation);
+        g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 254), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", group_key, 6, "", 0, 0), ==, 0);
+        for (unsigned i = 0; i < 253; ++i) {
+            char key[32];
+            snprintf(key, sizeof(key), "tree-%u-leaf-%u", generation, i);
+            g_assert_cmpint(tarn_ui_gtk_tree_node(session, group_key, key, 0, "Label", 0, 0), ==, 0);
+        }
+        g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+        g_assert_cmpint(tarn_ui_gtk_tree_begin(session, group_key, 0), ==, 1);
+        g_assert_cmpint(tarn_ui_gtk_list_begin(session, group_key, 0), ==, 1);
+    }
+    g_assert_cmpint(tarn_ui_gtk_set_text(session, "tree-0-leaf-0", "Gone"), ==, 1);
+    g_assert_cmpint(tarn_ui_gtk_list_begin(session, "region", 0), ==, 1);
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_release(session), ==, 0);
+    g_assert_true(test_clean());
+    g_print("whole-subtree replacement at capacity and exclusive ownership checked\n");
+
+    g_assert_cmpint(tarn_ui_gtk_create("Partial tree", "Mixed", &session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_page(session, "home"), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_box(session, "home", "region", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 2), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "group", 6, "", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "field", 5, "Value", 1, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 2), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "group", 6, "", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "field", 5, "Move parent", 1, 0), ==, 1);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 1);
+    g_assert_cmpint(tarn_ui_gtk_finish(session, 1), ==, 0);
+    g_assert_true(test_clean());
 
     /* Partial mount must also be released on ordinary error return. */
     g_assert_cmpint(tarn_ui_gtk_create("Partial", "Partial", &session), ==, 0);

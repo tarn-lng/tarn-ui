@@ -1,6 +1,6 @@
 # Contador nativo: fase 2
 
-> Estado actual: el ejemplo usa [el enlace reactivo](reactivity.md), con ABI 11
+> Estado actual: el ejemplo usa [el enlace reactivo](reactivity.md), con ABI 12
 > y encabezado par/impar derivado. El flujo imperativo y las versiones de ABI
 > descritos abajo son antecedentes de las fases 2–3. `counter.increment` se
 > conserva para las fixtures y sus pruebas de compatibilidad.

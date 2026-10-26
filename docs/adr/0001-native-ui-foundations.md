@@ -3,7 +3,7 @@
 Status: **architectural direction approved**, with the constraints below.
 Phase 5 component update (2026-10-22): keyed labels/buttons and retained native
 pages now support owned property views and a bounded Tarn route history.
-The native ABI is 11. A per-session registry borrows widgets from the native tree;
+The native ABI is 12. A per-session registry borrows widgets from the native tree;
 it is released with the scoped session. There is no global component registry or
 Tarn callback crossing the FFI boundary. See
 [components and navigation](../components-navigation.md).
@@ -12,6 +12,9 @@ Mesa/EGL investigation. The first implementation uses owned state, numeric
 reducers and owned counter view descriptions, preserving native widget identity
 and scoped cleanup. No callbacks receive native authority. See
 [reactivity](../reactivity.md) and [the current roadmap](../roadmap.md).
+Phase 5 closure review (2026-10-22): functional gates have evidence, but layout
+remains open for long lists and labels; keyboard/accessibility coverage also needs
+completion. See [the review matrix](../phase5-review.md). Mesa/EGL remains deferred.
 Earlier phase-only authorization paragraphs below are historical.
 Phase 3 update (2026-10-21): the user authorized inspect/click/close development
 control after accepting Phase 2. The optional build uses an inherited private
