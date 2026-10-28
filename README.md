@@ -10,8 +10,8 @@ con campo, encabezado y botones conservando su estado en Tarn.
 El formulario permite guardar y restablecer un nombre; el agente puede probarlo
 mediante [`ui.fill` con permiso explícito](docs/devtools.md#uifill).
 [Próximos pasos y recordatorio de memoria aplazado](docs/roadmap.md).
-La [revisión de fase 5](docs/phase5-review.md) mantiene abiertos los casos de
-listas largas y etiquetas extensas que exceden la pantalla.
+Las páginas se desplazan verticalmente y el texto largo se ajusta al ancho; la
+[revisión de fase 5](docs/phase5-review.md) mide disposición, teclado, temas y contraste.
 
 Contador nativo GTK4 con estado y lógica de aplicación en Tarn. El puente C
 encola eventos y presenta los valores que recibe; Tarn procesa los clics.

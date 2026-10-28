@@ -69,7 +69,7 @@ Límites actuales:
 
 - Hasta 32 páginas y 256 claves entre páginas y componentes por sesión.
 - Claves ASCII alfanuméricas, guion o guion bajo, de 1 a 128 bytes. Se reservan
-  `main`, `heading`, `content` y `pages`. No se aceptan duplicados.
+  `main`, `heading`, `content`, `pages` y `scroll`. No se aceptan duplicados.
 - Acciones de botón de 1 a 1024, con una cola compartida de 64 eventos.
 - Hasta 32 rutas permitidas y profundidad de historial 64; exceder esta última
   devuelve el error 10. El resto de entradas inválidas devuelve 1.

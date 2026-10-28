@@ -1,6 +1,6 @@
 # Estado y próximos pasos
 
-Actualizado el 22 de octubre de 2026.
+Actualizado el 28 de octubre de 2026.
 
 ## Fase 5: reactividad y componentes nativos
 
@@ -27,13 +27,14 @@ aplazando la investigación de memoria para evitar que bloquee el producto.
 - Implementado: regiones mixtas con grupos anidados, ramas condicionales y campos
   accesibles; conservación de identidad, desmontaje recursivo y recuperación del
   estado desde Tarn, con pruebas de límites y limpieza.
-- Revisión de cierre realizada: [matriz y mediciones](phase5-review.md). La fase
-  sigue abierta: 32 filas producen una ventana de 480×1589 y una etiqueta de 256
-  caracteres una de 3249×472 en un monitor de 1366×768, sin área de desplazamiento.
-- Siguiente dentro de la fase 5: resolver desplazamiento y tamaño vertical, después
-  etiquetas largas; completar pruebas de teclado y propiedades accesibles de
-  campos dinámicos, y contrastar fidelidad de capturas y legibilidad de temas
-  antes de repetir la revisión de cierre.
+- Implementado: páginas con desplazamiento vertical nativo y altura acotada por
+  el monitor, ajuste de texto en cualquier carácter, captura con viewport
+  explícito y auditoría aislada del CSS de usuario.
+- Implementado: pruebas nativas de Tab/Shift+Tab, activación por teclado,
+  retiro de la rama enfocada y propiedades accesibles reales de campos dinámicos.
+- Revisión de cierre repetida el 28 de octubre: [matriz y mediciones](phase5-review.md).
+  Los criterios se cumplen en el alcance medido; queda recomendada una
+  comprobación manual con lector de pantalla antes de presentar la preview.
 - La plantilla de proyecto es una propuesta para la preview, separada del siguiente
   bloque técnico del plan original. La fase 6 continúa siendo preparación móvil.
 

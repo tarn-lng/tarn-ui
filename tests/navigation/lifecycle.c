@@ -1,6 +1,36 @@
 #include "../../backends/linux/gtk/bridge.h"
 #include "../gtk/test_hooks.h"
 
+/* Pages live in a GtkStack inside the vertical GtkScrolledWindow's viewport. */
+static GtkWidget *stack_of(GtkWidget *root) {
+    GtkWidget *scroll = gtk_widget_get_last_child(root);
+    g_assert_true(GTK_IS_SCROLLED_WINDOW(scroll));
+    GtkWidget *viewport = gtk_scrolled_window_get_child(GTK_SCROLLED_WINDOW(scroll));
+    return gtk_viewport_get_child(GTK_VIEWPORT(viewport));
+}
+
+/* Run the main loop until GTK has allocated and painted pending layout. */
+static void settle(void) {
+    gint64 deadline = g_get_monotonic_time() + 300000;
+    while (g_get_monotonic_time() < deadline) {
+        while (g_main_context_pending(NULL)) g_main_context_iteration(NULL, FALSE);
+        g_usleep(5000);
+    }
+}
+
+/* True when the widget is entirely inside the scrolled viewport. */
+static gboolean in_viewport(GtkWidget *widget, GtkWidget *scroll) {
+    graphene_rect_t rect;
+    if (!gtk_widget_compute_bounds(widget, scroll, &rect)) return FALSE;
+    return rect.origin.y >= 0 && rect.origin.y + rect.size.height <= gtk_widget_get_height(scroll) &&
+        rect.origin.x >= 0 && rect.origin.x + rect.size.width <= gtk_widget_get_width(scroll);
+}
+
+static gboolean focus_within(GtkWindow *window, GtkWidget *widget) {
+    GtkWidget *focus = gtk_window_get_focus(window);
+    return focus && (focus == widget || gtk_widget_is_ancestor(focus, widget));
+}
+
 static gpointer wrong_thread(gpointer session) {
     g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 0), ==, 2);
     g_assert_cmpint(tarn_ui_gtk_list_begin(session, "rows", 0), ==, 2);
@@ -30,7 +60,7 @@ int main(void) {
     g_assert_cmpint(tarn_ui_gtk_add_button(session, "home", "bad", "Bad", 1025), ==, 1);
     g_assert_cmpint(tarn_ui_gtk_add_label(session, "home", "bad", "\xff"), ==, 1);
     GtkWidget *root = gtk_window_get_child(test_window(session));
-    GtkWidget *stack = gtk_widget_get_last_child(root);
+    GtkWidget *stack = stack_of(root);
     GtkWidget *home = gtk_stack_get_child_by_name(GTK_STACK(stack), "home");
     GtkWidget *details = gtk_stack_get_child_by_name(GTK_STACK(stack), "details");
     GtkWidget *label = gtk_widget_get_first_child(home);
@@ -94,7 +124,7 @@ int main(void) {
     g_assert_cmpint(tarn_ui_gtk_set_primary(session, "title", 1), ==, 1);
     g_assert_cmpint(tarn_ui_gtk_set_accessible(session, "action", "Accessible action", "Description"), ==, 0);
     root = gtk_window_get_child(test_window(session));
-    stack = gtk_widget_get_last_child(root);
+    stack = stack_of(root);
     home = gtk_stack_get_child_by_name(GTK_STACK(stack), "home");
     GtkWidget *row = gtk_widget_get_first_child(home);
     GtkWidget *title = gtk_widget_get_first_child(row);
@@ -120,7 +150,7 @@ int main(void) {
     g_assert_cmpint(tarn_ui_gtk_add_entry(session, "form", "name", "", 4), ==, 0);
     g_assert_cmpint(tarn_ui_gtk_add_entry(session, "form", "bad", "", 0), ==, 1);
     root = gtk_window_get_child(test_window(session));
-    stack = gtk_widget_get_last_child(root);
+    stack = stack_of(root);
     GtkWidget *form = gtk_stack_get_child_by_name(GTK_STACK(stack), "form");
     GtkWidget *entry = gtk_widget_get_first_child(form);
     g_assert_cmpint(gtk_entry_get_max_length(GTK_ENTRY(entry)), ==, 256);
@@ -163,7 +193,7 @@ int main(void) {
     g_assert_cmpint(tarn_ui_gtk_list_item(session, "beta", "Beta", 22), ==, 0);
     g_assert_cmpint(tarn_ui_gtk_list_end(session), ==, 0);
     root = gtk_window_get_child(test_window(session));
-    stack = gtk_widget_get_last_child(root);
+    stack = stack_of(root);
     home = gtk_stack_get_child_by_name(GTK_STACK(stack), "home");
     GtkWidget *rows = gtk_widget_get_first_child(home);
     GtkWidget *alpha = gtk_widget_get_first_child(rows);
@@ -257,7 +287,7 @@ int main(void) {
     g_assert_cmpint(tarn_ui_gtk_tree_node(session, "actions", "apply", 4, "Apply", 32, 0), ==, 0);
     g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
     root = gtk_window_get_child(test_window(session));
-    stack = gtk_widget_get_last_child(root);
+    stack = stack_of(root);
     home = gtk_stack_get_child_by_name(GTK_STACK(stack), "home");
     GtkWidget *region = gtk_widget_get_first_child(home);
     GtkWidget *summary = gtk_widget_get_first_child(region);
@@ -385,5 +415,110 @@ int main(void) {
     g_assert_cmpint(tarn_ui_gtk_release(session), ==, 0);
     g_assert_true(test_clean());
     g_print("page/widget bounds and mixed action ordering checked\n");
+    /* Long pages scroll; keyboard traversal reaches and reveals every control. */
+    g_object_set(gtk_settings_get_default(), "gtk-enable-animations", FALSE, NULL);
+    g_assert_cmpint(tarn_ui_gtk_create("Keyboard", "Keyboard", &session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_page(session, "home"), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_box(session, "home", "rows", 0, 6), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_box(session, "home", "region", 0, 6), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_add_button(session, "home", "back", "Back", 99), ==, 0);
+    char long_text[257];
+    memset(long_text, 'W', 256);
+    long_text[256] = 0;
+    g_assert_cmpint(tarn_ui_gtk_list_begin(session, "rows", 32), ==, 0);
+    for (unsigned i = 0; i < 32; ++i) {
+        char key[32];
+        snprintf(key, sizeof(key), "row-%u", i);
+        g_assert_cmpint(tarn_ui_gtk_list_item(session, key, i == 0 ? long_text : "Row", 100 + i), ==, 0);
+    }
+    g_assert_cmpint(tarn_ui_gtk_list_end(session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 4), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "group", 6, "", 0, 6), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "field-title", 1, "Options", 0, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "field", 5, "Note", 200, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "group", "apply", 4, "Apply", 201, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_set_accessible(session, "field", "Note field", "Kept while open."), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_set_accessible(session, "apply", "Apply note", "Saves the note."), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_show_page(session, "home"), ==, 0);
+    settle();
+    GtkWindow *window = test_window(session);
+    root = gtk_window_get_child(window);
+    GtkWidget *scroll = gtk_widget_get_last_child(root);
+    stack = stack_of(root);
+    home = gtk_stack_get_child_by_name(GTK_STACK(stack), "home");
+    rows = gtk_widget_get_first_child(home);
+    region = gtk_widget_get_next_sibling(rows);
+    GtkWidget *back_button = gtk_widget_get_last_child(home);
+    group = gtk_widget_get_first_child(region);
+    entry = gtk_widget_get_next_sibling(gtk_widget_get_first_child(group));
+    GtkWidget *apply = gtk_widget_get_last_child(group);
+    /* Bounded window: 32 rows and a 256-character label neither widen nor lengthen it. */
+    g_assert_cmpint(gtk_widget_get_width(GTK_WIDGET(window)), <=, 480);
+    g_assert_cmpint(gtk_widget_get_height(GTK_WIDGET(window)), <=, 720);
+    g_assert_cmpint(gtk_widget_get_width(gtk_widget_get_first_child(rows)), <=, 480);
+    GtkAdjustment *vadjustment = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scroll));
+    g_assert_cmpfloat(gtk_adjustment_get_upper(vadjustment), >, gtk_adjustment_get_page_size(vadjustment));
+    g_assert_false(in_viewport(back_button, scroll));
+    /* Real accessible properties and roles of dynamic controls. */
+    gtk_test_accessible_assert_role(entry, GTK_ACCESSIBLE_ROLE_TEXT_BOX);
+    gtk_test_accessible_assert_property(entry, GTK_ACCESSIBLE_PROPERTY_LABEL, "Note field");
+    gtk_test_accessible_assert_property(entry, GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, "Kept while open.");
+    gtk_test_accessible_assert_role(apply, GTK_ACCESSIBLE_ROLE_BUTTON);
+    gtk_test_accessible_assert_property(apply, GTK_ACCESSIBLE_PROPERTY_LABEL, "Apply note");
+    gtk_test_accessible_assert_role(gtk_widget_get_first_child(group), GTK_ACCESSIBLE_ROLE_HEADING);
+    /* Tab: rows in model order, then field, apply and back; each one revealed. */
+    g_assert_cmpint(tarn_ui_gtk_focus(session, "row-0"), ==, 0);
+    settle();
+    row = gtk_widget_get_first_child(rows);
+    for (unsigned i = 0; i < 32; ++i, row = gtk_widget_get_next_sibling(row)) {
+        if (i) {
+            g_assert_true(gtk_widget_child_focus(GTK_WIDGET(window), GTK_DIR_TAB_FORWARD));
+            settle();
+        }
+        g_assert_true(gtk_window_get_focus(window) == row);
+        g_assert_true(in_viewport(row, scroll));
+    }
+    GtkWidget *forward[] = {entry, apply, back_button};
+    for (unsigned i = 0; i < 3; ++i) {
+        g_assert_true(gtk_widget_child_focus(GTK_WIDGET(window), GTK_DIR_TAB_FORWARD));
+        settle();
+        g_assert_true(focus_within(window, forward[i]));
+        g_assert_true(in_viewport(forward[i], scroll));
+    }
+    g_assert_cmpfloat(gtk_adjustment_get_value(vadjustment), >, 0);
+    /* Shift+Tab walks the same order backwards. */
+    GtkWidget *backward[] = {apply, entry, gtk_widget_get_last_child(rows)};
+    for (unsigned i = 0; i < 3; ++i) {
+        g_assert_true(gtk_widget_child_focus(GTK_WIDGET(window), GTK_DIR_TAB_BACKWARD));
+        settle();
+        g_assert_true(focus_within(window, backward[i]));
+        g_assert_true(in_viewport(backward[i], scroll));
+    }
+    /* Keyboard activation uses the native activate binding, not a direct emit. */
+    g_assert_true(gtk_widget_activate(gtk_window_get_focus(window)));
+    event = tarn_ui_gtk_next(session);
+    if (event == 1) event = tarn_ui_gtk_next(session);
+    g_assert_cmpint(event, ==, 1131);
+    g_assert_cmpint(tarn_ui_gtk_complete_event(session, 0), ==, 0);
+    /* Removing the focused branch moves focus to a visible control on the page. */
+    g_assert_cmpint(tarn_ui_gtk_focus(session, "field"), ==, 0);
+    settle();
+    g_assert_true(focus_within(window, entry));
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+    settle();
+    g_assert_null(gtk_widget_get_first_child(region));
+    g_assert_true(gtk_window_get_focus(window) == gtk_widget_get_first_child(rows));
+    g_assert_true(in_viewport(gtk_widget_get_first_child(rows), scroll));
+    /* A remounted field is a new widget; its properties must be applied again. */
+    g_assert_cmpint(tarn_ui_gtk_tree_begin(session, "region", 1), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_node(session, "region", "field", 5, "Note", 200, 0), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_tree_end(session), ==, 0);
+    g_assert_cmpint(tarn_ui_gtk_set_accessible(session, "field", "Note field", "Restored."), ==, 0);
+    gtk_test_accessible_assert_property(gtk_widget_get_first_child(region), GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, "Restored.");
+    g_assert_cmpint(tarn_ui_gtk_release(session), ==, 0);
+    g_assert_true(test_clean());
+    g_print("bounded scrolling, wrapped long labels, Tab/Shift+Tab order, keyboard activation, focused-branch removal and dynamic accessibility checked\n");
     return 0;
 }

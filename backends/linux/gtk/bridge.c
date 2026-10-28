@@ -39,6 +39,32 @@ typedef struct {
 
 static Session *active;
 static gboolean main_thread(void) { return syscall(SYS_gettid) == getpid(); }
+
+/* Long valid text must wrap at any character instead of widening the window. */
+static void wrap_label(GtkWidget *label) {
+    gtk_label_set_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(label), PANGO_WRAP_WORD_CHAR);
+}
+static GtkWidget *wrapping_button(const char *text) {
+    GtkWidget *button = gtk_button_new_with_label(text);
+    /* gtk_button_set_label reuses this label child, so the policy persists. */
+    wrap_label(gtk_button_get_child(GTK_BUTTON(button)));
+    return button;
+}
+/* A bounded default height on the first monitor; pages scroll vertically
+ * instead of growing the window past it. */
+static int window_height_limit(void) {
+    GListModel *monitors = gdk_display_get_monitors(gdk_display_get_default());
+    int height = 768;
+    GdkMonitor *monitor = g_list_model_get_n_items(monitors) ? g_list_model_get_item(monitors, 0) : NULL;
+    if (monitor) {
+        GdkRectangle geometry;
+        gdk_monitor_get_geometry(monitor, &geometry);
+        height = geometry.height;
+        g_object_unref(monitor);
+    }
+    return CLAMP(height - 128, 320, 720);
+}
 #ifdef TARN_UI_DEVTOOLS
 static int dev_start(Session *s);
 static gboolean dev_pump(Session *s);
@@ -195,6 +221,7 @@ int32_t tarn_ui_gtk_create(const char *title, const char *heading, void **out) {
     gtk_window_set_default_size(s->window, 480, 240);
     GtkWidget *label = g_object_new(GTK_TYPE_LABEL, "accessible-role", GTK_ACCESSIBLE_ROLE_HEADING, "label", heading, NULL);
     gtk_accessible_update_property(GTK_ACCESSIBLE(label), GTK_ACCESSIBLE_PROPERTY_LEVEL, 1, -1);
+    wrap_label(label);
     s->heading = label;
     UI_ID(label, "heading");
     gtk_widget_add_css_class(label, "title-1");
@@ -343,6 +370,7 @@ int32_t tarn_ui_gtk_enable_counter(void *raw, int64_t value) {
     gtk_box_append(GTK_BOX(box), heading);
     g_object_unref(heading);
     s->counter_label = gtk_label_new("");
+    wrap_label(s->counter_label);
     UI_ID(s->counter_label, "counter");
     gtk_box_append(GTK_BOX(box), s->counter_label);
     s->button = gtk_button_new_with_label("Incrementar");
@@ -377,7 +405,7 @@ static gboolean valid_key(const char *key) {
     if (!key || !*key || strlen(key) > 128) return FALSE;
     for (const char *p = key; *p; ++p)
         if (!g_ascii_isalnum(*p) && *p != '-' && *p != '_') return FALSE;
-    return strcmp(key, "main") && strcmp(key, "heading") && strcmp(key, "content") && strcmp(key, "pages");
+    return strcmp(key, "main") && strcmp(key, "heading") && strcmp(key, "content") && strcmp(key, "pages") && strcmp(key, "scroll");
 }
 
 static void component_track(GtkWidget *widget) {
@@ -414,11 +442,21 @@ int32_t tarn_ui_gtk_add_page(void *raw, const char *key) {
         gtk_window_set_child(s->window, root);
         gtk_box_append(GTK_BOX(root), s->heading);
         g_object_unref(s->heading);
+        GtkWidget *scroll = gtk_scrolled_window_new();
+        UI_ID(scroll, "scroll");
+        component_track(scroll);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        gtk_window_set_default_size(s->window, 480, window_height_limit());
+        gtk_widget_set_vexpand(scroll, TRUE);
+        gtk_box_append(GTK_BOX(root), scroll);
         s->pages = gtk_stack_new();
         UI_ID(s->pages, "pages");
         component_track(s->pages);
         gtk_stack_set_transition_type(GTK_STACK(s->pages), GTK_STACK_TRANSITION_TYPE_NONE);
-        gtk_box_append(GTK_BOX(root), s->pages);
+        /* Size to the visible page; hidden long pages must not add empty space. */
+        gtk_stack_set_vhomogeneous(GTK_STACK(s->pages), FALSE);
+        /* The automatic GtkViewport scrolls focused descendants into view. */
+        gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), s->pages);
     }
     GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_set_margin_start(page, 24);
@@ -470,7 +508,7 @@ static int32_t component_add(void *raw, const char *page_key, const char *key, c
     GtkWidget *page = component_parent(s, page_key);
     if (!page || style > 2 || (action && style)) return 1;
     GtkWidget *widget;
-    if (action) widget = gtk_button_new_with_label(text);
+    if (action) widget = wrapping_button(text);
     else if (style == 1) {
         widget = g_object_new(GTK_TYPE_LABEL, "accessible-role", GTK_ACCESSIBLE_ROLE_HEADING, "label", text, NULL);
         gtk_accessible_update_property(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_PROPERTY_LEVEL, 2, -1);
@@ -480,7 +518,7 @@ static int32_t component_add(void *raw, const char *page_key, const char *key, c
         if (style == 2) gtk_widget_add_css_class(widget, "title-1");
     }
     component_track(widget);
-    if (!action) gtk_label_set_wrap(GTK_LABEL(widget), TRUE);
+    if (!action) wrap_label(widget);
     if (gtk_orientable_get_orientation(GTK_ORIENTABLE(page)) == GTK_ORIENTATION_HORIZONTAL)
         gtk_widget_set_hexpand(widget, TRUE);
     char *owned = g_strdup(key);
@@ -607,6 +645,10 @@ int32_t tarn_ui_gtk_show_page(void *raw, const char *key) {
         if (previous && focus && gtk_widget_is_ancestor(focus, previous))
             g_object_set_data(G_OBJECT(previous), "tarn-ui-last-focus", focus);
         gtk_stack_set_visible_child(GTK_STACK(s->pages), page);
+        if (previous != page) {
+            GtkWidget *scroll = gtk_widget_get_ancestor(s->pages, GTK_TYPE_SCROLLED_WINDOW);
+            gtk_adjustment_set_value(gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scroll)), 0);
+        }
         GtkWidget *target = g_object_get_data(G_OBJECT(page), "tarn-ui-last-focus");
         if (!target || !can_focus(target)) target = first_focusable(page);
         if (target) gtk_widget_grab_focus(target);
@@ -781,7 +823,7 @@ int32_t tarn_ui_gtk_list_item(void *raw, const char *key, const char *text, uint
     } else {
         /* Replacement may temporarily hold old and new rows, bounded at 512 keys. */
         if (g_hash_table_size(s->components) >= 512) return 1;
-        widget = gtk_button_new_with_label(text);
+        widget = wrapping_button(text);
         component_track(widget);
         g_hash_table_insert(s->components, g_strdup(key), widget);
 #ifdef TARN_UI_DEVTOOLS
@@ -900,7 +942,7 @@ int32_t tarn_ui_gtk_tree_node(void *raw, const char *parent_key, const char *key
         if (g_hash_table_size(s->components) >= 512) return 1;
         if (kind >= 6) widget = gtk_box_new(kind == 7 ? GTK_ORIENTATION_HORIZONTAL : GTK_ORIENTATION_VERTICAL, (int)spacing);
         else if (kind == 5) { widget = gtk_entry_new(); gtk_entry_set_max_length(GTK_ENTRY(widget), 256); }
-        else if (kind == 3 || kind == 4) widget = gtk_button_new_with_label(text);
+        else if (kind == 3 || kind == 4) widget = wrapping_button(text);
         else if (kind == 1) {
             widget = g_object_new(GTK_TYPE_LABEL, "accessible-role", GTK_ACCESSIBLE_ROLE_HEADING, "label", text, NULL);
             gtk_accessible_update_property(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_PROPERTY_LEVEL, 2, -1);
@@ -908,7 +950,7 @@ int32_t tarn_ui_gtk_tree_node(void *raw, const char *parent_key, const char *key
         } else widget = gtk_label_new(text);
         if (kind == 2) gtk_widget_add_css_class(widget, "title-1");
         if (kind == 4) gtk_widget_add_css_class(widget, "suggested-action");
-        if (kind <= 2) gtk_label_set_wrap(GTK_LABEL(widget), TRUE);
+        if (kind <= 2) wrap_label(widget);
         component_track(widget);
         g_hash_table_insert(s->components, g_strdup(key), widget);
 #ifdef TARN_UI_DEVTOOLS

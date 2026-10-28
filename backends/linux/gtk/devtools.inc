@@ -277,7 +277,8 @@ static void dev_capture(Session *s) {
     node = gtk_snapshot_free_to_node(snapshot);
     g_object_unref(paintable);
     if (!node) goto done;
-    texture = gsk_renderer_render_texture(renderer, node, NULL);
+    /* Explicit viewport: the PNG covers exactly the window allocation. */
+    texture = gsk_renderer_render_texture(renderer, node, &GRAPHENE_RECT_INIT(0, 0, width, height));
     if (!texture) goto done;
     png = gdk_texture_save_to_png_bytes(texture);
     if (!png || g_bytes_get_size(png) > DEV_RECORD_LIMIT) goto done;

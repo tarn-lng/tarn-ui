@@ -8,7 +8,8 @@ bash "$root/scripts/test-reactive.sh" > "$evidence/reactive.log" 2>&1
 cc -std=c11 -Wall -Wextra -Werror "$root/tests/audit/monitors.c" \
     -o "$evidence/monitors" $(pkg-config --cflags --libs gtk4)
 "$evidence/monitors" > "$evidence/monitors.json" 2> "$evidence/monitors.stderr"
-python3 "$root/tests/audit/phase5.py" > "$evidence/layout.stdout.json" 2> "$evidence/layout.stderr"
+gate=0
+python3 "$root/tests/audit/phase5.py" > "$evidence/layout.stdout.json" 2> "$evidence/layout.stderr" || gate=$?
 {
     date -u +%Y-%m-%dT%H:%M:%SZ
     pkg-config --modversion gtk4 json-glib-1.0
@@ -25,3 +26,4 @@ cp "$root/.build/navigation-tests/tasks.log" "$evidence/tasks.log"
 cp "$root/.build/navigation-tests/forms.log" "$evidence/forms.log"
 printf 'Audit evidence: %s\n' "$evidence"
 cat "$evidence/navigation.log" "$evidence/reactive.log" "$evidence/layout.stdout.json"
+exit "$gate"

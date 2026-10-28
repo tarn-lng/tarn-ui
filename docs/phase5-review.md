@@ -1,77 +1,84 @@
 # Revisión de cierre de la fase 5
 
-Revisado el 22 de octubre de 2026 sobre Linux/GTK4, ABI 12.
-**Resultado: la fase 5 sigue abierta por dos fallos comprobados de disposición.**
-La funcionalidad está implementada dentro del alcance actual, pero pasar los
-flujos de la demo no demuestra que la interfaz completa quepa en pantalla.
+Revisado el 28 de octubre de 2026 sobre Linux/GTK4, ABI 12.
+**Resultado: los criterios de la fase 5 se cumplen en el alcance medido.** Las dos
+brechas de disposición del 22 de octubre están corregidas y las coberturas de
+teclado, accesibilidad dinámica, captura y temas tienen pruebas propias.
+La revisión anterior se conserva en el historial de Git.
 
 Esta revisión usa los criterios de la [tabla de fases del ADR](adr/0001-native-ui-foundations.md#milestones-and-executable-gates):
 interfaz declarativa/reactiva, disposición nativa, navegación, tema y accesibilidad;
 identidad estable, disposición de recursos y pruebas de accesibilidad nativa,
-sin renderizador propio. La investigación de sanitizadores continúa aplazada
-por instrucción del usuario; no se reabre como parte de esta revisión.
+sin renderizador propio. La investigación de sanitizadores sigue aplazada
+por instrucción del usuario y no forma parte de esta revisión.
 
 ## Matriz de criterios
 
 | Criterio | Resultado | Evidencia y alcance |
 | --- | --- | --- |
 | Descripciones declarativas y estado Tarn | Cumplido en el alcance actual | `core/reactive.tarn`, `core/components.tarn`; modelos de formularios y listas; pruebas de valores derivados y errores de vista. |
-| Reconciliación e identidad estable | Cumplido en el alcance actual | Pruebas nativas conservan punteros en listas y subárboles mixtos durante 20 actualizaciones y reordenamientos. Tipo, padre y acción son fijos por clave. |
-| Liberación y señales | Cumplido funcionalmente | Referencias débiles y contadores equilibrados al cerrar, retirar ramas, reemplazar al límite y terminar montajes parciales. Los controles retirados con referencias externas no emiten acciones del adaptador. No equivale a un resultado limpio de LeakSanitizer. |
-| Disposición nativa | **Pendiente: fallos reproducidos** | Las cajas y controles son GTK; las filas cortas tienen geometría comprobada. La lista completa y el texto máximo exceden el monitor, sin desplazamiento. |
-| Navegación y estado | Cumplido en el alcance actual | Historial acotado, regreso, páginas retenidas, borradores conservados y recuperación desde Tarn al remontar bloques condicionales. |
-| Tema y representación de capturas | Parcial en cobertura | GTK usa clases semánticas sin CSS propio ni cambios globales. Se capturó el bloque mixto con tres filas en Adwaita claro y oscuro. Hashes diferentes no prueban legibilidad. Las capturas revisadas tienen transparencia y dimensiones distintas de la ventana; su fidelidad debe contrastarse con la superficie visible. Tampoco se probaron otros temas, escalas o preferencias de contraste. |
-| Accesibilidad nativa | Parcial en cobertura | Se verifican roles y niveles de encabezados y propiedades reales de botones mediante el contexto de prueba GTK. Los campos dinámicos exponen sus propiedades explícitas en el inspector. Faltan pruebas directas de sus propiedades en el contexto GTK y del recorrido de teclado. No hay validación con lector de pantalla. |
-| Foco | Cumplido para los casos probados | Foco por página, delegación de campos compuestos, eliminación de referencias a ramas retiradas y conservación del foco al editar. No hay prueba completa de Tab/Shift+Tab ni activación por teclado. |
-| Renderizador nativo | Cumplido | El adaptador crea `GtkBox`, `GtkStack`, `GtkButton`, `GtkEntry` y `GtkLabel`. No introduce un motor de dibujo, layout o web propio. |
-| Compatibilidad con el agente | Cumplido en los flujos probados | Inspección, clic, escritura y captura con permisos explícitos; las respuestas esperan la aplicación de la vista. La aceptación de protocolo/MCP de la entrega precedente pasó; esta revisión repite navegación e integración MCP de la demo mediante su suite. |
+| Reconciliación e identidad estable | Cumplido en el alcance actual | Las pruebas nativas conservan punteros en listas y subárboles mixtos durante 20 actualizaciones y reordenamientos. Tipo, padre y acción son fijos por clave. |
+| Liberación y señales | Cumplido funcionalmente | Referencias débiles y contadores equilibrados, incluido el nuevo `GtkScrolledWindow`. No equivale a un resultado limpio de LeakSanitizer. |
+| Disposición nativa | **Cumplido** | Las páginas están en un `GtkScrolledWindow` vertical. La ventana mide 480×640 en un monitor de 1366×768 con 3 o 32 filas, con 256 «W» y con 256 caracteres Unicode mixtos. Las etiquetas ajustan el texto en cualquier carácter. |
+| Navegación y estado | Cumplido en el alcance actual | Historial acotado, regreso, páginas retenidas y borradores conservados. Al cambiar de página el desplazamiento vuelve arriba. |
+| Tema y representación de capturas | **Cumplido en los temas medidos** | La captura usa un viewport explícito: el PNG mide exactamente lo mismo que la ventana y es opaco. Se midieron Adwaita claro y oscuro, HighContrast, HighContrastInverse y una fuente de 20 pt. El contraste mínimo del texto visible es 10.25:1. |
+| Accesibilidad nativa | **Cumplido en cobertura de pruebas** | El contexto de prueba GTK verifica el rol `TEXT_BOX` y la etiqueta y descripción reales de un campo dinámico, el rol de botones y encabezados dinámicos, y la reaplicación tras remontar. No hay validación con lector de pantalla. |
+| Foco y teclado | **Cumplido** | Tab recorre 32 filas, campo, botón aplicar y Volver en orden del modelo; Shift+Tab recorre en sentido inverso. Cada control enfocado queda dentro del viewport. La activación por la señal nativa `activate` entrega la acción. Retirar la rama enfocada mueve el foco a un control visible. |
+| Renderizador nativo | Cumplido | El adaptador crea `GtkBox`, `GtkStack`, `GtkScrolledWindow`, `GtkButton`, `GtkEntry` y `GtkLabel`. No introduce un motor propio. |
+| Compatibilidad con el agente | Cumplido en los flujos probados | Inspección, clic, escritura y captura con permisos explícitos. Se repitieron las suites de protocolo, lanzador, MCP y build. |
 
-## Medición de disposición
+## Cambios
 
-La auditoría obtuvo la geometría real del monitor mediante GDK: **1366×768
-píxeles lógicos, escala 1**. Las dimensiones de ventana vienen de `ui.inspect`
-tras una captura de un frame real. No se infiere el tamaño a partir del PNG.
+1. **Desplazamiento vertical.** `add_page` coloca el `GtkStack` dentro de un
+   `GtkScrolledWindow` (horizontal nunca, vertical automático). La pila ya no
+   iguala la altura de las páginas ocultas. La altura por defecto se deriva del
+   primer monitor: `alto - 128`, acotada entre 320 y 720 píxeles. El
+   `GtkViewport` desplaza automáticamente el control enfocado a la vista. La
+   clave `scroll` queda reservada.
+2. **Etiquetas largas.** Todas las etiquetas, incluidas las de botones estáticos,
+   de filas y de subárboles, usan `PANGO_WRAP_WORD_CHAR`. El límite de ancho de
+   una palabra desaparece, así que la ventana conserva su ancho de 480.
+3. **Captura.** `dev_capture` renderiza con un viewport `0,0,ancho,alto`. Antes
+   el tamaño dependía de los límites del nodo (440×610 frente a 480×661). La
+   transparencia observada provenía del CSS de usuario
+   (`~/.config/gtk-4.0/gtk.css`), que sustituye a `GTK_THEME`. La auditoría
+   ahora usa un `XDG_CONFIG_HOME` aislado, `GDK_DEBUG=no-portals` y animaciones
+   desactivadas para que inspección y captura vean la misma posición.
 
-| Escenario | Ventana medida | Resultado |
-| --- | --- | --- |
-| Tres filas y opciones abiertas, Adwaita claro | 480×661 | Cabe en el monitor medido. |
-| Tres filas y opciones abiertas, Adwaita oscuro | 480×661 | Cabe; se guardó una captura independiente. |
-| 32 filas y opciones abiertas | **480×1589** | Excede la altura de todos los monitores disponibles. Volver queda en `y=1539`, fuera de los 768 píxeles del monitor. |
-| Una fila con 256 letras W | **3249×472** | Excede el ancho de todos los monitores disponibles. La entrada acepta este contenido válido. |
+## Medición de disposición y tema
 
-El árbol inspeccionado contiene **cero `GtkScrolledWindow`** en los cuatro casos.
-El código de la página usa cajas sin un área de desplazamiento; los botones de
-fila se crean con etiquetas sin política de ajuste de texto. Esto explica los
-mínimos de tamaño observados. Una captura completa o un clic semántico exitoso
-no prueba que el control sea alcanzable por una persona en su pantalla.
+Monitor medido con GDK: **1366×768 píxeles lógicos, escala 1**.
 
-## Brechas y orden de trabajo
+| Escenario | Ventana | Contraste mínimo |
+| --- | --- | ---: |
+| Tres filas, opciones abiertas, Adwaita | 480×640 | 11.61 |
+| Igual, Adwaita oscuro | 480×640 | 10.25 |
+| Igual, HighContrast | 480×640 | 13.88 |
+| Igual, HighContrastInverse | 480×640 | 11.54 |
+| Igual, fuente Sans 20 (encabezado 36→73 px) | 480×640 | 11.61 |
+| 32 filas, opciones abiertas | 480×640 | 11.61 |
+| Una fila con 256 «W» | 480×640 | 11.61 |
+| Una fila con 256 caracteres latinos, emoji, CJK y árabe | 480×640 | 11.61 |
 
-1. **Corregir el crecimiento vertical.** Incorporar desplazamiento nativo y una
-   política de tamaño que mantenga disponibles los controles con 32 filas y las
-   opciones abiertas. Agregar una prueba de geometría en un tamaño acotado y de
-   acceso al final de la lista, conservando identidad y foco al desplazarse.
-2. **Corregir las etiquetas largas.** Definir ajuste o elipsis nativos para las
-   filas y los controles dinámicos; una cadena válida de 256 caracteres no debe
-   imponer una ventana más ancha que el monitor. Verificar también texto Unicode.
-3. **Completar cobertura de teclado y accesibilidad dinámica.** Probar
-   Tab/Shift+Tab, activación nativa por teclado, retiro de la rama enfocada y las
-   propiedades accesibles reales de sus campos. Los fallos de teclado todavía
-   no están demostrados: lo pendiente es la evidencia, no una regresión afirmada.
-4. **Verificar fidelidad de captura y legibilidad con los temas.** Las capturas
-   cortas miden 440×610 frente a una ventana inspeccionada de 480×661 y contienen
-   transparencia. `dev_capture` renderiza un nodo sin viewport explícito; el
-   recorte podría depender de sus límites. Falta comprobar el contrato de
-   coordenadas y composición con la superficie visible. No se afirma que el tema
-   de la ventana real esté roto a partir de un PNG transparente.
-5. Repetir los escenarios de disposición y revisar esta matriz antes de cerrar
-   la fase. Una comprobación manual con lector de pantalla es recomendable antes
-   de presentar la preview como accesible; no se declara una certificación.
+El contraste se calcula sobre la captura: la razón entre el píxel opaco más
+oscuro y el más claro dentro de cada etiqueta habilitada visible en el viewport.
+Mide legibilidad renderizada; no es una auditoría WCAG ni de lector de pantalla.
+El umbral del criterio es 4.5:1. Con las opciones abiertas el botón Volver queda
+debajo del pliegue y se alcanza desplazando o con Tab; la prueba nativa lo comprueba.
 
-Las dos primeras brechas son fallos de comportamiento medidos. La tercera y la cuarta son
-cobertura pendiente. No se exige introducir virtualización, cambios de tipo por
-clave, movimientos entre padres, trabajo asíncrono ni un backend móvil para
-corregir estos casos. Tampoco se cambia el alcance hacia la plantilla de proyecto.
+## Límites que se mantienen
+
+- La escala 2 no se midió: el monitor disponible es de escala 1 y Wayland ignora
+  `GDK_SCALE`. Las capturas multiplican por la escala del widget.
+- La altura se calcula con el primer monitor al montar la primera página; mover
+  la ventana a otro monitor no la recalcula.
+- La activación por teclado usa la señal `activate` que enlazan Intro y Espacio;
+  no se sintetizan eventos de teclado del compositor.
+- Las pruebas nativas presentan ventanas reales: la entrada del escritorio
+  (puntero o teclado) durante la ejecución puede producir eventos extra. Hubo un
+  fallo así en una ejecución; las 16 siguientes pasaron.
+- Recomendado antes de publicar una preview accesible: una comprobación manual
+  con Orca. No se declara una certificación.
 
 ## Reproducción y registros
 
@@ -79,36 +86,24 @@ corregir estos casos. Tampoco se cambia el alcance hacia la plantilla de proyect
 bash scripts/audit-phase5.sh
 ```
 
-Requiere el compilador suministrado, GTK4/JSON-GLib y una sesión gráfica. La receta
-recompila y ejecuta las suites de navegación y reactividad, y después mide los
-cuatro escenarios. En esta revisión pasaron **22 pruebas de integración** de
-navegación y **6 reactivas**, además de las pruebas nativas y modelos Tarn que
-incluyen sus scripts. No se ejecuta la investigación de fugas ni Cargo completo.
+Requiere el compilador suministrado, GTK4/JSON-GLib y una sesión gráfica. La
+receta recompila y ejecuta las suites de navegación (22 pruebas de integración
+y las pruebas nativas de `lifecycle.c`) y de reactividad (6), y después mide los
+ocho escenarios. **El código de salida refleja `layout_gate_passed`.**
 
-Los resultados están en `.build/evidence/phase5-audit/`:
+Los resultados están en `.build/evidence/phase5-audit/`: `layout.json` con
+dimensiones, contraste por etiqueta y hallazgos; una captura PNG y un
+`*.inspect.json` por escenario; `monitors.json`; registros de pruebas y
+`provenance.txt`.
 
-- `layout.json`: dimensiones, temas, hashes de capturas, hallazgos y
-  `layout_gate_passed`. Un valor false conserva el fallo de disposición. Incluye las dimensiones PNG
-  comprobadas contra la respuesta y si coinciden con la asignación de la ventana.
-- `short-light.png`, `short-dark.png`, `full-list.png`, `long-label.png`, con sus
-  snapshots `*.inspect.json` correspondientes.
-- `monitors.json`: geometría GDK; `navigation.log`, `reactive.log`, `lifecycle.log`,
-  `tasks.log` y `forms.log`: resultados de pruebas.
-- `provenance.txt` y `build-provenance.txt`: versiones y hashes de fuentes y build.
-
-La receta termina correctamente si puede recoger la evidencia; **su código de
-salida cero no declara cerrado el criterio de disposición**. El resultado del
-criterio está en `layout_gate_passed` y los hallazgos quedan explícitos.
-
-Los resultados de protocolo y MCP más recientes corresponden a la entrega de
-regiones mixtas: 21 pruebas del protocolo, dos verificaciones de build y seis
-escenarios MCP, además de los cuatro negativos de propiedad de sesión. Se
-conservan como regresión de esa entrega; esta auditoría no vuelve a declararlos
-como una ejecución nueva.
+En esta revisión también pasaron `test-reactive`, `test-devtools`,
+`test-launcher`, `test-launcher-contract`, `test-artifacts`, `test-mcp-build` y
+`test-project-build`. `test-artifacts` falló una vez sin registro y pasó en dos
+reejecuciones. `test-gtk` sigue saliendo con 1 únicamente por LeakSanitizer,
+igual que sin estos cambios.
 
 ## Aplazado por decisión del usuario
 
 La investigación Mesa/EGL y el baseline de sanitizadores siguen en
-[memory-status.md](memory-status.md), sin supresiones nuevas ni instalación del
-parche candidato. La evidencia funcional de liberación se mantiene separada de
-ese asunto. La fase 6 sigue siendo preparación móvil y no se inició aquí.
+[memory-status.md](memory-status.md). La fase 6 sigue siendo preparación móvil
+y no se inició aquí.
