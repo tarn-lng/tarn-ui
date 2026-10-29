@@ -39,7 +39,7 @@ pendiente y el error vuelve al runner para cerrar la sesión; no hay rollback ni
 atomicidad entre varios setters. El clic nunca se confirma como exitoso en ese
 caso. El límite i64 conserva el error 9 sin abortar ni desbordar.
 
-Esta entrega introdujo ABI 5 con `Session.set_heading`; la ABI vigente es **12**
+Esta entrega introdujo ABI 5 con `Session.set_heading`; la ABI vigente es **13**
 tras incorporar componentes y páginas. El puente valida hilo,
 cierre, cola y UTF-8, y conserva la etiqueta original al actualizar su texto.
 Hay que recompilar biblioteca y aplicación juntas. El número de versión del

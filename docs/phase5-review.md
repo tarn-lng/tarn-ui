@@ -74,9 +74,15 @@ debajo del pliegue y se alcanza desplazando o con Tab; la prueba nativa lo compr
   la ventana a otro monitor no la recalcula.
 - La activación por teclado usa la señal `activate` que enlazan Intro y Espacio;
   no se sintetizan eventos de teclado del compositor.
-- Las pruebas nativas presentan ventanas reales: la entrada del escritorio
-  (puntero o teclado) durante la ejecución puede producir eventos extra. Hubo un
-  fallo así en una ejecución; las 16 siguientes pasaron.
+- Las pruebas nativas presentan ventanas reales. GTK4 descarta la cadena de foco
+  de una ventana inactiva, así que el recorrido con Tab vuelve a presentar la
+  ventana antes de cada paso y cada paso es síncrono; si el escritorio no la
+  activa, el paso se informa como omitido. Los eventos de entrada real del
+  escritorio se descartan antes de comprobar la activación.
+- Al destruir muchas ventanas en un mismo proceso, el método de entrada Wayland
+  de GTK 4.24.1 a veces procesa un evento tardío de un campo destruido y falla
+  dentro de GTK. La prueba nativa usa `gtk-im-context-simple`; las aplicaciones
+  abren una sesión por proceso. Tras ambos cambios pasaron 12 ejecuciones seguidas.
 - Recomendado antes de publicar una preview accesible: una comprobación manual
   con Orca. No se declara una certificación.
 

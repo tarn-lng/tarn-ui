@@ -9,6 +9,9 @@ Las [opciones condicionales](docs/dynamic-regions.md) montan y retiran un bloque
 con campo, encabezado y botones conservando su estado en Tarn.
 El formulario permite guardar y restablecer un nombre; el agente puede probarlo
 mediante [`ui.fill` con permiso explícito](docs/devtools.md#uifill).
+[Controles nativos de formulario](docs/widgets.md): interruptor, casilla,
+deslizador, campo numérico y desplegable.
+[Bandeja, notificaciones y segundo plano](docs/tray.md) en Tarn puro sobre tarn-dbus (ABI 14).
 [Próximos pasos y recordatorio de memoria aplazado](docs/roadmap.md).
 Las páginas se desplazan verticalmente y el texto largo se ajusta al ancho; la
 [revisión de fase 5](docs/phase5-review.md) mide disposición, teclado, temas y contraste.

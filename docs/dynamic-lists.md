@@ -11,7 +11,7 @@ bash scripts/run-navigation.sh
 bash scripts/test-navigation.sh
 ```
 
-La ABI vigente es **12**. Recompilar aplicación y biblioteca juntas.
+La ABI vigente es **13**. Recompilar aplicación y biblioteca juntas.
 
 ## Descripción en Tarn
 
