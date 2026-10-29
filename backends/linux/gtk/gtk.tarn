@@ -46,6 +46,10 @@ pub extern "C" fn gtk_button_get_child(button *mut Widget) *mut Widget
 pub extern "C" fn gtk_box_new(orientation i32, spacing i32) *mut Widget
 pub extern "C" fn gtk_box_append(box *mut Widget, child *mut Widget) void
 pub extern "C" fn gtk_box_remove(box *mut Widget, child *mut Widget) void
+pub extern "C" fn gtk_box_reorder_child_after(box *mut Widget, child *mut Widget, sibling *mut Widget) void
+pub extern "C" fn gtk_box_get_spacing(box *mut Widget) i32
+pub extern "C" fn gtk_box_set_spacing(box *mut Widget, spacing i32) void
+pub extern "C" fn gtk_widget_get_prev_sibling(widget *mut Widget) *mut Widget
 pub extern "C" fn gtk_widget_set_hexpand(widget *mut Widget, expand i32) void
 pub extern "C" fn gtk_widget_set_vexpand(widget *mut Widget, expand i32) void
 pub extern "C" fn gtk_widget_remove_css_class(widget *mut Widget, name *u8) void

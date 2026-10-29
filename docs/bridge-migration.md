@@ -46,7 +46,7 @@ pasado a GTK debe vivir mientras GTK lo use.
 |---|---|---|
 | G1 ✓ | `gtk.tarn`, bloque de banderas, cola de eventos; ciclo de vida: create, next, request_close, release, finish, wake, background, present/hide, is_visible; contador | smoke Tarn del ciclo de vida y contador, sin fugas de sesión |
 | G2 ✓ | páginas, etiquetas, botones, cajas, texto, entradas, `set_*`, foco, accesibilidad | `tests/native/components.tarn`: los mismos casos que `session-smoke`, más finalización de widgets |
-| G3 | listas y regiones (`list_*`, `tree_*`) | ejemplos de navegación y regiones |
+| G3 ✓ | listas y regiones (`list_*`, `tree_*`) | `tests/native/regions.tarn`: identidad, orden, reescritura y eliminación |
 | G4 | controles, indicadores, contenedores, texto multilínea, barra de título y menú | ejemplo `widgets` |
 | G5 | devtools (`ui.inspect`, `ui.fill`, `ui.click`, `ui.close`) en Tarn; json-glib o JSON propio | suites Python (widgets, navigation, reactive, devtools, tray) sin cambios |
 | G6 | `session.tarn` usa el backend Tarn por defecto; se borran `bridge.c`, `bridge.h`, `devtools.inc`, scripts de compilación de C | todas las suites + ASan sobre el binario Tarn |

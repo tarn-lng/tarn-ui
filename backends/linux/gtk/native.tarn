@@ -111,6 +111,15 @@ pub struct Native {
     accessible collections.Map<string, string>
     page_count u32
     pages_presented bool
+    // The open list or tree reconciliation, if any.
+    region *mut gtk.Widget
+    tree_mode bool
+    expected u32
+    seen collections.Set<string>
+    previous *mut gtk.Widget
+    // Per parent address: the last node placed in this pass.
+    tree_last collections.Map<usize, usize>
+    focus_removed bool
 }
 
 // What a key names. Handlers are disconnected on release.
@@ -124,6 +133,15 @@ copy struct Part {
     kind u32
     horizontal bool
     handler u64
+    // REGION_LIST or REGION_TREE on a region root; tree nodes keep kind + 1.
+    region u32
+    tree_kind u32
+    action u32
+}
+fn REGION_LIST() u32 { return 1 }
+fn REGION_TREE() u32 { return 2 }
+fn blank() Part {
+    return Part { widget: ffi.null(), kind: 0, horizontal: false, handler: 0, region: 0, tree_kind: 0, action: 0 }
 }
 
 fn c(text &string) Result<ffi.CString, i32> {
@@ -266,6 +284,8 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
             handlers: Vec.new(), click_handler: 0, delivered_closed: false, text: ffi.null(),
             pages: ffi.null(), parts: collections.Map.new(), accessible: collections.Map.new(),
             page_count: 0, pages_presented: false,
+            region: ffi.null(), tree_mode: false, expected: 0, seen: collections.Set.new(),
+            previous: ffi.null(), tree_last: collections.Map.new(), focus_removed: false,
         }
         native.handlers.push(try connect(window, &"close-request", ffi.callback(close_requested), block))
         native.handlers.push(try connect(window, &"map", ffi.callback(mapped), block))
@@ -523,7 +543,7 @@ fn Native.admit(&self, key &string) i32 {
     if status != 0 { return status }
     if self.closed() { return 6 }
     if flag(self.block, FULL()) != 0 { return 8 }
-    if !valid_key(key) || !is_null(self.counter) || self.pages_presented { return 1 }
+    if !valid_key(key) || !is_null(self.counter) || self.pages_presented || !is_null(self.region) { return 1 }
     if self.parts.contains(key) || self.parts.len() >= 256 { return 1 }
     return 0
 }
@@ -532,6 +552,8 @@ fn Native.parent(&self, key &string) Option<Part> {
     match collections.get_copy(&self.parts, key) {
         Some(part) => {
             if part.kind != PAGE() && part.kind != BOX() { return None }
+            // Regions own their children; static widgets stay outside them.
+            if part.region != 0 || part.tree_kind != 0 { return None }
             var depth = 0
             var widget = part.widget
             unsafe {
@@ -557,7 +579,12 @@ fn Native.lookup(&self, key &string) Result<Part, i32> {
     }
 }
 fn Native.insert(&mut self, key &string, widget *mut gtk.Widget, kind u32, horizontal bool, handler u64) {
-    previous := self.parts.insert(key.clone(), Part { widget: widget, kind: kind, horizontal: horizontal, handler: handler })
+    var part = blank()
+    part.widget = widget
+    part.kind = kind
+    part.horizontal = horizontal
+    part.handler = handler
+    previous := self.parts.insert(key.clone(), part)
 }
 
 // The first page replaces the heading-only content with heading + scrolled stack.
@@ -627,7 +654,7 @@ fn Native.add_leaf(&mut self, parent &string, key &string, text &string, action 
     status := self.admit(key)
     if status != 0 { return status }
     if style > 2 || (action != 0 && style != 0) { return 1 }
-    var host = Part { widget: ffi.null(), kind: 0, horizontal: false, handler: 0 }
+    var host = blank()
     match self.parent(parent) {
         Some(found) => { host = found }
         None => { return 1 }
@@ -683,7 +710,7 @@ pub fn Native.add_entry(&mut self, parent &string, key &string, text &string, ac
     status := self.admit(key)
     if status != 0 { return status }
     if action == 0 || action > 1024 { return 1 }
-    var host = Part { widget: ffi.null(), kind: 0, horizontal: false, handler: 0 }
+    var host = blank()
     match self.parent(parent) {
         Some(found) => { host = found }
         None => { return 1 }
@@ -709,7 +736,7 @@ pub fn Native.add_entry(&mut self, parent &string, key &string, text &string, ac
 }
 
 pub fn Native.set_text(&mut self, key &string, text &string) i32 {
-    var part = Part { widget: ffi.null(), kind: 0, horizontal: false, handler: 0 }
+    var part = blank()
     match self.lookup(key) {
         Ok(found) => { part = found }
         Err(status) => { return status }
@@ -756,7 +783,7 @@ pub fn Native.set_enabled(&mut self, key &string, enabled bool) i32 {
 }
 
 pub fn Native.set_accessible(&mut self, key &string, label &string, description &string) i32 {
-    var part = Part { widget: ffi.null(), kind: 0, horizontal: false, handler: 0 }
+    var part = blank()
     match self.lookup(key) {
         Ok(found) => { part = found }
         Err(status) => { return status }
@@ -865,7 +892,7 @@ pub fn Native.show_page(&mut self, key &string) i32 {
 
 // Model write without a changed event; entries hold at most 256 characters.
 pub fn Native.set_input(&mut self, key &string, text &string) i32 {
-    var part = Part { widget: ffi.null(), kind: 0, horizontal: false, handler: 0 }
+    var part = blank()
     match self.lookup(key) {
         Ok(found) => { part = found }
         Err(status) => { return status }
@@ -888,3 +915,364 @@ pub fn Native.set_input(&mut self, key &string, text &string) i32 {
 
 // After applying an Increment or keyed component action in Tarn.
 pub fn Native.complete_event(&mut self, status i32) i32 { return self.check() }
+
+// ---- G3: dynamic regions ----
+// A list region owns only direct keyed buttons; a tree region owns a mixed
+// preorder of nodes: body=0, heading=1, value=2, button=3, primary=4,
+// input=5, column=6, row=7. Stable keys keep their widgets, kind, parent and
+// action; begin(count), nodes in the desired order, end removes the rest.
+
+fn address(widget *mut gtk.Widget) usize { return ffi.address(ffi.to_const(widget)) }
+fn within(widget *mut gtk.Widget, ancestor *mut gtk.Widget) bool {
+    unsafe { return gtk.gtk_widget_is_ancestor(widget, ancestor) != 0 }
+}
+fn parent_of(widget *mut gtk.Widget) *mut gtk.Widget {
+    unsafe { return gtk.gtk_widget_get_parent(widget) }
+}
+fn child_count(parent *mut gtk.Widget) u32 {
+    var count: u32 = 0
+    unsafe {
+        var child = gtk.gtk_widget_get_first_child(parent)
+        for !is_null(child) {
+            count = count + 1
+            child = gtk.gtk_widget_get_next_sibling(child)
+        }
+    }
+    return count
+}
+// A wrapping button with a click handler; returns the part to register.
+fn Native.action_button(&mut self, text &ffi.CString, action u32) Result<Part, i32> {
+    unsafe {
+        widget := gtk.gtk_button_new_with_label(text.as_ptr())
+        wrap_label(gtk.gtk_button_get_child(widget))
+        set_action(widget, action)
+        var part = blank()
+        part.widget = widget
+        part.kind = BUTTON()
+        part.action = action
+        part.handler = try connect(widget, &"clicked", ffi.callback(component_clicked), self.block)
+        return Ok(part)
+    }
+}
+fn Native.keys_within(&self, root *mut gtk.Widget, inclusive bool) Vec<string> {
+    var keys: Vec<string> = Vec.new()
+    var cursor: usize = 0
+    for true {
+        match self.parts.next_slot(&mut cursor) {
+            Some(slot) => {
+                entry := self.parts.entry_at(slot)
+                if within(entry.value.widget, root) || (inclusive && same(entry.value.widget, root)) { keys.push(entry.key.clone()) }
+            }
+            None => { break }
+        }
+    }
+    return keys
+}
+fn Native.key_of(&self, widget *mut gtk.Widget) Option<string> {
+    var cursor: usize = 0
+    for true {
+        match self.parts.next_slot(&mut cursor) {
+            Some(slot) => {
+                entry := self.parts.entry_at(slot)
+                if same(entry.value.widget, widget) { return Some(entry.key.clone()) }
+            }
+            None => { break }
+        }
+    }
+    return None
+}
+fn Native.set_region(&mut self, key &string, region u32) {
+    match collections.get_copy(&self.parts, key) {
+        Some(found) => {
+            var part = found
+            part.region = region
+            previous := self.parts.insert(key.clone(), part)
+        }
+        None => {}
+    }
+}
+fn Native.open(&mut self, root *mut gtk.Widget, count u32, tree bool) {
+    self.region = root
+    self.expected = count
+    self.tree_mode = tree
+    self.previous = ffi.null()
+    self.focus_removed = false
+    self.seen = collections.Set.new()
+    self.tree_last = collections.Map.new()
+}
+// Drops `child` and every keyed widget inside it, forgetting saved focus.
+fn Native.remove_subtree(&mut self, parent *mut gtk.Widget, child *mut gtk.Widget) {
+    focus_key := literal(&"tarn-ui-last-focus")
+    unsafe {
+        focused := gtk.gtk_window_get_focus(self.window)
+        if !is_null(focused) && (same(focused, child) || within(focused, child)) { self.focus_removed = true }
+        var page = gtk.gtk_widget_get_first_child(self.pages)
+        for !is_null(page) {
+            var saved: *mut gtk.Widget = ffi.from_address(ffi.address(ffi.to_const(gtk.g_object_get_data(page, focus_key.as_ptr()))))
+            if !is_null(saved) && (same(saved, child) || within(saved, child)) { gtk.g_object_set_data(page, focus_key.as_ptr(), ffi.null()) }
+            page = gtk.gtk_widget_get_next_sibling(page)
+        }
+        for key in self.keys_within(child, true) {
+            match self.parts.remove(&key) {
+                Some(part) => {
+                    if part.handler != 0 { gtk.g_signal_handler_disconnect(part.widget, part.handler) }
+                }
+                None => {}
+            }
+            forgotten := self.accessible.remove(&key)
+        }
+        gtk.gtk_box_remove(parent, child)
+    }
+}
+fn Native.close_region(&mut self) {
+    if self.focus_removed {
+        unsafe {
+            target := first_focusable(gtk.gtk_stack_get_visible_child(self.pages))
+            if !is_null(target) { focused := gtk.gtk_widget_grab_focus(target) }
+        }
+    }
+    self.region = ffi.null()
+    self.previous = ffi.null()
+    self.tree_mode = false
+    self.seen = collections.Set.new()
+    self.tree_last = collections.Map.new()
+}
+fn Native.writable(&self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    if flag(self.block, FULL()) != 0 { return 8 }
+    return 0
+}
+
+pub fn Native.list_begin(&mut self, parent &string, count u32) i32 {
+    var part = blank()
+    match self.lookup(parent) {
+        Ok(found) => { part = found }
+        Err(status) => { return status }
+    }
+    if !is_null(self.region) || (part.kind != PAGE() && part.kind != BOX()) || part.region == REGION_TREE() || part.tree_kind != 0 || count > 256 { return 1 }
+    old := child_count(part.widget)
+    if part.region != REGION_LIST() && old != 0 { return 1 }
+    if self.parts.len() - usize(old) + usize(count) > 256 { return 1 }
+    self.set_region(parent, REGION_LIST())
+    self.open(part.widget, count, false)
+    return 0
+}
+
+pub fn Native.list_item(&mut self, key &string, text &string, action u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if is_null(self.region) || self.tree_mode || !valid_key(key) || action == 0 || action > 1024 || self.seen.contains(key) { return 1 }
+    if u32(self.seen.len()) >= self.expected { return 1 }
+    var value = literal(&"")
+    match ffi.CString.new(text) {
+        Some(converted) => { value = converted }
+        None => { return 1 }
+    }
+    var widget: *mut gtk.Widget = ffi.null()
+    unsafe {
+        match collections.get_copy(&self.parts, key) {
+            Some(part) => {
+                if !same(parent_of(part.widget), self.region) || part.kind != BUTTON() || part.action != action { return 1 }
+                if !read_text(gtk.gtk_button_get_label(part.widget)).eq(text) { gtk.gtk_button_set_label(part.widget, value.as_ptr()) }
+                widget = part.widget
+            }
+            None => {
+                // Replacement may briefly hold old and new rows: at most 512 keys.
+                if self.parts.len() >= 512 { return 1 }
+                match self.action_button(&value, action) {
+                    Ok(part) => {
+                        widget = part.widget
+                        gtk.gtk_box_append(self.region, widget)
+                        previous := self.parts.insert(key.clone(), part)
+                    }
+                    Err(failure) => { return failure }
+                }
+            }
+        }
+        gtk.gtk_box_reorder_child_after(self.region, widget, self.previous)
+    }
+    self.previous = widget
+    added := self.seen.insert(key.clone())
+    return 0
+}
+
+pub fn Native.list_end(&mut self) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if is_null(self.region) || self.tree_mode || u32(self.seen.len()) != self.expected { return 1 }
+    region := self.region
+    unsafe {
+        var child = gtk.gtk_widget_get_first_child(region)
+        for !is_null(child) {
+            next := gtk.gtk_widget_get_next_sibling(child)
+            match self.key_of(child) {
+                Some(key) => { if !self.seen.contains(&key) { self.remove_subtree(region, child) } }
+                None => {}
+            }
+            child = next
+        }
+    }
+    self.close_region()
+    return 0
+}
+
+pub fn Native.tree_begin(&mut self, key &string, count u32) i32 {
+    var part = blank()
+    match self.lookup(key) {
+        Ok(found) => { part = found }
+        Err(status) => { return status }
+    }
+    if !is_null(self.region) || (part.kind != PAGE() && part.kind != BOX()) || count > 256 || part.region == REGION_LIST() { return 1 }
+    if part.region != REGION_TREE() && child_count(part.widget) != 0 { return 1 }
+    // A nested owned group cannot become a separately controlled region.
+    if part.tree_kind != 0 { return 1 }
+    old := self.keys_within(part.widget, false).len()
+    if self.parts.len() - old + usize(count) > 256 { return 1 }
+    self.set_region(key, REGION_TREE())
+    self.open(part.widget, count, true)
+    return 0
+}
+
+pub fn Native.tree_node(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, spacing u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || is_null(self.region) || !valid_key(key) || kind > 7 || spacing > 64 { return 1 }
+    if self.seen.contains(key) || u32(self.seen.len()) >= self.expected { return 1 }
+    if kind >= 3 && kind <= 5 {
+        if action == 0 || action > 1024 { return 1 }
+    } else if action != 0 { return 1 }
+    var value = literal(&"")
+    match ffi.CString.new(text) {
+        Some(converted) => { value = converted }
+        None => { return 1 }
+    }
+    if kind == 5 && chars(&value) > 256 { return 1 }
+    var parent = blank()
+    match collections.get_copy(&self.parts, parent_key) {
+        Some(found) => { parent = found }
+        None => { return 1 }
+    }
+    if parent.kind != PAGE() && parent.kind != BOX() { return 1 }
+    if !same(parent.widget, self.region) && (!self.seen.contains(parent_key) || !within(parent.widget, self.region)) { return 1 }
+    var depth = 0
+    var climb = parent.widget
+    for !same(climb, self.region) {
+        depth = depth + 1
+        if depth > 12 { return 1 }
+        climb = parent_of(climb)
+    }
+    if kind >= 6 && depth >= 12 { return 1 }
+    var part = blank()
+    unsafe {
+        match collections.get_copy(&self.parts, key) {
+            Some(found) => {
+                if !same(parent_of(found.widget), parent.widget) || found.tree_kind != kind + 1 || found.action != action { return 1 }
+                part = found
+            }
+            None => {
+                if self.parts.len() >= 512 { return 1 }
+                if kind >= 6 {
+                    var orientation: i32 = 1
+                    if kind == 7 { orientation = 0 }
+                    part.widget = gtk.gtk_box_new(orientation, i32(spacing))
+                    part.kind = BOX()
+                    part.horizontal = kind == 7
+                } else if kind == 5 {
+                    part.widget = gtk.gtk_entry_new()
+                    gtk.gtk_entry_set_max_length(part.widget, 256)
+                    set_action(part.widget, action)
+                    part.kind = ENTRY()
+                    part.handler = 0
+                } else if kind == 3 || kind == 4 {
+                    match self.action_button(&value, action) {
+                        Ok(button) => { part = button }
+                        Err(failure) => { return failure }
+                    }
+                    if kind == 4 { css(part.widget, &"suggested-action", true) }
+                } else {
+                    if kind == 1 {
+                        match heading_label(&value) {
+                            Ok(label) => { part.widget = label }
+                            Err(failure) => { return failure }
+                        }
+                        set_accessible_int(part.widget, gtk.PROPERTY_LEVEL(), 2)
+                        css(part.widget, &"title-2", true)
+                    } else {
+                        part.widget = gtk.gtk_label_new(value.as_ptr())
+                        if kind == 2 { css(part.widget, &"title-1", true) }
+                    }
+                    wrap_label(part.widget)
+                    part.kind = LABEL()
+                }
+                part.tree_kind = kind + 1
+                part.action = action
+                gtk.gtk_box_append(parent.widget, part.widget)
+                if kind == 5 {
+                    // Connected after the initial text so creation queues no edit.
+                    gtk.gtk_editable_set_text(part.widget, value.as_ptr())
+                    match connect(part.widget, &"changed", ffi.callback(entry_changed), self.block) {
+                        Ok(id) => { part.handler = id }
+                        Err(failure) => { return failure }
+                    }
+                }
+                previous := self.parts.insert(key.clone(), part)
+            }
+        }
+        if kind >= 6 {
+            if gtk.gtk_box_get_spacing(part.widget) != i32(spacing) { gtk.gtk_box_set_spacing(part.widget, i32(spacing)) }
+        } else if kind == 5 {
+            written := self.set_input(key, text)
+            if written != 0 { return written }
+        } else if kind >= 3 {
+            if !read_text(gtk.gtk_button_get_label(part.widget)).eq(text) { gtk.gtk_button_set_label(part.widget, value.as_ptr()) }
+        } else if !read_text(gtk.gtk_label_get_text(part.widget)).eq(text) {
+            gtk.gtk_label_set_text(part.widget, value.as_ptr())
+        }
+        // Order after the previous node placed under the same parent.
+        var previous: *mut gtk.Widget = ffi.null()
+        match collections.get_copy(&self.tree_last, &address(parent.widget)) {
+            Some(last) => { previous = ffi.from_address(last) }
+            None => {}
+        }
+        if !same(gtk.gtk_widget_get_prev_sibling(part.widget), previous) {
+            gtk.gtk_box_reorder_child_after(parent.widget, part.widget, previous)
+        }
+    }
+    replaced := self.tree_last.insert(address(parent.widget), address(part.widget))
+    added := self.seen.insert(key.clone())
+    return 0
+}
+
+fn Native.prune(&mut self, parent *mut gtk.Widget) {
+    unsafe {
+        var child = gtk.gtk_widget_get_first_child(parent)
+        for !is_null(child) {
+            next := gtk.gtk_widget_get_next_sibling(child)
+            var keep = false
+            var nested = false
+            match self.key_of(child) {
+                Some(key) => {
+                    keep = self.seen.contains(&key)
+                    match collections.get_copy(&self.parts, &key) {
+                        Some(part) => { nested = part.kind == BOX() }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+            if !keep { self.remove_subtree(parent, child) } else if nested { self.prune(child) }
+            child = next
+        }
+    }
+}
+
+pub fn Native.tree_end(&mut self) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || is_null(self.region) || u32(self.seen.len()) != self.expected { return 1 }
+    self.prune(self.region)
+    self.close_region()
+    return 0
+}

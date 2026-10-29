@@ -1,0 +1,93 @@
+// G3 smoke for the Tarn GTK backend: keyed list and tree regions keep
+// widget identity, reorder, update in place and remove what is absent.
+import "ffi"
+import "string"
+import "gtk/gtk"
+import "gtk/native"
+
+extern "C" fn gtk_widget_activate(widget *mut gtk.Widget) i32
+
+fn check(value bool, what string) { if !value { panic("regions: " + what) } }
+fn same(a *mut gtk.Widget, b *mut gtk.Widget) bool { return ffi.address(ffi.to_const(a)) == ffi.address(ffi.to_const(b)) }
+fn missing(widget *mut gtk.Widget) bool { return ffi.is_null(ffi.to_const(widget)) }
+fn first(parent *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_first_child(parent) } }
+fn after(widget *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_next_sibling(widget) } }
+
+fn main() {
+    var ui = open()
+    check(ui.next() == 1, "opened")
+    check(ui.add_page(&"home") == 0, "page")
+    check(ui.add_box(&"home", &"items", false, 4) == 0, "list host")
+    check(ui.add_box(&"home", &"form", false, 4) == 0, "tree host")
+    check(ui.add_label(&"home", &"filled", &"x") == 0, "label")
+    check(ui.show_page(&"home") == 0, "show")
+
+    // Lists.
+    check(ui.list_begin(&"filled", 1) == 1, "a label hosts no list")
+    check(ui.list_begin(&"items", 2) == 0, "list begin")
+    check(ui.add_label(&"items", &"stray", &"x") == 1, "no static widgets while a region is open")
+    check(ui.list_item(&"a", &"Uno", 11) == 0, "item a")
+    check(ui.list_item(&"a", &"Uno", 11) == 1, "duplicate item")
+    check(ui.list_item(&"b", &"Dos", 12) == 0, "item b")
+    check(ui.list_item(&"c", &"Tres", 13) == 1, "over count")
+    check(ui.list_end() == 0, "list end")
+    a := ui.widget(&"a")
+    b := ui.widget(&"b")
+    check(same(first(ui.widget(&"items")), a), "order a, b")
+    // Reorder, rename and drop: b keeps its widget, a disappears.
+    check(ui.list_begin(&"items", 2) == 0, "second pass")
+    check(ui.list_item(&"b", &"Dos!", 12) == 0, "b first")
+    check(ui.list_item(&"c", &"Tres", 13) == 0, "c new")
+    check(ui.list_end() == 0, "second end")
+    check(same(ui.widget(&"b"), b), "b kept its widget")
+    check(missing(ui.widget(&"a")), "a removed")
+    check(same(first(ui.widget(&"items")), b), "b now first")
+    check(ui.list_begin(&"items", 1) == 0, "action check")
+    check(ui.list_item(&"b", &"Dos", 99) == 1, "an item keeps its action")
+    check(ui.list_item(&"c", &"Tres", 13) == 0, "c")
+    check(ui.list_end() == 0, "end after refusal")
+    check(missing(ui.widget(&"b")), "b removed")
+    unsafe { check(gtk_widget_activate(ui.widget(&"c")) == 1, "activate c") }
+    check(ui.next() == 1013, "list click")
+
+    // Trees.
+    check(ui.tree_begin(&"items", 1) == 1, "a list root is not a tree")
+    check(ui.tree_begin(&"form", 5) == 0, "tree begin")
+    check(ui.tree_node(&"form", &"title", 1, &"Datos", 0, 0) == 0, "heading")
+    check(ui.tree_node(&"form", &"group", 7, &"", 0, 8) == 0, "row")
+    check(ui.tree_node(&"group", &"name", 5, &"Ana", 21, 0) == 0, "input")
+    check(ui.tree_node(&"group", &"save", 4, &"Guardar", 22, 0) == 0, "primary")
+    check(ui.tree_node(&"nowhere", &"x", 0, &"x", 0, 0) == 1, "unknown parent")
+    check(ui.tree_node(&"form", &"note", 0, &"Nota", 0, 0) == 0, "body")
+    check(ui.tree_end() == 0, "tree end")
+    name := ui.widget(&"name")
+    save := ui.widget(&"save")
+    check(ui.tree_begin(&"form", 4) == 0, "tree again")
+    check(ui.tree_node(&"form", &"group", 7, &"", 0, 8) == 0, "row first now")
+    check(ui.tree_node(&"group", &"save", 4, &"Guardar", 22, 0) == 0, "save before name")
+    check(ui.tree_node(&"group", &"name", 5, &"Bea", 21, 0) == 0, "input rewritten")
+    check(ui.tree_node(&"form", &"title", 1, &"Datos!", 0, 0) == 0, "heading renamed")
+    check(ui.tree_end() == 0, "tree end again")
+    check(same(ui.widget(&"name"), name) && same(ui.widget(&"save"), save), "identity kept")
+    check(missing(ui.widget(&"note")), "note removed")
+    check(same(first(ui.widget(&"group")), save), "save reordered first")
+    check(same(first(ui.widget(&"form")), ui.widget(&"group")), "group reordered first")
+    check(ui.tree_begin(&"form", 1) == 0, "kind check")
+    check(ui.tree_node(&"form", &"title", 0, &"x", 0, 0) == 1, "a key keeps its kind")
+    check(ui.tree_node(&"form", &"title", 1, &"Solo", 0, 0) == 0, "title only")
+    check(ui.tree_end() == 0, "collapse")
+    check(missing(ui.widget(&"group")) && missing(ui.widget(&"name")) && missing(ui.widget(&"save")), "nested group removed")
+
+    check(ui.request_close() == 0, "close")
+    // The model rewrite of "name" queued no edit before the close.
+    check(ui.next() == 2, "closed")
+    check(ui.release() == 0, "release")
+    print("regions ok")
+}
+
+fn open() native.Native {
+    match native.create(&"Regiones", &"Regiones en Tarn") {
+        Ok(value) => { return value }
+        Err(code) => { panic("create failed: " + string.from_i64(i64(code))) }
+    }
+}
