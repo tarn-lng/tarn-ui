@@ -25,7 +25,7 @@ fn main() {
                         session.Event.Increment => {
                             updates = updates + 1
                             if mode.eq(&"noop") { return Ok(value) }
-                            if mode.eq(&"error") { return Err(session.Error{code: 99}) }
+                            if mode.eq(&"error") { return Err(session.fail(99, "")) }
                             return counter.reduce(value, session.Event.Increment)
                         }
                         _ => { return Ok(value) }

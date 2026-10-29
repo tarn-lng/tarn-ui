@@ -12,6 +12,7 @@ mediante [`ui.fill` con permiso explícito](docs/devtools.md#uifill).
 [Controles nativos de formulario](docs/widgets.md): interruptor, casilla,
 deslizador, campo numérico y desplegable.
 [Bandeja, notificaciones y segundo plano](docs/tray.md) en Tarn puro sobre tarn-dbus (ABI 14).
+Los [errores](docs/errors.md) dicen qué operación falló, con qué clave y por qué.
 [Próximos pasos y recordatorio de memoria aplazado](docs/roadmap.md).
 Las páginas se desplazan verticalmente y el texto largo se ajusta al ancho; la
 [revisión de fase 5](docs/phase5-review.md) mide disposición, teclado, temas y contraste.

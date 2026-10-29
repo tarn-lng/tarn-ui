@@ -13,7 +13,7 @@ fn main() {
         }) {
             Ok(_) => { print("closed") }
             Err(error) => {
-                print(error.code)
+                print(error.message())
                 os.exit(1)
             }
         }

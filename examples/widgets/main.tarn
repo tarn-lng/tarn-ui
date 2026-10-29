@@ -151,7 +151,7 @@ fn run(ui &mut session.Session) Result<void, session.Error> {
             var value: i64 = 0
             match string.parse_i64(&text) {
                 Some(parsed) => { value = parsed }
-                None => { return Err(session.Error{code: 1}) }
+                None => { return Err(session.fail(1, "control value \"" + text + "\" is not a number")) }
             }
             if action == 1 { settings.notifications = value != 0
             } else if action == 2 { settings.dark = value != 0
@@ -162,7 +162,7 @@ fn run(ui &mut session.Session) Result<void, session.Error> {
             } else if action == 8 { settings.tab = value
             } else if action == 11 { settings.extras = value != 0
             } else if action == 12 { settings.level = value
-            } else { return Err(session.Error{code: 1}) }
+            } else { return Err(session.fail(1, "unknown action " + string.from_u64(u64(action)))) }
             return Ok(view(&settings))
         })
 }
@@ -172,7 +172,7 @@ fn main() {
         match session.run("Tarn UI · controles", "Controles nativos",
             fn(ui &mut session.Session) Result<void, session.Error> { return run(ui) }) {
             Ok(_) => { print("closed") }
-            Err(error) => { print(error.code)
+            Err(error) => { print(error.message())
                 os.exit(1) }
         }
     }

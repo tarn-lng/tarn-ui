@@ -130,7 +130,7 @@ fn main() {
                 match session.run("Tarn UI · bandeja", "Tarn en la bandeja",
                     fn(ui &mut session.Session) Result<void, session.Error> { return run(ui, &mut bus) }) {
                     Ok(_) => { print("closed") }
-                    Err(failure) => { print(failure.code) }
+                    Err(failure) => { print(failure.message()) }
                 }
             }
             bus.close()

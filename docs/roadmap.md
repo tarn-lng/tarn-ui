@@ -52,6 +52,7 @@ cambios de tipo o padre por clave y la virtualización siguen fuera de alcance.
 - Implementado: texto multilínea, barra de título y menú principal.
 - Implementado: controles, indicadores, marcos, desplegables y texto multilínea
   dentro de regiones dinámicas (las pestañas siguen siendo estáticas).
+- Implementado: [errores con contexto](errors.md): operación, clave y razón.
 - Implementado (ABI 14): [bandeja, notificaciones y segundo plano](tray.md) en
   Tarn puro sobre tarn-dbus, probado en un bus aislado y a mano en Plasma.
 

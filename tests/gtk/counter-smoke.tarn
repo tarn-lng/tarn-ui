@@ -11,11 +11,11 @@ fn next_increment(ui &mut session.Session) Result<void, session.Error> {
         match event {
             session.Event.Opened => {}
             session.Event.Increment => { return Ok(()) }
-            session.Event.Closed => { return Err(session.Error{code: 98}) }
+            session.Event.Closed => { return Err(session.fail(98, "")) }
         }
     }
 }
-fn fail() Result<void, session.Error> { return Err(session.Error{code: 99}) }
+fn fail() Result<void, session.Error> { return Err(session.fail(99, "")) }
 fn main() {
     var value: i64 = 0
     unsafe {
@@ -38,8 +38,8 @@ fn main() {
             event := try ui.next_event()
             match event {
                 session.Event.Closed => { return Ok(()) }
-                session.Event.Opened => { return Err(session.Error{code: 97}) }
-                session.Event.Increment => { return Err(session.Error{code: 97}) }
+                session.Event.Opened => { return Err(session.fail(97, "")) }
+                session.Event.Increment => { return Err(session.fail(97, "")) }
             }
         }) {
             Ok(_) => { print("PASS native activation and seven queued clicks: 0 -> 8") }

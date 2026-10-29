@@ -24,7 +24,7 @@ fn main() {
                             try ui.request_close()
                             return Ok(())
                         }
-                        if mode == 6 { return Err(session.Error{code: 99}) }
+                        if mode == 6 { return Err(session.fail(99, "")) }
                         if mode == 7 { try ui.request_close() } else {
                             try counter.increment(ui, &mut value)
                             if mode != 8 { try ui.complete_event() }

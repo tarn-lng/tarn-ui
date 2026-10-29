@@ -1,5 +1,6 @@
 // Owned descriptions: static pages plus scoped keyed dynamic list regions.
 import "core/session"
+import "string"
 
 pub struct Label { pub key string
     pub text string }
@@ -188,7 +189,7 @@ fn mount(ui &mut session.Session, parent &string, children &[]Node, depth u32) R
                 try ui.set_primary(value.key.clone(), true)
             }
             Node.Group(value) => {
-                if depth >= 12 { return Err(session.Error { code: 1 }) }
+                if depth >= 12 { return Err(session.fail(1, "mount \"" + value.key + "\": groups nest at most 12 deep")) }
                 try ui.add_box(parent.clone(), value.key.clone(), value.horizontal, value.spacing)
                 try mount(ui, &value.key, value.children.as_slice(), depth + 1)
             }
@@ -196,7 +197,7 @@ fn mount(ui &mut session.Session, parent &string, children &[]Node, depth u32) R
                 try ui.add_text_area(parent.clone(), value.key.clone(), value.text.clone(), value.action, value.lines)
             }
             Node.Section(value) => {
-                if depth >= 12 { return Err(session.Error { code: 1 }) }
+                if depth >= 12 { return Err(session.fail(1, "mount \"" + value.key + "\": containers nest at most 12 deep")) }
                 try ui.add_container(parent.clone(), value.key.clone(), value.kind, value.title.clone(), value.action, value.value)
                 try mount(ui, &value.key, value.children.as_slice(), depth + 1)
             }
@@ -211,51 +212,51 @@ pub fn Page.mount(&self, ui &mut session.Session) Result<void, session.Error> {
 }
 
 fn View.validate(&self) Result<void, session.Error> {
-    if self.regions.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.regions.len() > 256 { return Err(session.fail(1, "view: at most 256 regions")) }
     var region_keys: Vec<string> = Vec.new()
     for region in self.regions.as_slice() {
         try unique_key(&region.key, &mut region_keys)
         var keys: Vec<string> = Vec.new()
         try validate_nodes(region.children.as_slice(), 0, &mut keys)
     }
-    if self.route.is_empty() || self.texts.len() > 256 { return Err(session.Error { code: 1 }) }
-    if self.enabled.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.route.is_empty() || self.texts.len() > 256 { return Err(session.fail(1, "view: the route is empty or there are more than 256 texts")) }
+    if self.enabled.len() > 256 { return Err(session.fail(1, "view: at most 256 enabled states")) }
     var enabled_index: usize = 0
     for value in self.enabled.as_slice() {
-        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
+        if value.key.is_empty() { return Err(session.fail(1, "view: an enabled state has an empty key")) }
         var previous: usize = 0
         for previous < enabled_index {
-            if self.enabled.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
+            if self.enabled.as_slice()[previous].key.eq(&value.key) { return Err(session.fail(1, "view: duplicate enabled key \"" + value.key + "\"")) }
             previous = previous + 1
         }
         enabled_index = enabled_index + 1
     }
-    if self.inputs.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.inputs.len() > 256 { return Err(session.fail(1, "view: at most 256 inputs")) }
     var input_index: usize = 0
     for value in self.inputs.as_slice() {
-        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
+        if value.key.is_empty() { return Err(session.fail(1, "view: an input has an empty key")) }
         var previous: usize = 0
         for previous < input_index {
-            if self.inputs.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
+            if self.inputs.as_slice()[previous].key.eq(&value.key) { return Err(session.fail(1, "view: duplicate input key \"" + value.key + "\"")) }
             previous = previous + 1
         }
         input_index = input_index + 1
     }
-    if self.lists.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.lists.len() > 256 { return Err(session.fail(1, "view: at most 256 lists")) }
     var list_index: usize = 0
     for list in self.lists.as_slice() {
-        if list.key.is_empty() || list.items.len() > 256 { return Err(session.Error { code: 1 }) }
+        if list.key.is_empty() || list.items.len() > 256 { return Err(session.fail(1, "list \"" + list.key + "\": empty key or more than 256 items")) }
         var previous: usize = 0
         for previous < list_index {
-            if self.lists.as_slice()[previous].key.eq(&list.key) { return Err(session.Error { code: 1 }) }
+            if self.lists.as_slice()[previous].key.eq(&list.key) { return Err(session.fail(1, "view: duplicate list key \"" + list.key + "\"")) }
             previous = previous + 1
         }
         var item_index: usize = 0
         for item in list.items.as_slice() {
-            if item.key.is_empty() || item.action < 1 || item.action > 1024 { return Err(session.Error { code: 1 }) }
+            if item.key.is_empty() || item.action < 1 || item.action > 1024 { return Err(session.fail(1, "list \"" + list.key + "\": an item has an empty key or an action outside 1..1024")) }
             var before: usize = 0
             for before < item_index {
-                if list.items.as_slice()[before].key.eq(&item.key) { return Err(session.Error { code: 1 }) }
+                if list.items.as_slice()[before].key.eq(&item.key) { return Err(session.fail(1, "list \"" + list.key + "\": duplicate item key \"" + item.key + "\"")) }
                 before = before + 1
             }
             item_index = item_index + 1
@@ -264,10 +265,10 @@ fn View.validate(&self) Result<void, session.Error> {
     }
     var index: usize = 0
     for value in self.texts.as_slice() {
-        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
+        if value.key.is_empty() { return Err(session.fail(1, "view: a text has an empty key")) }
         var previous: usize = 0
         for previous < index {
-            if self.texts.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
+            if self.texts.as_slice()[previous].key.eq(&value.key) { return Err(session.fail(1, "view: duplicate text key \"" + value.key + "\"")) }
             previous = previous + 1
         }
         index = index + 1
@@ -388,13 +389,13 @@ fn View.reconcile_lists(&self, ui &mut session.Session) Result<void, session.Err
 }
 
 fn unique_key(key &string, keys &mut Vec<string>) Result<void, session.Error> {
-    if key.is_empty() || keys.len() >= 256 { return Err(session.Error { code: 1 }) }
-    for previous in keys.as_slice() { if previous.eq(key) { return Err(session.Error { code: 1 }) } }
+    if key.is_empty() || keys.len() >= 256 { return Err(session.fail(1, "region: empty key, or more than 256 nodes")) }
+    for previous in keys.as_slice() { if previous.eq(key) { return Err(session.fail(1, "region: duplicate key \"" + key + "\"")) } }
     keys.push(key.clone())
     return Ok(())
 }
 fn validate_action(action u32) Result<void, session.Error> {
-    if action < 1 || action > 1024 { return Err(session.Error { code: 1 }) }
+    if action < 1 || action > 1024 { return Err(session.fail(1, "region: action " + string.from_u64(u64(action)) + " is outside 1..1024")) }
     return Ok(())
 }
 fn validate_nodes(children &[]Node, depth u32, keys &mut Vec<string>) Result<void, session.Error> {
@@ -411,21 +412,21 @@ fn validate_nodes(children &[]Node, depth u32, keys &mut Vec<string>) Result<voi
                 try validate_action(value.action) }
             Node.Field(value) => { try unique_key(&value.key, keys)
                 try validate_action(value.action)
-                if value.label.is_empty() { return Err(session.Error { code: 1 }) } }
+                if value.label.is_empty() { return Err(session.fail(1, "region: field \"" + value.key + "\" needs an accessible label")) } }
             Node.Control(value) => { try unique_key(&value.key, keys)
                 // Indicators (5..7) carry no action.
-                if value.kind > 7 { return Err(session.Error { code: 1 }) }
+                if value.kind > 7 { return Err(session.fail(1, "region: control \"" + value.key + "\" has an unknown kind")) }
                 if value.kind <= 4 { try validate_action(value.action) } }
             // Tabs stay static-only; frames and expanders reconcile like groups.
             Node.Section(value) => {
-                if depth >= 12 || value.kind > 1 { return Err(session.Error { code: 1 }) }
+                if depth >= 12 || value.kind > 1 { return Err(session.fail(1, "region: \"" + value.key + "\" nests too deep, or tabs (only static pages have tabs)")) }
                 try unique_key(&value.key, keys)
                 try validate_nodes(value.children.as_slice(), depth + 1, keys)
             }
             Node.Area(value) => { try unique_key(&value.key, keys)
                 try validate_action(value.action) }
             Node.Group(value) => {
-                if depth >= 12 || value.spacing > 64 { return Err(session.Error { code: 1 }) }
+                if depth >= 12 || value.spacing > 64 { return Err(session.fail(1, "region: group \"" + value.key + "\" nests too deep or has spacing over 64")) }
                 try unique_key(&value.key, keys)
                 try validate_nodes(value.children.as_slice(), depth + 1, keys)
             }

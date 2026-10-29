@@ -36,10 +36,9 @@ pub enum Signal {
 pub struct Desktop { bus connection.Connection
     tray status_notifier.Tray }
 
-/// Converts a D-Bus failure into a UI error after reporting it.
+/// Converts a D-Bus failure into a UI error that keeps its name and text.
 pub fn ui_error(failure error.Error) session.Error {
-    print("desktop: " + failure.name + ": " + failure.message)
-    return session.Error{code: 40}
+    return session.fail(40, "desktop: " + failure.name + ": " + failure.message)
 }
 
 /// Connects to the session bus, publishes the tray item and subscribes to
