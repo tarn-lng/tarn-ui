@@ -1,0 +1,74 @@
+// GTK 4, GObject and GLib declarations used by the Tarn backend. No logic.
+// Every pointer is opaque; GObject instances are all `*mut Widget` because
+// the backend only passes them back to the functions that created them.
+// Link with: --link gtk-4 --link gobject-2.0 --link gio-2.0 --link glib-2.0
+
+pub struct Widget {}
+pub struct Queue {}
+
+// Enum values from the GTK 4 headers (checked against GTK 4.20).
+pub fn ROLE_HEADING() i32 { return 19 }
+pub fn PROPERTY_DESCRIPTION() i32 { return 1 }
+pub fn PROPERTY_LABEL() i32 { return 4 }
+pub fn PROPERTY_LEVEL() i32 { return 5 }
+pub fn TYPE_INT() usize { return 24 }
+pub fn TYPE_STRING() usize { return 64 }
+pub fn GVALUE_SIZE() usize { return 24 }
+pub fn WRAP_WORD_CHAR() i32 { return 2 }
+
+pub extern "C" fn gtk_init_check() i32
+pub extern "C" fn gtk_window_new() *mut Widget
+pub extern "C" fn gtk_window_set_title(window *mut Widget, title *u8) void
+pub extern "C" fn gtk_window_set_default_size(window *mut Widget, width i32, height i32) void
+pub extern "C" fn gtk_window_set_child(window *mut Widget, child *mut Widget) void
+pub extern "C" fn gtk_window_get_child(window *mut Widget) *mut Widget
+pub extern "C" fn gtk_window_present(window *mut Widget) void
+pub extern "C" fn gtk_window_close(window *mut Widget) void
+pub extern "C" fn gtk_window_destroy(window *mut Widget) void
+pub extern "C" fn gtk_window_get_toplevels() *mut Widget
+pub extern "C" fn gtk_widget_set_visible(widget *mut Widget, visible i32) void
+pub extern "C" fn gtk_widget_get_visible(widget *mut Widget) i32
+pub extern "C" fn gtk_widget_add_css_class(widget *mut Widget, name *u8) void
+pub extern "C" fn gtk_widget_set_margin_start(widget *mut Widget, margin i32) void
+pub extern "C" fn gtk_widget_set_margin_end(widget *mut Widget, margin i32) void
+pub extern "C" fn gtk_widget_set_margin_top(widget *mut Widget, margin i32) void
+pub extern "C" fn gtk_widget_set_margin_bottom(widget *mut Widget, margin i32) void
+pub extern "C" fn gtk_label_get_type() usize
+pub extern "C" fn gtk_label_new(text *u8) *mut Widget
+pub extern "C" fn gtk_label_set_text(label *mut Widget, text *u8) void
+pub extern "C" fn gtk_label_set_wrap(label *mut Widget, wrap i32) void
+pub extern "C" fn gtk_label_set_wrap_mode(label *mut Widget, mode i32) void
+pub extern "C" fn gtk_button_new_with_label(text *u8) *mut Widget
+pub extern "C" fn gtk_button_get_child(button *mut Widget) *mut Widget
+pub extern "C" fn gtk_box_new(orientation i32, spacing i32) *mut Widget
+pub extern "C" fn gtk_box_append(box *mut Widget, child *mut Widget) void
+pub extern "C" fn gtk_accessible_role_get_type() usize
+pub extern "C" fn gtk_accessible_update_property_value(accessible *mut Widget, count i32, properties *mut i32, values *mut u8) void
+
+pub extern "C" fn g_object_new_with_properties(gtype usize, count u32, names *mut usize, values *mut u8) *mut Widget
+pub extern "C" fn g_object_ref(object *mut Widget) *mut Widget
+pub extern "C" fn g_object_unref(object *mut Widget) void
+pub extern "C" fn g_object_set_data(object *mut Widget, key *u8, data *mut u8) void
+pub extern "C" fn g_object_get_data(object *mut Widget, key *u8) *mut u8
+pub extern "C" fn g_signal_connect_data(instance *mut Widget, signal *u8, handler *u8, data *mut u8, destroy *u8, flags i32) u64
+pub extern "C" fn g_signal_handler_disconnect(instance *mut Widget, id u64) void
+pub extern "C" fn g_value_init(value *mut u8, gtype usize) *mut u8
+pub extern "C" fn g_value_set_string(value *mut u8, text *u8) void
+pub extern "C" fn g_value_set_int(value *mut u8, number i32) void
+pub extern "C" fn g_value_set_enum(value *mut u8, number i32) void
+pub extern "C" fn g_value_unset(value *mut u8) void
+
+pub extern "C" fn g_malloc0(size usize) *mut u8
+pub extern "C" fn g_free(memory *mut u8) void
+pub extern "C" fn g_strdup(text *u8) *mut u8
+pub extern "C" fn g_utf8_validate(text *u8, length isize, end *mut u8) i32
+pub extern "C" fn g_queue_new() *mut Queue
+pub extern "C" fn g_queue_push_tail(queue *mut Queue, data *mut u8) void
+pub extern "C" fn g_queue_pop_head(queue *mut Queue) *mut u8
+pub extern "C" fn g_queue_get_length(queue *mut Queue) u32
+pub extern "C" fn g_queue_free(queue *mut Queue) void
+pub extern "C" fn g_list_model_get_n_items(model *mut Widget) u32
+pub extern "C" fn g_list_model_get_item(model *mut Widget, index u32) *mut Widget
+pub extern "C" fn g_main_context_iteration(context *mut u8, may_block i32) i32
+pub extern "C" fn getpid() i32
+pub extern "C" fn gettid() i32
