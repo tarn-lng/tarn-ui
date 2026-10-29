@@ -1,0 +1,1108 @@
+// Development-only automation channel (dev builds copy this file as
+// gtk/devtools.tarn; release builds copy devtools_off.tarn). Line-delimited
+// JSON over the Unix stream socket inherited as TARN_UI_DEV_FD: session.authorize,
+// ui.inspect, ui.click, ui.fill, ui.close, ui.screenshot and ui.diagnostics,
+// each allowed by TARN_UI_DEV_ALLOW. Same protocol as the former devtools.inc.
+import "ffi"
+import "os"
+import "json"
+import "string"
+import "crypto"
+import "encoding"
+import "collections"
+import "gtk/gtk"
+import "gtk/native"
+
+struct GString {}
+extern "C" fn recv(fd i32, buffer *mut u8, length usize, flags i32) isize
+extern "C" fn send(fd i32, buffer *u8, length usize, flags i32) isize
+extern "C" fn close(fd i32) i32
+extern "C" fn __errno_location() *mut i32
+extern "C" fn getsockname(fd i32, address *mut u8, length *mut u32) i32
+extern "C" fn getsockopt(fd i32, level i32, name i32, value *mut u8, length *mut u32) i32
+extern "C" fn getuid() u32
+// fcntl is variadic; its third argument is a plain int, passed in a register.
+extern "C" fn fcntl(fd i32, command i32, argument i32) i32
+extern "C" fn memchr(data *u8, byte i32, length usize) *u8
+extern "C" fn g_unix_fd_add(fd i32, condition u32, function *u8, data *mut u8) u32
+extern "C" fn g_timeout_add(interval u32, function *u8, data *mut u8) u32
+extern "C" fn g_source_remove(id u32) i32
+extern "C" fn g_uuid_string_random() *mut u8
+extern "C" fn g_get_monotonic_time() i64
+extern "C" fn g_string_new(text *u8) *mut GString
+extern "C" fn g_string_append_len(target *mut GString, text *u8, length isize) *mut GString
+extern "C" fn g_string_erase(target *mut GString, position isize, length isize) *mut GString
+extern "C" fn g_string_free(target *mut GString, free_segment i32) *mut u8
+extern "C" fn gtk_native_get_renderer(surface *mut gtk.Widget) *mut gtk.Widget
+extern "C" fn gtk_widget_paintable_new(widget *mut gtk.Widget) *mut gtk.Widget
+extern "C" fn gtk_snapshot_new() *mut gtk.Widget
+extern "C" fn gdk_paintable_snapshot(paintable *mut gtk.Widget, snapshot *mut gtk.Widget, width f64, height f64) void
+extern "C" fn gtk_snapshot_free_to_node(snapshot *mut gtk.Widget) *mut u8
+extern "C" fn gsk_render_node_unref(node *mut u8) void
+// viewport: graphene_rect_t, four f32 in caller-owned bytes.
+extern "C" fn gsk_renderer_render_texture(renderer *mut gtk.Widget, node *mut u8, viewport *mut u8) *mut gtk.Widget
+extern "C" fn gdk_texture_save_to_png_bytes(texture *mut gtk.Widget) *mut u8
+extern "C" fn gdk_texture_get_width(texture *mut gtk.Widget) i32
+extern "C" fn gdk_texture_get_height(texture *mut gtk.Widget) i32
+extern "C" fn g_bytes_get_data(bytes *mut u8, size *mut usize) *u8
+extern "C" fn g_bytes_unref(bytes *mut u8) void
+extern "C" fn gdk_frame_clock_get_frame_counter(clock *mut gtk.Widget) i64
+extern "C" fn gdk_frame_clock_request_phase(clock *mut gtk.Widget, phase u32) void
+
+const RECORD_LIMIT usize = 1048576
+const LINE_LIMIT u32 = 32
+const REQUEST_LIMIT usize = 1024
+const DEADLINE_US i64 = 2000000
+const DEPTH_LIMIT u32 = 32
+const MSG_NOSIGNAL i32 = 16384
+const EINTR i32 = 4
+const EAGAIN i32 = 11
+const IO_IN u32 = 1
+const IO_OUT u32 = 4
+const IO_ERR u32 = 8
+const IO_HUP u32 = 16
+const PHASE_AFTER_PAINT u32 = 64
+// Source callbacks cannot reach Tarn values: they write this GLib block.
+const TIMED_OUT usize = 0
+const FRAME_READY usize = 4
+const TIMER usize = 8
+const REVISION usize = 16
+const FRAME_REVISION usize = 24
+const BLOCK_SIZE usize = 32
+
+fn cell<T>(base *mut u8, offset usize) *mut T {
+    return ffi.from_address(ffi.address(base) + offset)
+}
+fn read_u32(block *mut u8, offset usize) u32 {
+    var value: *mut u32 = cell(block, offset)
+    unsafe { return ffi.read(value) }
+}
+fn write_u32(block *mut u8, offset usize, value u32) {
+    var target: *mut u32 = cell(block, offset)
+    unsafe { ffi.write(target, value) }
+}
+fn read_u64(block *mut u8, offset usize) u64 {
+    var value: *mut u64 = cell(block, offset)
+    unsafe { return ffi.read(value) }
+}
+fn write_u64(block *mut u8, offset usize, value u64) {
+    var target: *mut u64 = cell(block, offset)
+    unsafe { ffi.write(target, value) }
+}
+
+fn woken(fd i32, condition u32, block *mut u8) i32 { return 1 }
+fn timed_out(block *mut u8) i32 {
+    write_u32(block, TIMED_OUT, 1)
+    write_u32(block, TIMER, 0)
+    return 0
+}
+fn painted(clock *mut gtk.Widget, block *mut u8) void {
+    write_u32(block, FRAME_READY, 1)
+    write_u64(block, FRAME_REVISION, read_u64(block, REVISION))
+}
+
+fn errno() i32 {
+    unsafe { return ffi.read(__errno_location()) }
+}
+fn now() i64 {
+    unsafe { return g_get_monotonic_time() }
+}
+fn literal(text &string) ffi.CString { return ffi.CString.new(text).expect("literal with NUL") }
+fn read_text(text *u8) string {
+    if ffi.is_null(text) { return "" }
+    unsafe { return ffi.string_from_c(text).unwrap_or("") }
+}
+fn env_is(name &string, value &string) bool {
+    return match os.env(name) {
+        Ok(found) => found.unwrap_or("").eq(value)
+        Err(_) => false
+    }
+}
+fn env_text(name &string) Option<string> {
+    return match os.env(name) {
+        Ok(found) => found
+        Err(_) => None
+    }
+}
+fn gstring_text(target *mut GString) *u8 {
+    var text: *mut *u8 = cell(ffi.from_address(ffi.address(target)), 0)
+    unsafe { return ffi.read(text) }
+}
+fn gstring_len(target *mut GString) usize {
+    var length: *mut usize = cell(ffi.from_address(ffi.address(target)), 8)
+    unsafe { return ffi.read(length) }
+}
+
+pub struct Devtools {
+    on bool
+    fd i32
+    block *mut u8
+    reader u32
+    writer u32
+    input *mut GString
+    output *mut GString
+    lines u32
+    failed bool
+    ready bool
+    authorized bool
+    allow_text bool
+    allow_capture bool
+    closed bool
+    timed_out bool
+    terminal string
+    inspect bool
+    click bool
+    fill bool
+    close bool
+    screenshot bool
+    diagnostics bool
+    session_id string
+    pending_id string
+    close_id string
+    capture_id string
+    sequence u64
+    pending_token u64
+    deadline i64
+    request_ids collections.Set<string>
+    capture_clock *mut gtk.Widget
+    capture_handler u64
+    application_error i32
+}
+
+pub fn new() Devtools {
+    return Devtools {
+        on: false, fd: -1, block: ffi.null(), reader: 0, writer: 0, input: ffi.null(), output: ffi.null(),
+        lines: 0, failed: false, ready: false, authorized: false, allow_text: false, allow_capture: false,
+        closed: false, timed_out: false, terminal: "", inspect: false, click: false, fill: false,
+        close: false, screenshot: false, diagnostics: false, session_id: "", pending_id: "", close_id: "",
+        capture_id: "", sequence: 0, pending_token: 0, deadline: 0, request_ids: collections.Set.new(),
+        capture_clock: ffi.null(), capture_handler: 0, application_error: 0,
+    }
+}
+pub fn Devtools.active(&self) bool { return self.on }
+fn Devtools.revision(&self) u64 { return read_u64(self.block, REVISION) }
+fn Devtools.bump_revision(&mut self) { write_u64(self.block, REVISION, self.revision() + 1) }
+
+// ---- wire ----
+fn Devtools.flush(&mut self) bool {
+    for gstring_len(self.output) > 0 {
+        var sent: isize = 0
+        unsafe { sent = send(self.fd, gstring_text(self.output), gstring_len(self.output), MSG_NOSIGNAL) }
+        if sent > 0 {
+            unsafe { erased := g_string_erase(self.output, 0, sent) }
+        } else if sent < 0 && errno() == EINTR {
+            continue
+        } else if sent < 0 && errno() == EAGAIN {
+            return false
+        } else {
+            self.failed = true
+            return true
+        }
+    }
+    return true
+}
+fn Devtools.wire(&mut self, text &string) {
+    if text.len() + gstring_len(self.output) > 2 * RECORD_LIMIT {
+        self.failed = true
+        return
+    }
+    line := literal(&(text.clone() + "\n"))
+    unsafe { appended := g_string_append_len(self.output, line.as_ptr(), isize(line.len())) }
+    if !self.flush() && self.writer == 0 {
+        unsafe { self.writer = g_unix_fd_add(self.fd, IO_OUT | IO_ERR | IO_HUP, ffi.callback(woken), self.block) }
+    }
+}
+fn quoted(text &string) string {
+    var w = json.Writer.new()
+    w.string(text)
+    return w.finish()
+}
+// {"session_id", "revision"} plus `extra`, already encoded as `,"k":v...`.
+fn Devtools.result(&self, extra &string) string {
+    return "{\"session_id\":" + quoted(&self.session_id) + ",\"revision\":" + self.revision().to_string() + extra + "}"
+}
+fn Devtools.reply(&mut self, id &string, result &string, error &string) {
+    var record = "{\"version\":1,\"request_id\":"
+    if id.is_empty() { record = record + "null" } else { record = record + quoted(id) }
+    if error.is_empty() {
+        record = record + ",\"result\":" + result + "}"
+    } else {
+        var stage = "protocol"
+        if error.eq(&"UNAUTHORIZED") { stage = "authorization" }
+        if error.eq(&"CAPTURE_UNAVAILABLE") { stage = "capture" }
+        if error.eq(&"NATIVE_ERROR") && self.application_error != 0 { stage = "application" }
+        var details = "{}"
+        if self.application_error != 0 { details = "{\"application_code\":" + self.application_error.to_string() + "}" }
+        record = record + ",\"error\":{\"code\":" + quoted(error) + ",\"message\":" + quoted(error) +
+            ",\"stage\":" + quoted(&stage) + ",\"details\":" + details + "}}"
+    }
+    self.wire(&record)
+}
+fn Devtools.fail(&mut self, id &string, error &string) { self.reply(id, &"", error) }
+
+// Reads what the socket has; marks a terminal error past the limits.
+fn Devtools.read(&mut self) {
+    if self.reader == 0 { return }
+    var buffer: Vec<u8> = Vec.new()
+    var i: usize = 0
+    for i < 8192 {
+        buffer.push(0)
+        i = i + 1
+    }
+    var batch = 0
+    for batch < 8 {
+        var got: isize = 0
+        unsafe { got = recv(self.fd, ffi.vec_mut(&mut buffer), 8192, 0) }
+        if got > 0 {
+            unsafe {
+                appended := g_string_append_len(self.input, ffi.vec(&buffer), got)
+                var j: usize = 0
+                for j < usize(got) {
+                    if ffi.read(ffi.offset(ffi.vec(&buffer), j)) == 10 { self.lines = self.lines + 1 }
+                    j = j + 1
+                }
+            }
+            if self.lines > LINE_LIMIT { self.terminal = "QUEUE_FULL" }
+            if gstring_len(self.input) > RECORD_LIMIT { self.terminal = "INVALID_REQUEST" }
+            if !self.terminal.is_empty() {
+                self.stop_reading()
+                return
+            }
+            batch = batch + 1
+        } else if got < 0 && errno() == EINTR {
+            continue
+        } else if got < 0 && errno() == EAGAIN {
+            return
+        } else {
+            self.failed = true
+            self.stop_reading()
+            return
+        }
+    }
+}
+fn Devtools.stop_reading(&mut self) {
+    if self.reader != 0 {
+        unsafe { removed := g_source_remove(self.reader) }
+    }
+    self.reader = 0
+}
+fn Devtools.pop(&mut self) Option<Vec<u8>> {
+    if ffi.is_null(self.input) { return None }
+    length := gstring_len(self.input)
+    if length == 0 { return None }
+    unsafe {
+        start := gstring_text(self.input)
+        end := memchr(start, 10, length)
+        if ffi.is_null(end) { return None }
+        size := ffi.address(end) - ffi.address(start)
+        record := ffi.copy_bytes(start, size)
+        erased := g_string_erase(self.input, 0, isize(size + 1))
+        self.lines = self.lines - 1
+        return Some(record)
+    }
+}
+
+fn Devtools.remove_timer(&mut self) {
+    timer := read_u32(self.block, TIMER)
+    if timer != 0 {
+        unsafe { removed := g_source_remove(timer) }
+    }
+    write_u32(self.block, TIMER, 0)
+}
+fn Devtools.start_timer(&mut self) {
+    unsafe { write_u32(self.block, TIMER, g_timeout_add(2000, ffi.callback(timed_out), self.block)) }
+}
+fn Devtools.clear_pending(&mut self) {
+    self.remove_timer()
+    self.pending_id = ""
+    self.pending_token = 0
+}
+fn Devtools.clear_capture(&mut self) {
+    unsafe {
+        if self.capture_handler != 0 { gtk.g_signal_handler_disconnect(self.capture_clock, self.capture_handler) }
+        if !ffi.is_null(self.capture_clock) { gtk.g_object_unref(self.capture_clock) }
+    }
+    self.capture_handler = 0
+    self.capture_clock = ffi.null()
+    self.capture_id = ""
+}
+fn Devtools.free(&mut self) {
+    if !self.on { return }
+    self.stop_reading()
+    unsafe {
+        if self.writer != 0 { removed := g_source_remove(self.writer) }
+    }
+    self.writer = 0
+    self.clear_pending()
+    self.clear_capture()
+    unsafe {
+        closed := close(self.fd)
+        input := g_string_free(self.input, 1)
+        output := g_string_free(self.output, 1)
+        gtk.g_free(self.block)
+    }
+    self.input = ffi.null()
+    self.output = ffi.null()
+    self.block = ffi.null()
+    self.on = false
+    native.stat_add(native.test_stats(), native.STAT_DEV_CHANNELS, -1)
+}
+
+// ---- widget tree ----
+fn find_at(widget *mut gtk.Widget, id &string, fallback &string) *mut gtk.Widget {
+    name := native.widget_id(widget).unwrap_or(fallback.clone())
+    if name.eq(id) { return widget }
+    var index: u32 = 0
+    unsafe {
+        var child = gtk.gtk_widget_get_first_child(widget)
+        for !ffi.is_null(child) {
+            found := find_at(child, id, &(name.clone() + "/" + index.to_string()))
+            if !ffi.is_null(found) { return found }
+            index = index + 1
+            child = gtk.gtk_widget_get_next_sibling(child)
+        }
+    }
+    return ffi.null()
+}
+fn allocated(widget *mut gtk.Widget) bool {
+    unsafe {
+        if gtk.gtk_widget_is_visible(widget) == 0 { return true }
+        return gtk.gtk_widget_get_mapped(widget) != 0 && gtk.gtk_widget_get_width(widget) > 0 && gtk.gtk_widget_get_height(widget) > 0
+    }
+}
+fn ids_unique(widget *mut gtk.Widget, ids &mut collections.Set<string>) bool {
+    match native.widget_id(widget) {
+        Some(id) => {
+            if ids.contains(&id) { return false }
+            added := ids.insert(id)
+        }
+        None => {}
+    }
+    unsafe {
+        var child = gtk.gtk_widget_get_first_child(widget)
+        for !ffi.is_null(child) {
+            if !ids_unique(child, ids) { return false }
+            child = gtk.gtk_widget_get_next_sibling(child)
+        }
+    }
+    return true
+}
+fn field_text(w &mut json.Writer, key &string, value &Option<string>) {
+    w.key(key)
+    match value {
+        Some(text) => { w.string(text) }
+        None => { w.null() }
+    }
+}
+fn role_name(widget *mut gtk.Widget) string {
+    unsafe {
+        roles := gtk.g_type_class_ref(gtk.gtk_accessible_role_get_type())
+        role := gtk.g_enum_get_value(roles, gtk.gtk_accessible_get_accessible_role(widget))
+        var name = "unknown"
+        if !ffi.is_null(role) {
+            var nick: *mut *u8 = cell(role, 16)
+            name = read_text(ffi.read(nick))
+        }
+        gtk.g_type_class_unref(roles)
+        return name
+    }
+}
+fn data_text(widget *mut gtk.Widget, key &string) Option<string> {
+    name := literal(key)
+    unsafe {
+        data := gtk.g_object_get_data(widget, name.as_ptr())
+        if ffi.is_null(data) { return None }
+        return Some(read_text(data))
+    }
+}
+fn Devtools.widget(&self, ui &native.Native, w &mut json.Writer, widget *mut gtk.Widget, root *mut gtk.Widget,
+    fallback &string, parent &Option<string>, depth u32) {
+    id := native.widget_id(widget)
+    stable := id.is_some()
+    name := id.unwrap_or(fallback.clone())
+    w.begin_object()
+    w.field_string(&"id", &name)
+    w.field_bool(&"stable_id", stable)
+    field_text(w, &"parent_id", parent)
+    unsafe {
+        w.field_string(&"native_type", &read_text(gtk.g_type_name_from_instance(widget)))
+        w.field_string(&"type", &role_name(widget))
+        var text: Option<string> = None
+        if self.allow_text {
+            if native.is_a(widget, gtk.gtk_entry_get_type()) {
+                text = Some(read_text(gtk.gtk_editable_get_text(widget)))
+            } else if native.is_a(widget, gtk.gtk_text_view_get_type()) {
+                text = data_text(widget, &native.LAST_KEY)
+            } else if native.is_a(widget, gtk.gtk_label_get_type()) {
+                text = Some(read_text(gtk.gtk_label_get_text(widget)))
+            } else if native.is_a(widget, gtk.gtk_button_get_type()) {
+                label := gtk.gtk_button_get_label(widget)
+                if !ffi.is_null(label) { text = Some(read_text(label)) }
+            } else if native.is_a(widget, gtk.gtk_window_get_type()) {
+                text = Some(read_text(gtk.gtk_window_get_title(widget)))
+            }
+            match ui.widget_value(widget) {
+                Some(value) => { text = Some(value.to_string()) }
+                None => {}
+            }
+        }
+        field_text(w, &"text", &text)
+        w.field_bool(&"redacted", !self.allow_text)
+        label := data_text(widget, &"tarn-ui-a11y-label")
+        description := data_text(widget, &"tarn-ui-a11y-description")
+        if self.allow_text {
+            field_text(w, &"accessibility_label", &label)
+            field_text(w, &"accessibility_description", &description)
+        } else {
+            field_text(w, &"accessibility_label", &None)
+            field_text(w, &"accessibility_description", &None)
+        }
+        var reason = "native property getter unavailable"
+        if label.is_some() {
+            if self.allow_text { reason = "explicit adapter property; computed name unavailable" } else { reason = "text access denied" }
+        }
+        w.field_string(&"accessibility_label_reason", &reason)
+        w.field_bool(&"focusable", gtk.gtk_widget_get_focusable(widget) != 0)
+        w.field_bool(&"focused", gtk.gtk_window_get_focus(root) == widget)
+        w.key(&"style_classes")
+        w.begin_array()
+        classes := gtk.gtk_widget_get_css_classes(widget)
+        var k: usize = 0
+        for ffi.read(ffi.offset(classes, k)) != 0 {
+            var item: *u8 = ffi.from_address(ffi.read(ffi.offset(classes, k)))
+            w.string(&read_text(item))
+            k = k + 1
+        }
+        gtk.g_strfreev(classes)
+        w.end_array()
+        w.field_bool(&"enabled", gtk.gtk_widget_is_sensitive(widget) != 0)
+        visible := gtk.gtk_widget_is_visible(widget) != 0 && gtk.gtk_widget_get_mapped(widget) != 0
+        w.field_bool(&"visible", visible)
+        var rect = zeroed(16)
+        var bounded = false
+        if visible && gtk.gtk_widget_get_width(widget) > 0 {
+            bounded = gtk.gtk_widget_compute_bounds(widget, root, ffi.vec_mut(&mut rect)) != 0
+        }
+        if bounded {
+            var fields: *mut f32 = cell(ffi.vec_mut(&mut rect), 0)
+            w.key(&"bounds")
+            w.begin_object()
+            w.key(&"x")
+            ok_x := w.f64(f64(ffi.read(fields)))
+            w.key(&"y")
+            ok_y := w.f64(f64(ffi.read(ffi.offset(fields, 1))))
+            w.key(&"width")
+            ok_w := w.f64(f64(ffi.read(ffi.offset(fields, 2))))
+            w.key(&"height")
+            ok_h := w.f64(f64(ffi.read(ffi.offset(fields, 3))))
+            w.field_string(&"space", &"window")
+            w.field_string(&"units", &"logical-pixels")
+            w.field_i64(&"scale", i64(gtk.gtk_widget_get_scale_factor(widget)))
+            w.end_object()
+        } else {
+            w.key(&"bounds")
+            w.null()
+            w.field_string(&"bounds_reason", &"not allocated or not visible")
+        }
+        w.key(&"global_bounds")
+        w.null()
+        w.field_string(&"global_bounds_reason", &"desktop coordinates not requested")
+        first := gtk.gtk_widget_get_first_child(widget)
+        w.field_bool(&"children_truncated", depth >= DEPTH_LIMIT && !ffi.is_null(first))
+        w.key(&"children")
+        w.begin_array()
+        // Bound traversal independently of request size.
+        if depth < DEPTH_LIMIT {
+            var index: u32 = 0
+            var child = first
+            for !ffi.is_null(child) {
+                self.widget(ui, w, child, root, &(name.clone() + "/" + index.to_string()), &Some(name.clone()), depth + 1)
+                index = index + 1
+                child = gtk.gtk_widget_get_next_sibling(child)
+            }
+        }
+        w.end_array()
+    }
+    w.end_object()
+}
+fn zeroed(size usize) Vec<u8> {
+    var bytes: Vec<u8> = Vec.new()
+    var i: usize = 0
+    for i < size {
+        bytes.push(0)
+        i = i + 1
+    }
+    return bytes
+}
+
+// ---- requests ----
+fn text_of(object &json.Value, key &string) Option<string> {
+    value := try object.get(key)
+    return value.as_text()
+}
+fn is_integer(value &json.Value) bool {
+    return match value {
+        json.Value.Number(text) => !string.contains(text, &".") && !string.contains(text, &"e") && !string.contains(text, &"E") && string.parse_i64(text).is_some()
+        _ => false
+    }
+}
+fn members(object &json.Value) Vec<string> {
+    var keys: Vec<string> = Vec.new()
+    match object {
+        json.Value.Object(items) => {
+            for item in items { keys.push(item.key.clone()) }
+        }
+        _ => {}
+    }
+    return keys
+}
+// Every member is in `allowed`, a comma-separated list of names.
+fn only(object &json.Value, allowed &string) bool {
+    names := string.split(allowed, &",")
+    for key in members(object) {
+        var found = false
+        for name in &names {
+            if name.eq(&key) { found = true }
+        }
+        if !found { return false }
+    }
+    return true
+}
+// No object repeats a member name.
+fn unique_members(value &json.Value) bool {
+    match value {
+        json.Value.Object(items) => {
+            var seen: collections.Set<string> = collections.Set.new()
+            for item in items {
+                if seen.contains(&item.key) { return false }
+                added := seen.insert(item.key.clone())
+                if !unique_members(&item.value) { return false }
+            }
+        }
+        json.Value.List(items) => {
+            for item in items {
+                if !unique_members(item) { return false }
+            }
+        }
+        _ => {}
+    }
+    return true
+}
+// Rejects \u0000 escapes and nesting deeper than 64 before parsing.
+fn prescan(record &[]u8) bool {
+    var depth: u32 = 0
+    var quoted_text = false
+    var escaped = false
+    var i: usize = 0
+    for byte in record {
+        if quoted_text {
+            if escaped {
+                if byte == 117 && i + 4 < record.len() && record[i + 1] == 48 && record[i + 2] == 48 && record[i + 3] == 48 && record[i + 4] == 48 { return false }
+                escaped = false
+            } else if byte == 92 {
+                escaped = true
+            } else if byte == 34 {
+                quoted_text = false
+            }
+        } else if byte == 34 {
+            quoted_text = true
+        } else if byte == 123 || byte == 91 {
+            depth = depth + 1
+            if depth > 64 { return false }
+        } else if byte == 125 || byte == 93 {
+            if depth > 0 { depth = depth - 1 }
+        }
+        i = i + 1
+    }
+    return true
+}
+fn valid_id(id &string) bool {
+    if id.is_empty() || id.len() > 128 { return false }
+    for byte in id.bytes() {
+        alphanumeric := (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        if !alphanumeric && byte != 45 && byte != 95 { return false }
+    }
+    return true
+}
+fn chars(text &string) i64 {
+    value := literal(text)
+    unsafe { return gtk.g_utf8_strlen(value.as_ptr(), -1) }
+}
+
+fn Devtools.request(&mut self, ui &mut native.Native, record &Vec<u8>) {
+    var id = ""
+    error := self.handle(ui, record, &mut id)
+    if !error.is_empty() { self.fail(&id, &error) }
+}
+
+// Answers a request (or starts a pending one); returns an error code or "".
+// `id` receives the request id once it is known valid.
+fn Devtools.handle(&mut self, ui &mut native.Native, record &Vec<u8>, id &mut string) string {
+    invalid := "INVALID_REQUEST"
+    bytes := record.as_slice()
+    for byte in bytes {
+        if byte == 0 { return invalid }
+    }
+    if !prescan(bytes) { return invalid }
+    root := match json.parse_bytes(bytes) {
+        Ok(value) => value
+        Err(_) => { return invalid }
+    }
+    if !unique_members(&root) { return invalid }
+    match root {
+        json.Value.Object(_) => {}
+        _ => { return invalid }
+    }
+    request_id := text_of(&root, &"request_id").unwrap_or("")
+    if !valid_id(&request_id) { return invalid }
+    *id = request_id.clone()
+        if !only(&root, &"version,request_id,method,params") || members(&root).len() != 4 { return invalid }
+    version := root.get(&"version").expect("version")
+    if !is_integer(&version) { return invalid }
+    if version.as_i64().unwrap_or(0) != 1 { return "UNSUPPORTED_VERSION" }
+    method := match text_of(&root, &"method") {
+        Some(text) => text
+        None => { return invalid }
+    }
+    params := root.get(&"params").expect("params")
+    match params {
+        json.Value.Object(_) => {}
+        _ => { return invalid }
+    }
+    if self.request_ids.contains(&request_id) { return invalid }
+    if self.request_ids.len() >= REQUEST_LIMIT { return "QUEUE_FULL" }
+    added := self.request_ids.insert(request_id.clone())
+    if method.eq(&"session.authorize") {
+        if !only(&params, &"session_id") || members(&params).len() != 1 { return invalid }
+        if !text_of(&params, &"session_id").unwrap_or("").eq(&self.session_id) { return "UNAUTHORIZED" }
+        self.authorized = true
+        self.reply(&request_id, &self.result(&""), &"")
+        return ""
+    }
+    if !self.authorized { return "UNAUTHORIZED" }
+    inspect := method.eq(&"ui.inspect")
+    click := method.eq(&"ui.click")
+    closing := method.eq(&"ui.close")
+    fill := method.eq(&"ui.fill")
+    capture := method.eq(&"ui.screenshot")
+    diagnostics := method.eq(&"ui.diagnostics")
+    if !inspect && !click && !fill && !closing && !capture && !diagnostics { return "UNSUPPORTED_OPERATION" }
+    if (inspect && !self.inspect) || (click && !self.click) || (fill && !self.fill) || (closing && !self.close) ||
+        (capture && (!self.screenshot || !self.allow_capture)) || (diagnostics && !self.diagnostics) { return "UNAUTHORIZED" }
+    count := members(&params).len()
+    if capture {
+        if !only(&params, &"window_id,min_revision") || count < 1 || count > 2 { return invalid }
+    } else if fill {
+        if !only(&params, &"window_id,element_id,text") || count != 3 { return invalid }
+    } else if click {
+        if !only(&params, &"window_id,element_id") || count != 2 { return invalid }
+    } else {
+        if !only(&params, &"window_id") || count != 1 { return invalid }
+    }
+    window_id := match text_of(&params, &"window_id") {
+        Some(text) => text
+        None => { return invalid }
+    }
+    element_id := text_of(&params, &"element_id").unwrap_or("")
+    if (click || fill) && text_of(&params, &"element_id").is_none() { return invalid }
+    fill_text := text_of(&params, &"text").unwrap_or("")
+    if fill && (text_of(&params, &"text").is_none() || chars(&fill_text) > 4096) { return invalid }
+    if !window_id.eq(&"main") { return "NOT_FOUND" }
+    if ui.is_closed() || self.closed { return "WINDOW_CLOSED" }
+    window := ui.native_window()
+    unsafe {
+        // A window hidden in background mode can still be inspected (visible=false).
+        hidden := ui.is_background() && gtk.gtk_widget_get_visible(window) == 0
+        if !(inspect && hidden) && (gtk.gtk_widget_get_mapped(window) == 0 || gtk.gtk_widget_get_width(window) <= 0) { return "NOT_READY" }
+        if capture {
+            match params.get(&"min_revision") {
+                Some(minimum) => {
+                    if !is_integer(&minimum) || minimum.as_i64().unwrap_or(-1) < 0 { return invalid }
+                    if u64(minimum.as_i64().unwrap_or(0)) > self.revision() { return "NOT_READY" }
+                }
+                None => {}
+            }
+            clock := gtk.gtk_widget_get_frame_clock(window)
+            if ffi.is_null(clock) { return "CAPTURE_UNAVAILABLE" }
+            self.capture_id = request_id.clone()
+            self.capture_clock = gtk.g_object_ref(clock)
+            write_u32(self.block, FRAME_READY, 0)
+            self.deadline = now() + DEADLINE_US
+            name := literal(&"after-paint")
+            self.capture_handler = gtk.g_signal_connect_data(clock, name.as_ptr(), ffi.callback(painted), self.block, ffi.null(), 0)
+            self.start_timer()
+            gtk.gtk_widget_queue_draw(window)
+            gdk_frame_clock_request_phase(clock, PHASE_AFTER_PAINT)
+            return ""
+        }
+        if diagnostics {
+            extra := ",\"stage\":\"native\",\"backend\":\"gtk4\",\"abi\":" + native.abi().to_string() +
+                ",\"queued_events\":" + ui.queued_events().to_string() + ",\"queue_full\":" + bool_text(ui.queue_full()) +
+                ",\"mapped\":" + bool_text(gtk.gtk_widget_get_mapped(window) != 0)
+            self.reply(&request_id, &self.result(&extra), &"")
+            return ""
+        }
+        if inspect {
+            version := gtk.gtk_get_major_version().to_string() + "." + gtk.gtk_get_minor_version().to_string() + "." + gtk.gtk_get_micro_version().to_string()
+            var w = json.Writer.new()
+            self.widget(ui, &mut w, window, window, &"main", &None, 0)
+            extra := ",\"platform\":\"linux\",\"backend\":\"gtk4\",\"backend_version\":" + quoted(&version) +
+                ",\"window_id\":\"main\",\"root\":" + w.finish()
+            self.reply(&request_id, &self.result(&extra), &"")
+            return ""
+        }
+        if closing {
+            self.close_id = request_id.clone()
+            gtk.gtk_window_close(window)
+            return ""
+        }
+        var target = find_at(window, &element_id, &"main")
+        titlebar := ui.titlebar()
+        if ffi.is_null(target) && !ffi.is_null(titlebar) { target = find_at(titlebar, &element_id, &"main") }
+        if ffi.is_null(target) && click {
+            // A menu entry: activate its action by key, like choosing it.
+            if ui.queue_full() || ui.queued_events() >= 64 { return "QUEUE_FULL" }
+            self.begin_pending(ui, &request_id)
+            found := ui.activate_menu(&element_id)
+            ui.set_token(0)
+            if !found {
+                self.clear_pending()
+                return "NOT_FOUND"
+            }
+            self.start_timer()
+            return ""
+        }
+        if ffi.is_null(target) { return "NOT_FOUND" }
+        kind := ui.target_kind(target)
+        // Entries are single-line; reject rather than silently transforming input.
+        if fill && kind != native.TARGET_AREA {
+            if chars(&fill_text) > 256 || string.contains(&fill_text, &"\n") || string.contains(&fill_text, &"\r") { return invalid }
+        }
+        if kind == native.TARGET_INDICATOR { return "WRONG_ELEMENT_TYPE" }
+        if fill && kind != native.TARGET_ENTRY && kind != native.TARGET_AREA && kind != native.TARGET_CONTROL { return "WRONG_ELEMENT_TYPE" }
+        if !fill && kind != native.TARGET_BUTTON { return "WRONG_ELEMENT_TYPE" }
+        var value: i64 = 0
+        if fill && kind == native.TARGET_CONTROL {
+            value = match string.parse_i64(&fill_text) {
+                Some(parsed) => parsed
+                None => { return invalid }
+            }
+            if !ui.accepts(target, value) { return invalid }
+        }
+        if gtk.gtk_widget_is_sensitive(target) == 0 { return "DISABLED" }
+        if gtk.gtk_widget_is_visible(target) == 0 || gtk.gtk_widget_get_mapped(target) == 0 { return "HIDDEN" }
+        if fill && kind == native.TARGET_ENTRY && gtk.gtk_editable_get_editable(target) == 0 { return "DISABLED" }
+        if ui.queue_full() || ui.queued_events() >= 64 { return "QUEUE_FULL" }
+        self.begin_pending(ui, &request_id)
+        if fill && kind == native.TARGET_CONTROL {
+            ui.user_control(target, value)
+        } else if fill && kind == native.TARGET_AREA {
+            ui.user_area(target, &fill_text)
+        } else if fill {
+            ui.user_entry(target, &fill_text)
+        } else {
+            ui.user_click(target)
+        }
+        ui.set_token(0)
+        self.start_timer()
+    }
+    return ""
+}
+fn bool_text(value bool) string {
+    if value { return "true" }
+    return "false"
+}
+// Events queued until set_token(0) answer this request when Tarn completes them.
+fn Devtools.begin_pending(&mut self, ui &mut native.Native, id &string) {
+    self.pending_id = id.clone()
+    self.sequence = self.sequence + 1
+    self.pending_token = self.sequence
+    self.deadline = now() + DEADLINE_US
+    ui.set_token(self.pending_token)
+}
+
+fn Devtools.capture(&mut self, ui &native.Native) {
+    window := ui.native_window()
+    var error = "CAPTURE_UNAVAILABLE"
+    unsafe {
+        width := gtk.gtk_widget_get_width(window)
+        height := gtk.gtk_widget_get_height(window)
+        failing := env_is(&"TARN_UI_TEST_MODE", &"capture-failure")
+        renderer := gtk_native_get_renderer(window)
+        if !failing && gtk.gtk_widget_get_realized(window) != 0 && gtk.gtk_widget_get_mapped(window) != 0 &&
+            width > 0 && height > 0 && width <= 4096 && height <= 4096 && !ffi.is_null(renderer) {
+            paintable := gtk_widget_paintable_new(window)
+            snapshot := gtk_snapshot_new()
+            gdk_paintable_snapshot(paintable, snapshot, f64(width), f64(height))
+            node := gtk_snapshot_free_to_node(snapshot)
+            gtk.g_object_unref(paintable)
+            if !ffi.is_null(node) {
+                // Explicit viewport: the PNG covers exactly the window allocation.
+                var viewport = zeroed(16)
+                var rect: *mut f32 = cell(ffi.vec_mut(&mut viewport), 0)
+                ffi.write(ffi.offset_mut(rect, 2), f32(width))
+                ffi.write(ffi.offset_mut(rect, 3), f32(height))
+                texture := gsk_renderer_render_texture(renderer, node, ffi.vec_mut(&mut viewport))
+                if !ffi.is_null(texture) {
+                    png := gdk_texture_save_to_png_bytes(texture)
+                    if !ffi.is_null(png) {
+                        var size: usize = 0
+                        data := g_bytes_get_data(png, ffi.of_mut(&mut size))
+                        if size <= RECORD_LIMIT {
+                            bytes := ffi.copy_bytes(data, size)
+                            extra := ",\"format\":\"png\",\"width\":" + gdk_texture_get_width(texture).to_string() +
+                                ",\"height\":" + gdk_texture_get_height(texture).to_string() +
+                                ",\"frame_counter\":" + gdk_frame_clock_get_frame_counter(self.capture_clock).to_string() +
+                                ",\"coordinate_space\":\"window-content\",\"sha256\":" + quoted(&encoding.hex(&crypto.sha256(bytes.as_slice()))) +
+                                ",\"data_base64\":" + quoted(&encoding.base64_encode(bytes.as_slice()))
+                            id := self.capture_id.clone()
+                            self.reply(&id, &self.result(&extra), &"")
+                            error = ""
+                        }
+                        g_bytes_unref(png)
+                    }
+                    gtk.g_object_unref(texture)
+                }
+                gsk_render_node_unref(node)
+            }
+        }
+    }
+    if !error.is_empty() {
+        id := self.capture_id.clone()
+        self.fail(&id, &error)
+    }
+    self.clear_capture()
+}
+
+// ---- session hooks ----
+
+// After the first presentation (counter or pages). Without TARN_UI_DEV_FD only
+// the id check runs: 0 when ids are unique, 1 otherwise or on a bad channel.
+pub fn Devtools.start(&mut self, ui &native.Native) i32 {
+    if self.on { return 0 }
+    window := ui.native_window()
+    if env_is(&"TARN_UI_TEST_MODE", &"duplicate") && !ffi.is_null(ui.counter_button()) {
+        name := literal(&native.ID_KEY)
+        id := literal(&"counter")
+        unsafe { gtk.g_object_set_data_full(ui.counter_button(), name.as_ptr(), gtk.g_strdup(id.as_ptr()), ffi.callback(free_data)) }
+    }
+    var ids: collections.Set<string> = collections.Set.new()
+    unique := ids_unique(window, &mut ids)
+    fd_text := match env_text(&"TARN_UI_DEV_FD") {
+        Some(text) => text
+        None => {
+            // Explicit opt-in only.
+            if unique { return 0 }
+            return 1
+        }
+    }
+    parsed := string.parse_i64(&fd_text).unwrap_or(-1)
+    if parsed < 3 || parsed > 2147483647 { return 1 }
+    fd := i32(parsed)
+    var address = zeroed(128)
+    var length: u32 = 128
+    var peer = zeroed(12)
+    var peer_length: u32 = 12
+    var kind = zeroed(4)
+    var kind_length: u32 = 4
+    unsafe {
+        if getsockname(fd, ffi.vec_mut(&mut address), ffi.of_mut(&mut length)) != 0 { return 1 }
+        var family: *mut u16 = cell(ffi.vec_mut(&mut address), 0)
+        // AF_UNIX, SOL_SOCKET + SO_TYPE = SOCK_STREAM, SO_PEERCRED uid.
+        if ffi.read(family) != 1 { return 1 }
+        if getsockopt(fd, 1, 3, ffi.vec_mut(&mut kind), ffi.of_mut(&mut kind_length)) != 0 { return 1 }
+        var type_value: *mut i32 = cell(ffi.vec_mut(&mut kind), 0)
+        if ffi.read(type_value) != 1 { return 1 }
+        if getsockopt(fd, 1, 17, ffi.vec_mut(&mut peer), ffi.of_mut(&mut peer_length)) != 0 { return 1 }
+        var uid: *mut u32 = cell(ffi.vec_mut(&mut peer), 4)
+        if ffi.read(uid) != getuid() { return 1 }
+        self.block = gtk.g_malloc0(BLOCK_SIZE)
+        self.input = g_string_new(ffi.null())
+        self.output = g_string_new(ffi.null())
+        uuid := g_uuid_string_random()
+        self.session_id = read_text(uuid)
+        gtk.g_free(uuid)
+    }
+    self.fd = fd
+    self.on = true
+    native.stat_add(native.test_stats(), native.STAT_DEV_CHANNELS, 1)
+    self.allow_text = env_is(&"TARN_UI_DEV_TEXT", &"1")
+    self.allow_capture = env_is(&"TARN_UI_DEV_CAPTURE", &"1")
+    grants := env_text(&"TARN_UI_DEV_ALLOW").unwrap_or("")
+    if grants.is_empty() {
+        self.free()
+        return 1
+    }
+    var valid = unique
+    for part in string.split(&grants, &",") {
+        if part.eq(&"inspect") {
+            self.inspect = true
+        } else if part.eq(&"fill") {
+            self.fill = true
+        } else if part.eq(&"click") {
+            self.click = true
+        } else if part.eq(&"close") {
+            self.close = true
+        } else if part.eq(&"screenshot") {
+            self.screenshot = true
+        } else if part.eq(&"diagnostics") {
+            self.diagnostics = true
+        } else {
+            valid = false
+        }
+    }
+    unsafe {
+        // F_GETFL/F_SETFL O_NONBLOCK, F_SETFD FD_CLOEXEC.
+        flags := fcntl(fd, 3, 0)
+        if !valid || flags < 0 || fcntl(fd, 4, flags | 2048) < 0 || fcntl(fd, 2, 1) < 0 {
+            self.free()
+            return 1
+        }
+        self.reader = g_unix_fd_add(fd, IO_IN | IO_HUP | IO_ERR, ffi.callback(woken), self.block)
+    }
+    return 0
+}
+fn free_data(data *mut u8) void {
+    unsafe { gtk.g_free(data) }
+}
+
+// One step of channel work before the session blocks; true if it did
+// something and the caller should poll again.
+pub fn Devtools.pump(&mut self, ui &mut native.Native) bool {
+    if !self.on { return false }
+    self.read()
+    if self.writer != 0 && self.flush() {
+        unsafe { removed := g_source_remove(self.writer) }
+        self.writer = 0
+    }
+    if self.failed {
+        self.free()
+        return false
+    }
+    if !self.terminal.is_empty() {
+        terminal := self.terminal.clone()
+        self.fail(&"", &terminal)
+        self.free()
+        return false
+    }
+    window := ui.native_window()
+    if !self.ready {
+        unsafe {
+            if gtk.gtk_widget_get_mapped(window) == 0 || !allocated(window) { return false }
+        }
+        counter := ui.counter_label()
+        if !ffi.is_null(counter) && (!allocated(counter) || !allocated(ui.counter_button())) { return false }
+        page := ui.visible_page()
+        if !ffi.is_null(page) && !allocated(page) { return false }
+        self.wire(&("{\"session_id\":" + quoted(&self.session_id) + ",\"revision\":" + self.revision().to_string() +
+            ",\"version\":1,\"event\":\"ready\"}"))
+        self.ready = true
+        return true
+    }
+    if !self.pending_id.is_empty() {
+        if now() >= self.deadline || read_u32(self.block, TIMED_OUT) != 0 { self.timed_out = true }
+        if ui.is_closed() || self.timed_out {
+            id := self.pending_id.clone()
+            if ui.is_closed() { self.fail(&id, &"WINDOW_CLOSED") } else { self.fail(&id, &"TIMEOUT") }
+            self.clear_pending()
+            if self.timed_out {
+                self.free()
+                return false
+            }
+        } else {
+            return false
+        }
+    }
+    if !self.capture_id.is_empty() {
+        if !ui.is_closed() && env_is(&"TARN_UI_TEST_MODE", &"capture-close") {
+            unsafe { gtk.gtk_window_close(window) }
+        }
+        if ui.is_closed() || now() >= self.deadline {
+            id := self.capture_id.clone()
+            if ui.is_closed() { self.fail(&id, &"WINDOW_CLOSED") } else { self.fail(&id, &"CAPTURE_UNAVAILABLE") }
+            self.clear_capture()
+            self.remove_timer()
+            write_u32(self.block, TIMED_OUT, 0)
+            self.timed_out = false
+        } else if read_u32(self.block, FRAME_READY) != 0 {
+            if read_u64(self.block, FRAME_REVISION) != self.revision() {
+                write_u32(self.block, FRAME_READY, 0)
+                unsafe {
+                    gtk.gtk_widget_queue_draw(window)
+                    gdk_frame_clock_request_phase(self.capture_clock, PHASE_AFTER_PAINT)
+                }
+            } else {
+                self.capture(ui)
+                self.remove_timer()
+            }
+        } else {
+            return false
+        }
+        if !self.capture_id.is_empty() { return false }
+        return true
+    }
+    if gstring_len(self.output) > 0 || !self.close_id.is_empty() { return false }
+    record := match self.pop() {
+        Some(found) => found
+        None => { return false }
+    }
+    self.request(ui, &record)
+    return true
+}
+
+// After Tarn applied (status 0) or failed an event carrying `token`.
+pub fn Devtools.complete(&mut self, token u64, status i32) {
+    if !self.on { return }
+    if !self.pending_id.is_empty() && now() >= self.deadline {
+        id := self.pending_id.clone()
+        self.fail(&id, &"TIMEOUT")
+        self.free()
+        return
+    }
+    if status == 0 { self.bump_revision() }
+    if !self.pending_id.is_empty() && token == self.pending_token {
+        id := self.pending_id.clone()
+        if status == 0 { self.reply(&id, &self.result(&""), &"") } else { self.fail(&id, &"NATIVE_ERROR") }
+        self.clear_pending()
+    }
+}
+
+// Background mode: ui.close hid the window and the session lives on, so the
+// close request is answered with "hidden" instead of at disposal.
+pub fn Devtools.hidden(&mut self) {
+    if !self.on || self.close_id.is_empty() { return }
+    id := self.close_id.clone()
+    self.reply(&id, &self.result(&",\"hidden\":true"), &"")
+    self.close_id = ""
+}
+
+// After the native session finished; answers what is left and closes.
+pub fn Devtools.dispose(&mut self, ui &mut native.Native, window_closed bool, application_error i32) {
+    if !self.on { return }
+    self.application_error = application_error
+    if !self.pending_id.is_empty() {
+        id := self.pending_id.clone()
+        if window_closed { self.fail(&id, &"WINDOW_CLOSED") } else { self.fail(&id, &"NATIVE_ERROR") }
+        self.clear_pending()
+    }
+    self.closed = true
+    if !self.capture_id.is_empty() {
+        id := self.capture_id.clone()
+        self.fail(&id, &"WINDOW_CLOSED")
+        self.clear_capture()
+    }
+    if !self.close_id.is_empty() {
+        self.bump_revision()
+        id := self.close_id.clone()
+        self.reply(&id, &self.result(&",\"closed\":true"), &"")
+    }
+    for true {
+        record := match self.pop() {
+            Some(found) => found
+            None => { break }
+        }
+        self.request(ui, &record)
+    }
+    // A non-reading peer may lose replies at teardown; never invent success.
+    self.free()
+}

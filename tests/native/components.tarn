@@ -58,7 +58,7 @@ fn main() {
         g_object_weak_ref(ui.native_window(), ffi.callback(finalized), ffi.of_mut(&mut gone))
         check(gtk_widget_activate(go) == 1, "activate")
         click := ui.next()
-        check(click == 1007, "click event " + click.to_string())
+        check(click == 1007, "click event " + click.to_string() + " text " + ui.event_text().unwrap_or("?"))
         check(text_of(&ui).is_empty(), "click carries no text")
         typed := cstring(&"Ana María")
         gtk_editable_set_text(name, typed.as_ptr())

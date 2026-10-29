@@ -50,13 +50,30 @@ pasado a GTK debe vivir mientras GTK lo use.
 | G2 ✓ | páginas, etiquetas, botones, cajas, texto, entradas, `set_*`, foco, accesibilidad | `tests/native/components.tarn`: los mismos casos que `session-smoke`, más finalización de widgets |
 | G3 ✓ | listas y regiones (`list_*`, `tree_*`) | `tests/native/regions.tarn`: identidad, orden, reescritura y eliminación |
 | G4 ✓ | controles, indicadores, contenedores, texto multilínea, barra de título y menú | `tests/native/widgets.tarn`: eventos de usuario, escrituras sin evento, rangos, contenedores, cabecera, menú y sus nodos de región |
-| G5 | devtools (`ui.inspect`, `ui.fill`, `ui.click`, `ui.close`) en Tarn; json-glib o JSON propio | suites Python (widgets, navigation, reactive, devtools, tray) sin cambios |
+| G5 ✓ | devtools en Tarn (`gtk/devtools.tarn`, con `json` y `crypto` del stdlib) y `gtk/session.tarn` | suites Python (widgets, navigation, reactive, devtools, tray) sin cambios con `TARN_UI_BACKEND=tarn` |
 | G6 | `session.tarn` usa el backend Tarn por defecto; se borran `bridge.c`, `bridge.h`, `devtools.inc`, scripts de compilación de C | todas las suites + ASan sobre el binario Tarn |
 
 Desde G3 el backend usa constantes, `match` como expresión, comparación de
 punteros con `==`, `ffi.offset`/`ffi.vec_mut`, `unwrap`/`expect` y
 `to_string()` (ADR 0088–0090 del compilador). Necesita un `tarn` posterior a
 0.1.1: `TARN_BIN=../tarn/target/release/tarn scripts/test-native.sh`.
+
+G5 añade:
+
+- `gtk/session.tarn`: la API de `core/session.tarn` sobre `native` y
+  `devtools`. Con `TARN_UI_BACKEND=tarn`, `scripts/backend.sh` lo copia como
+  `core/session.tarn`, copia el backend a `gtk/` y enlaza GTK; sin la variable
+  se compila `bridge.c` como antes.
+- `gtk/devtools.tarn` en builds `--dev`, `gtk/devtools_off.tarn` (vacío) en
+  las demás: el binario de producción no contiene el canal. Sus fuentes GLib
+  (socket, temporizador, after-paint) solo marcan un bloque GLib propio; el
+  trabajo ocurre en `pump()`, que la sesión llama antes de bloquear.
+- Cada evento encolado lleva el token de la petición en curso, así
+  `complete_event` responde a la acción correcta, igual que en C.
+- `tests/native/hooks.c`: los hooks de prueba de los fixtures (`test_clean`,
+  contadores, `test_dev_*`) para el backend Tarn. Registra sus contadores como
+  qdata del tipo GObject; `native.tarn` los encuentra ahí y, sin hooks (una
+  app real), el puntero es nulo.
 
 Hasta G6 el bridge C sigue siendo el predeterminado y `session.tarn` no
 cambia. El backend Tarn se prueba por su cuenta con `scripts/test-native.sh`,

@@ -18,10 +18,9 @@ cp "$root/core/session.tarn" "$root/core/components.tarn" "$root/core/desktop.ta
 cp "$dbus"/src/*.tarn "$build/source/src/"
 cp "$dbus"/desktop/*.tarn "$build/source/desktop/"
 cp "$root/examples/tray/main.tarn" "$build/source/main.tarn"
-cc -std=c11 -Wall -Wextra -Werror -fPIC -shared "${flags[@]}" \
-    "$root/backends/linux/gtk/bridge.c" -o "$build/libtarn_ui_gtk.so" \
-    $(pkg-config --cflags --libs "${packages[@]}")
-if ! LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" --link tarn_ui_gtk --link glib-2.0 \
+source "$root/scripts/backend.sh"
+ui_backend "$build" "${flags[@]}"
+if ! LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" "${UI_LINKS[@]}" \
     -o "$build/tray" --json > "$build/compiler.jsonl"; then cat "$build/compiler.jsonl" >&2; exit 1; fi
 if rg -q '"severity":"warning"' "$build/compiler.jsonl"; then cat "$build/compiler.jsonl" >&2; exit 1; fi
 printf 'Built %s/tray\n' "$build"

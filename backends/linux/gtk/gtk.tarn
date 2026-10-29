@@ -185,6 +185,45 @@ pub extern "C" fn g_menu_model_get_n_items(model *mut Widget) i32
 pub extern "C" fn g_value_take_boxed(value *mut u8, boxed *mut u8) void
 pub extern "C" fn g_object_set_data_full(object *mut Widget, key *u8, data *mut u8, destroy *u8) void
 
+// G5: devtools introspection and simulated user input.
+pub const TYPE_OBJECT usize = 80
+pub extern "C" fn g_type_check_instance_is_a(instance *mut Widget, gtype usize) i32
+pub extern "C" fn g_type_name_from_instance(instance *mut Widget) *u8
+pub extern "C" fn gtk_button_get_type() usize
+pub extern "C" fn gtk_entry_get_type() usize
+pub extern "C" fn gtk_text_view_get_type() usize
+pub extern "C" fn gtk_window_get_type() usize
+pub extern "C" fn gtk_widget_get_focus_on_click(widget *mut Widget) i32
+pub extern "C" fn gtk_widget_get_mapped(widget *mut Widget) i32
+pub extern "C" fn gtk_widget_get_realized(widget *mut Widget) i32
+pub extern "C" fn gtk_widget_get_width(widget *mut Widget) i32
+pub extern "C" fn gtk_widget_get_height(widget *mut Widget) i32
+pub extern "C" fn gtk_widget_get_scale_factor(widget *mut Widget) i32
+// graphene_rect_t: four f32 (x, y, width, height) in caller-owned bytes.
+pub extern "C" fn gtk_widget_compute_bounds(widget *mut Widget, target *mut Widget, bounds *mut u8) i32
+pub extern "C" fn gtk_widget_get_css_classes(widget *mut Widget) *mut usize
+pub extern "C" fn gtk_widget_queue_draw(widget *mut Widget) void
+pub extern "C" fn gtk_widget_get_frame_clock(widget *mut Widget) *mut Widget
+pub extern "C" fn gtk_accessible_get_accessible_role(accessible *mut Widget) i32
+pub extern "C" fn gtk_editable_get_editable(editable *mut Widget) i32
+pub extern "C" fn gtk_editable_set_position(editable *mut Widget, position i32) void
+pub extern "C" fn gtk_get_major_version() u32
+pub extern "C" fn gtk_get_minor_version() u32
+pub extern "C" fn gtk_get_micro_version() u32
+pub extern "C" fn g_signal_lookup(name *u8, itype usize) u32
+pub extern "C" fn g_signal_emitv(values *mut u8, signal u32, detail u32, result *mut u8) void
+pub extern "C" fn g_value_set_object(value *mut u8, object *mut Widget) void
+pub extern "C" fn g_action_get_enabled(action *mut Widget) i32
+pub extern "C" fn g_action_activate(action *mut Widget, parameter *u8) void
+pub extern "C" fn g_type_class_ref(gtype usize) *mut u8
+pub extern "C" fn g_type_class_unref(class *mut u8) void
+// GEnumValue: i32 value, then name and nick pointers at bytes 8 and 16.
+pub extern "C" fn g_enum_get_value(class *mut u8, value i32) *mut u8
+pub extern "C" fn g_strfreev(strings *mut usize) void
+pub extern "C" fn g_quark_from_string(name *u8) u32
+pub extern "C" fn g_type_get_qdata(gtype usize, quark u32) *mut u8
+pub extern "C" fn g_object_weak_ref(object *mut Widget, notify *u8, data *mut u8) void
+
 pub extern "C" fn g_object_new_with_properties(gtype usize, count u32, names *mut usize, values *mut u8) *mut Widget
 pub extern "C" fn g_object_ref(object *mut Widget) *mut Widget
 pub extern "C" fn g_object_unref(object *mut Widget) void
