@@ -19,7 +19,7 @@ cp "$root/examples/navigation/main.tarn" "$build/source/main.tarn"
 cc -std=c11 -Wall -Wextra -Werror -fPIC -shared "${flags[@]}" \
     "$root/backends/linux/gtk/bridge.c" -o "$build/libtarn_ui_gtk.so" \
     $(pkg-config --cflags --libs "${packages[@]}")
-if ! LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" --link tarn_ui_gtk \
+if ! LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" --link tarn_ui_gtk --link glib-2.0 \
     -o "$build/navigation" --json > "$build/compiler.jsonl"; then cat "$build/compiler.jsonl" >&2; exit 1; fi
 if rg -q '"severity":"warning"' "$build/compiler.jsonl"; then cat "$build/compiler.jsonl" >&2; exit 1; fi
 {
@@ -29,6 +29,6 @@ if rg -q '"severity":"warning"' "$build/compiler.jsonl"; then cat "$build/compil
         "$root/examples/navigation/main.tarn" "$root/examples/navigation/tasks.tarn" "$root/backends/linux/gtk/bridge.c" "$root/backends/linux/gtk/bridge.h" \
         "$build/libtarn_ui_gtk.so"
     if [[ ${1:-} == --dev ]]; then sha256sum "$root/backends/linux/gtk/devtools.inc"; fi
-    printf 'ABI=12\nLD_LIBRARY_PATH=%s\n' "$build"
+    printf 'ABI=14\nLD_LIBRARY_PATH=%s\n' "$build"
 } > "$build/provenance.txt"
 printf 'Built %s/navigation\n' "$build"

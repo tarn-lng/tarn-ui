@@ -2,7 +2,7 @@ import "core/session"
 extern "C" fn test_clean() i32
 
 fn check(value bool) { if !value { panic("UI smoke failed") } }
-fn fail() Result<void, session.Error> { return Err(session.Error{code: 99}) }
+fn fail() Result<void, session.Error> { return Err(session.fail(99, "")) }
 fn main() {
     var opened: i64 = 0
     unsafe {
@@ -10,15 +10,24 @@ fn main() {
             closed_event := try ui.next_event()
             match closed_event {
                 session.Event.Opened => { opened = opened + 1 }
-                session.Event.Closed => { return Err(session.Error{code: 98}) }
-                session.Event.Increment => { return Err(session.Error{code: 97}) }
+                session.Event.Closed => { return Err(session.fail(98, "")) }
+                session.Event.Increment => { return Err(session.fail(97, "")) }
+            }
+            // A failed operation names itself, its key and the reason.
+            match ui.set_text("missing", "x") {
+                Ok(_) => { return Err(session.fail(96, "set_text on a missing key succeeded")) }
+                Err(failure) => {
+                    check(failure.code == 1)
+                    check(failure.message().eq(&("set_text \"missing\": " + failure.reason())))
+                    print(failure.message())
+                }
             }
             try ui.request_close()
             event := try ui.next_event()
             match event {
                 session.Event.Closed => { return Ok(()) }
-                session.Event.Opened => { return Err(session.Error{code: 97}) }
-                session.Event.Increment => { return Err(session.Error{code: 97}) }
+                session.Event.Opened => { return Err(session.fail(97, "")) }
+                session.Event.Increment => { return Err(session.fail(97, "")) }
             }
         }) {
             Ok(_) => { print("normal-close") }

@@ -1,0 +1,178 @@
+import "core/session"
+import "core/components"
+import "string"
+import "os"
+
+// Native form controls: the model lives in Tarn; each change arrives as text.
+struct Settings { notifications bool
+    dark bool
+    volume i64
+    copies i64
+    quality i64
+    details bool
+    tab i64
+    note string
+    extras bool
+    level i64 }
+
+fn page(settings &Settings) components.Page {
+    var children: Vec<components.Node> = Vec.new()
+    children.push(components.heading("settings-title", "Preferencias"))
+    children.push(components.switch("notify", "Notificaciones", settings.notifications, 1))
+    children.push(components.check("dark", "Usar tema oscuro", settings.dark, 2))
+    children.push(components.slider("volume", "Volumen", settings.volume, 0, 100, 3))
+    children.push(components.spin("copies", "Copias", settings.copies, 1, 99, 4))
+    var qualities: Vec<string> = Vec.new()
+    qualities.push("Baja")
+    qualities.push("Media")
+    qualities.push("Alta")
+    children.push(components.dropdown("quality", "Calidad", qualities.as_slice(), settings.quality, 5))
+    var meters: Vec<components.Node> = Vec.new()
+    meters.push(components.progress("volume-meter", "Nivel de volumen", settings.volume, 0, 100))
+    meters.push(components.level("copies-meter", "Copias en cola", settings.copies, 1, 99))
+    meters.push(components.spinner("syncing", "Sincronizando avisos", settings.notifications))
+    children.push(components.frame("meters", "Indicadores", meters))
+    var details: Vec<components.Node> = Vec.new()
+    details.push(components.label("details-text", "Los valores viven en el modelo de Tarn."))
+    children.push(components.expander("details", "Detalles", settings.details, 7, details))
+    var general: Vec<components.Node> = Vec.new()
+    general.push(components.label("general-text", "Ajustes generales"))
+    var about: Vec<components.Node> = Vec.new()
+    about.push(components.label("about-text", "Tarn UI con widgets GTK nativos"))
+    var pages: Vec<components.Node> = Vec.new()
+    pages.push(components.tab("tab-general", "General", general))
+    pages.push(components.tab("tab-about", "Acerca de", about))
+    children.push(components.tabs("sections", settings.tab, 8, pages))
+    children.push(components.text_area("note", settings.note.clone(), 4, 9))
+    children.push(components.label("note-count", note_count(&settings.note)))
+    children.push(components.label("summary", summary(settings)))
+    children.push(components.switch("extras-toggle", "Opciones avanzadas", settings.extras, 11))
+    var region: Vec<components.Node> = Vec.new()
+    children.push(components.column("extras", 6, region))
+    children.push(components.button("reset", "Restablecer", 6))
+    return components.Page{key: "settings", children: children}
+}
+
+fn note_count(note &string) string {
+    var lines: i64 = 1
+    for byte in note.bytes() { if byte == 10 { lines = lines + 1 } }
+    if note.is_empty() { lines = 0 }
+    return "Nota: " + string.from_i64(lines) + " líneas"
+}
+
+fn header() components.Header {
+    var buttons: Vec<components.HeaderButton> = Vec.new()
+    buttons.push(components.header_button("header-reset", "Restablecer", "edit-undo-symbolic", 6, false))
+    var menu: Vec<components.MenuItem> = Vec.new()
+    menu.push(components.menu_item("menu-reset", "Restablecer todo", 6))
+    menu.push(components.menu_item("menu-about", "Ir a «Acerca de»", 10))
+    return components.Header{subtitle: "Ajustes nativos", buttons: buttons, menu: menu}
+}
+
+fn on_off(value bool) string {
+    if value { return "sí" }
+    return "no"
+}
+
+fn summary(settings &Settings) string {
+    return "Notificaciones: " + on_off(settings.notifications) + " · oscuro: " + on_off(settings.dark) +
+        " · volumen " + string.from_i64(settings.volume) + " · copias " + string.from_i64(settings.copies) +
+        " · calidad " + string.from_i64(settings.quality)
+}
+
+fn bool_text(value bool) string {
+    if value { return "1" }
+    return "0"
+}
+
+// A dynamic region with controls, containers and multiline text: it mounts
+// when "Opciones avanzadas" is on and is removed, with its handlers, when off.
+fn extras(settings &Settings) components.Region {
+    var children: Vec<components.Node> = Vec.new()
+    if settings.extras {
+        var inner: Vec<components.Node> = Vec.new()
+        inner.push(components.spin("extras-level", "Nivel avanzado", settings.level, 1, 10, 12))
+        inner.push(components.progress("extras-meter", "Nivel actual", settings.level, 1, 10))
+        inner.push(components.text_area("extras-note", settings.note.clone(), 2, 9))
+        var more: Vec<components.Node> = Vec.new()
+        more.push(components.label("extras-more-text", "Nivel " + string.from_i64(settings.level)))
+        inner.push(components.expander("extras-more", "Más", settings.details, 7, more))
+        children.push(components.frame("extras-frame", "Avanzado", inner))
+    }
+    return components.Region{key: "extras", children: children}
+}
+
+fn view(settings &Settings) components.View {
+    var texts: Vec<components.Text> = Vec.new()
+    texts.push(components.Text{key: "summary", text: summary(settings)})
+    texts.push(components.Text{key: "note-count", text: note_count(&settings.note)})
+    var regions: Vec<components.Region> = Vec.new()
+    regions.push(extras(settings))
+    var inputs: Vec<components.Text> = Vec.new()
+    inputs.push(components.Text{key: "notify", text: bool_text(settings.notifications)})
+    inputs.push(components.Text{key: "dark", text: bool_text(settings.dark)})
+    inputs.push(components.Text{key: "volume", text: string.from_i64(settings.volume)})
+    inputs.push(components.Text{key: "copies", text: string.from_i64(settings.copies)})
+    inputs.push(components.Text{key: "quality", text: string.from_i64(settings.quality)})
+    inputs.push(components.Text{key: "volume-meter", text: string.from_i64(settings.volume)})
+    inputs.push(components.Text{key: "copies-meter", text: string.from_i64(settings.copies)})
+    inputs.push(components.Text{key: "syncing", text: bool_text(settings.notifications)})
+    inputs.push(components.Text{key: "details", text: bool_text(settings.details)})
+    inputs.push(components.Text{key: "sections", text: string.from_i64(settings.tab)})
+    inputs.push(components.Text{key: "note", text: settings.note.clone()})
+    inputs.push(components.Text{key: "extras-toggle", text: bool_text(settings.extras)})
+    return components.View{route: "settings", texts: texts, enabled: Vec.new(), inputs: inputs,
+        lists: Vec.new(), regions: regions}
+}
+
+fn defaults() Settings {
+    return Settings{notifications: true, dark: false, volume: 40, copies: 1, quality: 1, details: false, tab: 0, note: "", extras: false, level: 3}
+}
+
+fn run(ui &mut session.Session) Result<void, session.Error> {
+    var settings = defaults()
+    try page(&settings).mount(ui)
+    // Header buttons are keyed components, so the header mounts after a page.
+    try header().mount(ui)
+    return components.drive_input(ui, view(&settings),
+        fn(action u32, text string) Result<components.View, session.Error> {
+            if action == 6 {
+                settings = defaults()
+                return Ok(view(&settings))
+            }
+            if action == 9 {
+                settings.note = text
+                return Ok(view(&settings))
+            }
+            if action == 10 {
+                settings.tab = 1
+                return Ok(view(&settings))
+            }
+            var value: i64 = 0
+            match string.parse_i64(&text) {
+                Some(parsed) => { value = parsed }
+                None => { return Err(session.fail(1, "control value \"" + text + "\" is not a number")) }
+            }
+            if action == 1 { settings.notifications = value != 0
+            } else if action == 2 { settings.dark = value != 0
+            } else if action == 3 { settings.volume = value
+            } else if action == 4 { settings.copies = value
+            } else if action == 5 { settings.quality = value
+            } else if action == 7 { settings.details = value != 0
+            } else if action == 8 { settings.tab = value
+            } else if action == 11 { settings.extras = value != 0
+            } else if action == 12 { settings.level = value
+            } else { return Err(session.fail(1, "unknown action " + string.from_u64(u64(action)))) }
+            return Ok(view(&settings))
+        })
+}
+
+fn main() {
+    unsafe {
+        match session.run("Tarn UI · controles", "Controles nativos", run) {
+            Ok(_) => { print("closed") }
+            Err(error) => { print(error.message())
+                os.exit(1) }
+        }
+    }
+}

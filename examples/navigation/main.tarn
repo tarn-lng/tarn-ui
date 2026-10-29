@@ -97,7 +97,7 @@ fn run(ui &mut session.Session) Result<void, session.Error> {
     return components.drive_input(ui, view(value, navigator.current(), &form, &list),
         fn(action u32, text string) Result<components.View, session.Error> {
             if action == 1 {
-                if value == 9223372036854775807 { return Err(session.Error{code: 9}) }
+                if value == 9223372036854775807 { return Err(session.fail(9, "the counter is at its maximum")) }
                 value = value + 1
             } else if action == 2 {
                 try navigator.push("details")
@@ -112,17 +112,16 @@ fn run(ui &mut session.Session) Result<void, session.Error> {
             } else if action == 7 { try navigator.push("tasks")
             } else if action == 13 { navigator.back()
             } else if action >= 8 { list.reduce(action, &text)
-            } else { return Err(session.Error{code: 1}) }
+            } else { return Err(session.fail(1, "unknown action " + string.from_u64(u64(action)))) }
             return Ok(view(value, navigator.current(), &form, &list))
         })
 }
 
 fn main() {
     unsafe {
-        match session.run("Tarn UI · navegación", "Mi contador",
-            fn(ui &mut session.Session) Result<void, session.Error> { return run(ui) }) {
+        match session.run("Tarn UI · navegación", "Mi contador", run) {
             Ok(_) => { print("closed") }
-            Err(error) => { print(error.code)
+            Err(error) => { print(error.message())
                 os.exit(1) }
         }
     }

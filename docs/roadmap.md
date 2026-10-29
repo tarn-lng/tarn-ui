@@ -44,6 +44,18 @@ usa páginas de topología fija con [regiones de listas dinámicas](dynamic-list
 las [regiones mixtas](dynamic-regions.md) añaden subárboles condicionales. Los
 cambios de tipo o padre por clave y la virtualización siguen fuera de alcance.
 
+## Widgets nativos y escritorio
+
+- Implementado (ABI 13): [controles de formulario](widgets.md) en páginas estáticas.
+- Implementado: indicadores de progreso, nivel y actividad.
+- Implementado: contenedores (marco, desplegable y pestañas).
+- Implementado: texto multilínea, barra de título y menú principal.
+- Implementado: controles, indicadores, marcos, desplegables y texto multilínea
+  dentro de regiones dinámicas (las pestañas siguen siendo estáticas).
+- Implementado: [errores con contexto](errors.md): operación, clave y razón.
+- Implementado (ABI 14): [bandeja, notificaciones y segundo plano](tray.md) en
+  Tarn puro sobre tarn-dbus, probado en un bus aislado y a mano en Plasma.
+
 ## Recordatorio aplazado: Mesa/EGL
 
 Retomar cuando el usuario lo solicite o al planificar el endurecimiento de una

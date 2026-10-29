@@ -1,0 +1,140 @@
+import "core/session"
+import "core/components"
+import "core/desktop"
+import "desktop/dbusmenu"
+import "desktop/notifications"
+import "src/error"
+import "string"
+import "os"
+
+// A window that lives in the tray: closing it hides it, the icon shows or
+// hides it, and the menu offers Show, a quiet toggle and Quit. "Avisar"
+// sends a notification whose "Abrir" action brings the window back.
+struct App { quiet bool
+    sent u32
+    told_hidden bool
+    quit bool }
+
+fn tray(app &App) desktop.TrayView {
+    var items: Vec<dbusmenu.Item> = Vec.new()
+    items.push(dbusmenu.entry(1, &"Mostrar").with_icon(&"window-new"))
+    items.push(dbusmenu.checkbox(2, &"No molestar", app.quiet))
+    items.push(dbusmenu.separator(3))
+    items.push(dbusmenu.entry(4, &"Salir").with_icon(&"application-exit"))
+    return desktop.TrayView{icon: "applications-development", title: "Tarn UI", tooltip: summary(app),
+        attention: false, items: items}
+}
+
+fn summary(app &App) string {
+    var text = "Avisos enviados: " + string.from_u64(u64(app.sent))
+    if app.quiet { text = text + " · no molestar" }
+    return text
+}
+
+fn page(app &App) components.Page {
+    var children: Vec<components.Node> = Vec.new()
+    children.push(components.heading("tray-title", "Tarn en la bandeja"))
+    children.push(components.label("help", "Cierra la ventana: la app sigue en la bandeja."))
+    children.push(components.label("summary", summary(app)))
+    children.push(components.button("notify", "Avisar", 1))
+    children.push(components.button("hide", "Ocultar", 2))
+    children.push(components.button("quit", "Salir", 3))
+    return components.Page{key: "tray", children: children}
+}
+
+fn dbus(failure error.Error) session.Error { return desktop.ui_error(failure) }
+
+fn send(desk &mut desktop.Desktop, app &mut App, title &string, body &string) Result<void, session.Error> {
+    if app.quiet { return Ok(()) }
+    item := notifications.Notification.new(&"Tarn UI", title).with_body(body)
+        .with_icon(&"applications-development").with_action(&"default", &"Abrir").with_action(&"open", &"Abrir")
+    match desk.notify(&item) {
+        Ok(_) => { app.sent = app.sent + 1 }
+        Err(failure) => { return Err(dbus(failure)) }
+    }
+    return Ok(())
+}
+
+fn show(ui &mut session.Session) Result<void, session.Error> { return ui.present() }
+
+fn toggle(ui &mut session.Session) Result<void, session.Error> {
+    if try ui.is_visible() { return ui.hide() }
+    return ui.present()
+}
+
+fn on_signal(ui &mut session.Session, app &mut App, signal desktop.Signal) Result<void, session.Error> {
+    match signal {
+        desktop.Signal.Activate => { try toggle(ui) }
+        desktop.Signal.Menu(id) => {
+            if id == 1 { try show(ui) }
+            if id == 2 { app.quiet = !app.quiet }
+            if id == 4 { app.quit = true }
+        }
+        desktop.Signal.Notification(_) => { try show(ui) }
+        // Without a host the window is the only way back: stop hiding it.
+        desktop.Signal.TrayGone => {
+            try ui.set_background(false)
+            try show(ui)
+        }
+        desktop.Signal.TrayShown => { try ui.set_background(true) }
+    }
+    return Ok(())
+}
+
+fn run(ui &mut session.Session, desk &mut desktop.Desktop) Result<void, session.Error> {
+    var app = App{quiet: false, sent: 0, told_hidden: false, quit: false}
+    try page(&app).mount(ui)
+    try ui.show_page("tray")
+    // Fallback: with no tray host, closing the window ends the app as usual.
+    try ui.set_background(desk.has_tray())
+    try ui.watch_fd(desk.fd())
+    for !app.quit {
+        match try ui.next_action() {
+            session.Action.Closed => { return Ok(()) }
+            session.Action.Opened => {}
+            session.Action.Wake => {}
+            session.Action.Hidden => {
+                if !app.told_hidden {
+                    app.told_hidden = true
+                    try send(desk, &mut app, &"Sigo en la bandeja", &"Usa el icono para volver a abrir la ventana.")
+                }
+            }
+            session.Action.Activate(action) => {
+                if action == 1 { try send(desk, &mut app, &"Hola desde Tarn UI", &"Pulsa Abrir para traer la ventana.") }
+                if action == 2 { try ui.hide() }
+                if action == 3 { app.quit = true }
+                try ui.complete_event()
+            }
+        }
+        signals := try desk.poll().map_err(dbus)
+        for signal in signals { try on_signal(ui, &mut app, signal) }
+        try ui.set_text("summary", summary(&app))
+        try desk.apply(&tray(&app)).map_err(dbus)
+    }
+    return ui.request_close()
+}
+
+fn main() {
+    var desk: Option<desktop.Desktop> = None
+    match desktop.connect(&"tarn-ui-tray", &tray(&App{quiet: false, sent: 0, told_hidden: false, quit: false})) {
+        Ok(connected) => { desk = Some(connected) }
+        Err(failure) => {
+            print("No session bus: " + failure.message)
+            os.exit(1)
+        }
+    }
+    match desk {
+        Some(d) => {
+            var bus = d
+            unsafe {
+                match session.run("Tarn UI · bandeja", "Tarn en la bandeja",
+                    fn(ui &mut session.Session) Result<void, session.Error> { return run(ui, &mut bus) }) {
+                    Ok(_) => { print("closed") }
+                    Err(failure) => { print(failure.message()) }
+                }
+            }
+            bus.close()
+        }
+        None => {}
+    }
+}

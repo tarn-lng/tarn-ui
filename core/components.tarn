@@ -1,5 +1,6 @@
 // Owned descriptions: static pages plus scoped keyed dynamic list regions.
 import "core/session"
+import "string"
 
 pub struct Label { pub key string
     pub text string }
@@ -13,7 +14,45 @@ pub enum Node { Text(Label)
     Primary(Button)
     Group(Container)
     Input(Button)
-    Field(Field) }
+    Field(Field)
+    Control(Control)
+    Section(Section)
+    Area(Area) }
+// Multiline text; `lines` (2..20) sets the visible height.
+pub struct Area { pub key string
+    pub text string
+    pub action u32
+    pub lines u32 }
+// The window's header bar: buttons at the start or end and a main menu.
+pub struct HeaderButton { pub key string
+    pub text string
+    pub icon string
+    pub action u32
+    pub end bool }
+pub struct MenuItem { pub key string
+    pub text string
+    pub action u32 }
+pub struct Header { pub subtitle string
+    pub buttons Vec<HeaderButton>
+    pub menu Vec<MenuItem> }
+// Container: kind frame=0, expander=1, tabs=2, tab=3. Expander value is 0/1
+// (open); tabs value is the selected index and its children must be tabs.
+// With action 0 the user's changes are not reported.
+pub struct Section { pub key string
+    pub kind u32
+    pub title string
+    pub action u32
+    pub value i64
+    pub children Vec<Node> }
+// Form control: kind switch=0, check=1, scale=2, spin=3, dropdown=4; display-only
+// indicators progress=5, level=6, spinner=7 use action 0. For a dropdown, `text` lists newline-separated options after the caption line.
+pub struct Control { pub key string
+    pub kind u32
+    pub text string
+    pub action u32
+    pub value i64
+    pub min i64
+    pub max i64 }
 pub struct Field { pub key string
     pub text string
     pub action u32
@@ -50,6 +89,73 @@ pub fn input(key string, text string, action u32) Node {
 pub fn field(key string, text string, action u32, accessible_label string, description string) Node {
     return Node.Field(Field { key: key, text: text, action: action, label: accessible_label, description: description })
 }
+pub fn switch(key string, caption string, on bool, action u32) Node {
+    var value: i64 = 0
+    if on { value = 1 }
+    return Node.Control(Control { key: key, kind: 0, text: caption, action: action, value: value, min: 0, max: 1 })
+}
+pub fn check(key string, caption string, on bool, action u32) Node {
+    var value: i64 = 0
+    if on { value = 1 }
+    return Node.Control(Control { key: key, kind: 1, text: caption, action: action, value: value, min: 0, max: 1 })
+}
+pub fn slider(key string, caption string, value i64, min i64, max i64, action u32) Node {
+    return Node.Control(Control { key: key, kind: 2, text: caption, action: action, value: value, min: min, max: max })
+}
+pub fn spin(key string, caption string, value i64, min i64, max i64, action u32) Node {
+    return Node.Control(Control { key: key, kind: 3, text: caption, action: action, value: value, min: min, max: max })
+}
+// Caption and options are joined with newlines; the selected index is the value.
+pub fn dropdown(key string, caption string, options &[]string, selected i64, action u32) Node {
+    var text = caption
+    for option in options { text = text + "\n" + option.clone() }
+    return Node.Control(Control { key: key, kind: 4, text: text, action: action, value: selected, min: 0, max: 0 })
+}
+// Indicators: the model owns the value and updates it through View.inputs
+// like any control; the user cannot change them.
+pub fn progress(key string, caption string, value i64, min i64, max i64) Node {
+    return Node.Control(Control { key: key, kind: 5, text: caption, action: 0, value: value, min: min, max: max })
+}
+pub fn level(key string, caption string, value i64, min i64, max i64) Node {
+    return Node.Control(Control { key: key, kind: 6, text: caption, action: 0, value: value, min: min, max: max })
+}
+// A busy indicator; GTK draws nothing while it is stopped.
+pub fn spinner(key string, caption string, spinning bool) Node {
+    var value: i64 = 0
+    if spinning { value = 1 }
+    return Node.Control(Control { key: key, kind: 7, text: caption, action: 0, value: value, min: 0, max: 1 })
+}
+pub fn frame(key string, title string, children Vec<Node>) Node {
+    return Node.Section(Section { key: key, kind: 0, title: title, action: 0, value: 0, children: children })
+}
+pub fn expander(key string, title string, open bool, action u32, children Vec<Node>) Node {
+    var value: i64 = 0
+    if open { value = 1 }
+    return Node.Section(Section { key: key, kind: 1, title: title, action: action, value: value, children: children })
+}
+pub fn tabs(key string, selected i64, action u32, children Vec<Node>) Node {
+    return Node.Section(Section { key: key, kind: 2, title: "", action: action, value: selected, children: children })
+}
+pub fn tab(key string, title string, children Vec<Node>) Node {
+    return Node.Section(Section { key: key, kind: 3, title: title, action: 0, value: 0, children: children })
+}
+pub fn text_area(key string, text string, lines u32, action u32) Node {
+    return Node.Area(Area { key: key, text: text, action: action, lines: lines })
+}
+pub fn header_button(key string, text string, icon string, action u32, end bool) HeaderButton {
+    return HeaderButton { key: key, text: text, icon: icon, action: action, end: end }
+}
+pub fn menu_item(key string, text string, action u32) MenuItem {
+    return MenuItem { key: key, text: text, action: action }
+}
+pub fn Header.mount(&self, ui &mut session.Session) Result<void, session.Error> {
+    try ui.set_header(self.subtitle.clone())
+    for item in self.buttons.as_slice() {
+        try ui.add_header_button(item.key.clone(), item.text.clone(), item.icon.clone(), item.action, item.end)
+    }
+    for item in self.menu.as_slice() { try ui.add_menu_item(item.key.clone(), item.text.clone(), item.action) }
+    return Ok(())
+}
 pub fn heading(key string, text string) Node { return Node.Heading(Label { key: key, text: text }) }
 pub fn number(key string, text string) Node { return Node.Value(Label { key: key, text: text }) }
 pub fn primary_button(key string, text string, action u32) Node {
@@ -70,6 +176,10 @@ fn mount(ui &mut session.Session, parent &string, children &[]Node, depth u32) R
                 try ui.set_accessible(value.key.clone(), value.label.clone(), value.description.clone())
             }
             Node.Input(value) => { try ui.add_entry(parent.clone(), value.key.clone(), value.text.clone(), value.action) }
+            Node.Control(value) => {
+                try ui.add_control(parent.clone(), value.key.clone(), value.kind, value.text.clone(), value.action,
+                    value.value, value.min, value.max)
+            }
             Node.Text(value) => { try ui.add_label(parent.clone(), value.key.clone(), value.text.clone()) }
             Node.Press(value) => { try ui.add_button(parent.clone(), value.key.clone(), value.text.clone(), value.action) }
             Node.Heading(value) => { try ui.add_text(parent.clone(), value.key.clone(), value.text.clone(), 1) }
@@ -79,8 +189,16 @@ fn mount(ui &mut session.Session, parent &string, children &[]Node, depth u32) R
                 try ui.set_primary(value.key.clone(), true)
             }
             Node.Group(value) => {
-                if depth >= 12 { return Err(session.Error { code: 1 }) }
+                if depth >= 12 { return Err(session.fail(1, "mount \"" + value.key + "\": groups nest at most 12 deep")) }
                 try ui.add_box(parent.clone(), value.key.clone(), value.horizontal, value.spacing)
+                try mount(ui, &value.key, value.children.as_slice(), depth + 1)
+            }
+            Node.Area(value) => {
+                try ui.add_text_area(parent.clone(), value.key.clone(), value.text.clone(), value.action, value.lines)
+            }
+            Node.Section(value) => {
+                if depth >= 12 { return Err(session.fail(1, "mount \"" + value.key + "\": containers nest at most 12 deep")) }
+                try ui.add_container(parent.clone(), value.key.clone(), value.kind, value.title.clone(), value.action, value.value)
                 try mount(ui, &value.key, value.children.as_slice(), depth + 1)
             }
         }
@@ -94,51 +212,51 @@ pub fn Page.mount(&self, ui &mut session.Session) Result<void, session.Error> {
 }
 
 fn View.validate(&self) Result<void, session.Error> {
-    if self.regions.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.regions.len() > 256 { return Err(session.fail(1, "view: at most 256 regions")) }
     var region_keys: Vec<string> = Vec.new()
     for region in self.regions.as_slice() {
         try unique_key(&region.key, &mut region_keys)
         var keys: Vec<string> = Vec.new()
         try validate_nodes(region.children.as_slice(), 0, &mut keys)
     }
-    if self.route.is_empty() || self.texts.len() > 256 { return Err(session.Error { code: 1 }) }
-    if self.enabled.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.route.is_empty() || self.texts.len() > 256 { return Err(session.fail(1, "view: the route is empty or there are more than 256 texts")) }
+    if self.enabled.len() > 256 { return Err(session.fail(1, "view: at most 256 enabled states")) }
     var enabled_index: usize = 0
     for value in self.enabled.as_slice() {
-        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
+        if value.key.is_empty() { return Err(session.fail(1, "view: an enabled state has an empty key")) }
         var previous: usize = 0
         for previous < enabled_index {
-            if self.enabled.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
+            if self.enabled.as_slice()[previous].key.eq(&value.key) { return Err(session.fail(1, "view: duplicate enabled key \"" + value.key + "\"")) }
             previous = previous + 1
         }
         enabled_index = enabled_index + 1
     }
-    if self.inputs.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.inputs.len() > 256 { return Err(session.fail(1, "view: at most 256 inputs")) }
     var input_index: usize = 0
     for value in self.inputs.as_slice() {
-        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
+        if value.key.is_empty() { return Err(session.fail(1, "view: an input has an empty key")) }
         var previous: usize = 0
         for previous < input_index {
-            if self.inputs.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
+            if self.inputs.as_slice()[previous].key.eq(&value.key) { return Err(session.fail(1, "view: duplicate input key \"" + value.key + "\"")) }
             previous = previous + 1
         }
         input_index = input_index + 1
     }
-    if self.lists.len() > 256 { return Err(session.Error { code: 1 }) }
+    if self.lists.len() > 256 { return Err(session.fail(1, "view: at most 256 lists")) }
     var list_index: usize = 0
     for list in self.lists.as_slice() {
-        if list.key.is_empty() || list.items.len() > 256 { return Err(session.Error { code: 1 }) }
+        if list.key.is_empty() || list.items.len() > 256 { return Err(session.fail(1, "list \"" + list.key + "\": empty key or more than 256 items")) }
         var previous: usize = 0
         for previous < list_index {
-            if self.lists.as_slice()[previous].key.eq(&list.key) { return Err(session.Error { code: 1 }) }
+            if self.lists.as_slice()[previous].key.eq(&list.key) { return Err(session.fail(1, "view: duplicate list key \"" + list.key + "\"")) }
             previous = previous + 1
         }
         var item_index: usize = 0
         for item in list.items.as_slice() {
-            if item.key.is_empty() || item.action < 1 || item.action > 1024 { return Err(session.Error { code: 1 }) }
+            if item.key.is_empty() || item.action < 1 || item.action > 1024 { return Err(session.fail(1, "list \"" + list.key + "\": an item has an empty key or an action outside 1..1024")) }
             var before: usize = 0
             for before < item_index {
-                if list.items.as_slice()[before].key.eq(&item.key) { return Err(session.Error { code: 1 }) }
+                if list.items.as_slice()[before].key.eq(&item.key) { return Err(session.fail(1, "list \"" + list.key + "\": duplicate item key \"" + item.key + "\"")) }
                 before = before + 1
             }
             item_index = item_index + 1
@@ -147,10 +265,10 @@ fn View.validate(&self) Result<void, session.Error> {
     }
     var index: usize = 0
     for value in self.texts.as_slice() {
-        if value.key.is_empty() { return Err(session.Error { code: 1 }) }
+        if value.key.is_empty() { return Err(session.fail(1, "view: a text has an empty key")) }
         var previous: usize = 0
         for previous < index {
-            if self.texts.as_slice()[previous].key.eq(&value.key) { return Err(session.Error { code: 1 }) }
+            if self.texts.as_slice()[previous].key.eq(&value.key) { return Err(session.fail(1, "view: duplicate text key \"" + value.key + "\"")) }
             previous = previous + 1
         }
         index = index + 1
@@ -215,6 +333,8 @@ pub fn drive(ui &mut session.Session, initial View,
         match event {
             session.Action.Closed => { return Ok(()) }
             session.Action.Opened => {}
+            session.Action.Hidden => {}
+            session.Action.Wake => {}
             session.Action.Activate(action) => {
                 next := try update(action)
                 try next.update(&shown, ui)
@@ -235,6 +355,8 @@ pub fn drive_input(ui &mut session.Session, initial View,
         match event {
             session.Action.Closed => { return Ok(()) }
             session.Action.Opened => {}
+            session.Action.Hidden => {}
+            session.Action.Wake => {}
             session.Action.Activate(action) => {
                 text := try ui.event_text()
                 next := try update(action, text)
@@ -267,13 +389,13 @@ fn View.reconcile_lists(&self, ui &mut session.Session) Result<void, session.Err
 }
 
 fn unique_key(key &string, keys &mut Vec<string>) Result<void, session.Error> {
-    if key.is_empty() || keys.len() >= 256 { return Err(session.Error { code: 1 }) }
-    for previous in keys.as_slice() { if previous.eq(key) { return Err(session.Error { code: 1 }) } }
+    if key.is_empty() || keys.len() >= 256 { return Err(session.fail(1, "region: empty key, or more than 256 nodes")) }
+    for previous in keys.as_slice() { if previous.eq(key) { return Err(session.fail(1, "region: duplicate key \"" + key + "\"")) } }
     keys.push(key.clone())
     return Ok(())
 }
 fn validate_action(action u32) Result<void, session.Error> {
-    if action < 1 || action > 1024 { return Err(session.Error { code: 1 }) }
+    if action < 1 || action > 1024 { return Err(session.fail(1, "region: action " + string.from_u64(u64(action)) + " is outside 1..1024")) }
     return Ok(())
 }
 fn validate_nodes(children &[]Node, depth u32, keys &mut Vec<string>) Result<void, session.Error> {
@@ -290,9 +412,21 @@ fn validate_nodes(children &[]Node, depth u32, keys &mut Vec<string>) Result<voi
                 try validate_action(value.action) }
             Node.Field(value) => { try unique_key(&value.key, keys)
                 try validate_action(value.action)
-                if value.label.is_empty() { return Err(session.Error { code: 1 }) } }
+                if value.label.is_empty() { return Err(session.fail(1, "region: field \"" + value.key + "\" needs an accessible label")) } }
+            Node.Control(value) => { try unique_key(&value.key, keys)
+                // Indicators (5..7) carry no action.
+                if value.kind > 7 { return Err(session.fail(1, "region: control \"" + value.key + "\" has an unknown kind")) }
+                if value.kind <= 4 { try validate_action(value.action) } }
+            // Tabs stay static-only; frames and expanders reconcile like groups.
+            Node.Section(value) => {
+                if depth >= 12 || value.kind > 1 { return Err(session.fail(1, "region: \"" + value.key + "\" nests too deep, or tabs (only static pages have tabs)")) }
+                try unique_key(&value.key, keys)
+                try validate_nodes(value.children.as_slice(), depth + 1, keys)
+            }
+            Node.Area(value) => { try unique_key(&value.key, keys)
+                try validate_action(value.action) }
             Node.Group(value) => {
-                if depth >= 12 || value.spacing > 64 { return Err(session.Error { code: 1 }) }
+                if depth >= 12 || value.spacing > 64 { return Err(session.fail(1, "region: group \"" + value.key + "\" nests too deep or has spacing over 64")) }
                 try unique_key(&value.key, keys)
                 try validate_nodes(value.children.as_slice(), depth + 1, keys)
             }
@@ -309,6 +443,16 @@ fn tree_nodes(ui &mut session.Session, parent &string, children &[]Node) Result<
             Node.Press(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 3, value.text.clone(), value.action, 0) }
             Node.Primary(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 4, value.text.clone(), value.action, 0) }
             Node.Input(value) => { try ui.tree_node(parent.clone(), value.key.clone(), 5, value.text.clone(), value.action, 0) }
+            // Form controls mount only in static pages for now.
+            Node.Control(value) => {
+                try ui.tree_control(parent.clone(), value.key.clone(), value.kind, value.text.clone(), value.action,
+                    value.value, value.min, value.max)
+            }
+            Node.Section(value) => {
+                try ui.tree_container(parent.clone(), value.key.clone(), value.kind, value.title.clone(), value.action, value.value)
+                try tree_nodes(ui, &value.key, value.children.as_slice())
+            }
+            Node.Area(value) => { try ui.tree_text_area(parent.clone(), value.key.clone(), value.text.clone(), value.action, value.lines) }
             Node.Field(value) => {
                 try ui.tree_node(parent.clone(), value.key.clone(), 5, value.text.clone(), value.action, 0)
                 try ui.set_accessible(value.key.clone(), value.label.clone(), value.description.clone())

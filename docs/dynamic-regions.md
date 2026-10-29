@@ -3,7 +3,7 @@
 `View.regions` amplía las regiones dinámicas a etiquetas, encabezados, valores,
 botones, campos de texto, filas y columnas anidadas. Las páginas siguen montadas
 una sola vez; cada región ocupa una caja estática inicialmente vacía.
-La ABI vigente es **12**: recompilar aplicación y biblioteca juntas.
+La ABI vigente es **14**: recompilar aplicación y biblioteca juntas.
 
 La demo incluye **Abrir mi lista → Mostrar u ocultar opciones**. Al abrir monta
 un encabezado, un campo de nota accesible, una vista previa y una fila de botones.

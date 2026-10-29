@@ -24,7 +24,7 @@ cc -std=c11 -Wall -Wextra -Werror -g -fPIC -shared -DTARN_UI_TESTING -DTARN_UI_D
     "$root/backends/linux/gtk/bridge.c" -o "$build/libtarn_ui_gtk.so" \
     $(pkg-config --cflags --libs gtk4 json-glib-1.0)
 cp "$root/tests/navigation/views.tarn" "$build/source/views.tarn"
-if ! LIBRARY_PATH="$build" "$compiler" build "$build/source/views.tarn" --link tarn_ui_gtk \
+if ! LIBRARY_PATH="$build" "$compiler" build "$build/source/views.tarn" --link tarn_ui_gtk --link glib-2.0 \
     -o "$build/views" --json > "$build/views.compiler.jsonl"; then cat "$build/views.compiler.jsonl" >&2; exit 1; fi
 if rg -q '"severity":"warning"' "$build/views.compiler.jsonl"; then cat "$build/views.compiler.jsonl" >&2; exit 1; fi
 cc -std=c11 -Wall -Wextra -Werror -g -DTARN_UI_TESTING \

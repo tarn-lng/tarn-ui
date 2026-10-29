@@ -17,7 +17,7 @@ for name in state app example; do
         cp "$root/tests/reactive/$name.tarn" "$build/source/$name.tarn"
     fi
     LIBRARY_PATH="$build" "$compiler" build "$build/source/$name.tarn" \
-        --link tarn_ui_gtk -o "$build/$name" --json > "$build/$name.compiler.jsonl"
+        --link tarn_ui_gtk --link glib-2.0 -o "$build/$name" --json > "$build/$name.compiler.jsonl"
     if rg -q '"severity":"warning"' "$build/$name.compiler.jsonl"; then
         cat "$build/$name.compiler.jsonl" >&2; exit 1
     fi
