@@ -13,6 +13,6 @@ cc -std=c11 -Wall -Wextra -Werror -g -fPIC -shared \
     -DTARN_UI_DEVTOOLS -DTARN_UI_TESTING "$root/backends/linux/gtk/bridge.c" \
     -o "$build/libtarn_ui_gtk.so" $(pkg-config --cflags --libs gtk4 json-glib-1.0)
 LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" \
-    --link tarn_ui_gtk -o "$build/counter" --json > "$build/compiler.jsonl"
+    --link tarn_ui_gtk --link glib-2.0 -o "$build/counter" --json > "$build/compiler.jsonl"
 [[ ${1:-} != --build-only ]] || exit 0
 exec python3 "$root/tests/devtools/test_protocol.py"

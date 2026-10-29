@@ -24,7 +24,7 @@ cc -std=c11 -Wall -Wextra -Werror -fPIC -shared "${flags[@]}" \
     "$root/backends/linux/gtk/bridge.c" -o "$build/libtarn_ui_gtk.so" \
     $(pkg-config --cflags --libs "${packages[@]}")
 LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" \
-    --link tarn_ui_gtk -o "$build/counter" --json > "$build/compiler.jsonl"
+    --link tarn_ui_gtk --link glib-2.0 -o "$build/counter" --json > "$build/compiler.jsonl"
 {
     cc --version | head -n 1
     "$compiler" --version
@@ -34,7 +34,7 @@ LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" \
         "$compiler" "$build/libtarn_ui_gtk.so"
     sha256sum "$root/examples/counter/counter.tarn" "$root/examples/counter/main.tarn"
     if [[ ${1:-} == --dev ]]; then sha256sum "$root/backends/linux/gtk/devtools.inc"; fi
-    printf 'ABI=12\nLIBRARY_PATH=%s\nLD_LIBRARY_PATH=%s\n' "$build" "$build"
+    printf 'ABI=14\nLIBRARY_PATH=%s\nLD_LIBRARY_PATH=%s\n' "$build" "$build"
 } > "$build/provenance.txt"
 printf 'Built %s\n' "$build/counter"
 if [[ ${1:-} == --dev ]]; then

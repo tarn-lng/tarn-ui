@@ -20,4 +20,5 @@ uint32_t test_counter_updates(void);
 uint32_t test_heading_updates(void);
 uint32_t test_component_text_calls(void);
 uint32_t test_page_calls(void);
+uint32_t test_pending_events(void);
 #endif

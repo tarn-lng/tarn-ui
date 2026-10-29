@@ -13,6 +13,7 @@ typedef struct {
     GtkWindow *window; /* explicit ref in addition to GTK's toplevel ref */
     gulong close_handler, map_handler;
     gboolean opened, closed, delivered_closed;
+    gboolean background, hidden, woken; /* hide-on-close mode; coalesced wake from fd watches */
     GtkWidget *heading, *counter_label, *button; /* borrowed from the window's child tree */
     GtkWidget *pages;
     GHashTable *components; /* per-session borrowed widgets; the native tree owns them */
@@ -22,6 +23,7 @@ typedef struct {
     gboolean list_focus_removed;
     unsigned list_expected;
     gboolean tree_mode;
+    GtkWidget *forced_parent; /* region reconciliation reuses the static creators */
     GHashTable *tree_last;
     gboolean pages_presented;
     gulong click_handler;
@@ -38,6 +40,18 @@ typedef struct {
 } Session;
 
 static Session *active;
+/* Form controls, defined after the core component registry. */
+static gboolean is_control(GtkWidget *widget);
+static gboolean is_indicator(GtkWidget *widget);
+static void text_changed(GtkTextBuffer *buffer, gpointer data);
+static char *text_view_text(GtkWidget *view);
+static void text_view_write(GtkWidget *view, Session *s, const char *text);
+static void control_enqueue(GtkWidget *widget, Session *s);
+static void control_disconnect(GtkWidget *widget, Session *s, unsigned *count);
+static int32_t control_write(GtkWidget *widget, Session *s, int64_t value);
+static gboolean control_accepts(GtkWidget *widget, int64_t value);
+static int64_t control_value(GtkWidget *widget);
+static gboolean parse_value(const char *text, int64_t *out);
 static gboolean main_thread(void) { return syscall(SYS_gettid) == getpid(); }
 
 /* Long valid text must wrap at any character instead of widening the window. */
@@ -70,6 +84,8 @@ static int dev_start(Session *s);
 static gboolean dev_pump(Session *s);
 static void dev_complete(Session *s, int32_t status);
 static void dev_dispose(Session *s, gboolean window_closed);
+static void dev_hidden(Session *s);
+static gboolean menu_activate_key(Session *s, const char *key);
 #define UI_ID(widget, id) g_object_set_data(G_OBJECT(widget), "tarn-ui-id", (gpointer)(id))
 #else
 #define UI_ID(widget, id) ((void)0)
@@ -89,7 +105,7 @@ static void finalized(gpointer data, GObject *object) {
 #define FAIL_AT(stage) FALSE
 #endif
 
-uint32_t tarn_ui_gtk_abi(void) { return 12; }
+uint32_t tarn_ui_gtk_abi(void) { return 14; }
 
 static void enqueue(Session *s, int32_t code) {
     if (s->closed || s->queue_full) return;
@@ -130,6 +146,15 @@ static void mapped(GtkWidget *widget, gpointer data) {
 static gboolean close_requested(GtkWindow *window, gpointer data) {
     (void)window;
     Session *s = data;
+    if (s->background) {
+        /* Background mode: the window hides; the session and its events stay. */
+        gtk_widget_set_visible(GTK_WIDGET(s->window), FALSE);
+        s->hidden = TRUE;
+#ifdef TARN_UI_DEVTOOLS
+        dev_hidden(s);
+#endif
+        return TRUE;
+    }
     s->closed = TRUE;
     s->opened = FALSE;
     s->pending_increments = 0;
@@ -154,6 +179,9 @@ static void dispose(Session *s) {
         while (g_hash_table_iter_next(&iter, NULL, &widget)) {
             unsigned disconnected = g_signal_handlers_disconnect_by_func(widget, component_clicked, s);
             disconnected += g_signal_handlers_disconnect_by_func(widget, entry_changed, s);
+            if (GTK_IS_TEXT_VIEW(widget))
+                disconnected += g_signal_handlers_disconnect_by_func(gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget)), text_changed, s);
+            control_disconnect(widget, s, &disconnected);
 #ifdef TARN_UI_TESTING
             stats.disconnected += disconnected;
 #else
@@ -168,6 +196,9 @@ static void dispose(Session *s) {
 #endif
     }
     if (s->window) {
+        /* Menu actions hold the session pointer: drop them with it. */
+        gtk_widget_insert_action_group(GTK_WIDGET(s->window), "tarn", NULL);
+        g_object_set_data(G_OBJECT(s->window), "tarn-ui-menu-actions", NULL);
         if (s->close_handler) {
             g_signal_handler_disconnect(s->window, s->close_handler);
 #ifdef TARN_UI_TESTING
@@ -271,6 +302,14 @@ int32_t tarn_ui_gtk_next(void *raw) {
             return 2;
         }
         if (s->queue_full) return -8;
+        if (s->hidden) {
+            s->hidden = FALSE;
+            return 4;
+        }
+        if (s->woken) {
+            s->woken = FALSE;
+            return 5;
+        }
         if (s->opened) {
             s->opened = FALSE;
             return 1;
@@ -294,6 +333,7 @@ int32_t tarn_ui_gtk_request_close(void *raw) {
     if (status) return status;
     Session *s = raw;
     if (s->closed) return 6;
+    s->background = FALSE; /* an explicit close ends the session even in background mode */
     gtk_window_close(s->window);
     return 0;
 }
@@ -303,6 +343,50 @@ int32_t tarn_ui_gtk_release(void *raw) {
     if (status) return status;
     dispose(raw);
     return 0;
+}
+
+/* Safe to call from a GLib source callback on the main thread: it only sets a
+ * flag, so any number of wakes before next() collapse into one Wake event. */
+int32_t tarn_ui_gtk_wake(void *raw) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    ((Session *)raw)->woken = TRUE;
+    return 0;
+}
+
+int32_t tarn_ui_gtk_set_background(void *raw, uint32_t enabled) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    if (enabled > 1) return 1;
+    s->background = enabled;
+    return 0;
+}
+
+int32_t tarn_ui_gtk_present(void *raw) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    s->hidden = FALSE;
+    gtk_window_present(s->window);
+    return 0;
+}
+
+int32_t tarn_ui_gtk_hide(void *raw) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    gtk_widget_set_visible(GTK_WIDGET(s->window), FALSE);
+    return 0;
+}
+
+int32_t tarn_ui_gtk_is_visible(void *raw) {
+    int32_t status = validate(raw);
+    if (status) return -status;
+    return gtk_widget_get_visible(GTK_WIDGET(((Session *)raw)->window)) ? 1 : 0;
 }
 
 int32_t tarn_ui_gtk_finish(void *raw, int32_t application_error) {
@@ -420,6 +504,10 @@ static void component_track(GtkWidget *widget) {
 static int32_t component_admit(Session *s, const char *key) {
     if (s->closed) return 6;
     if (s->queue_full) return 8;
+    if (s->forced_parent) {
+        /* Region node: tree_prepare already checked the key and capacity. */
+        return valid_key(key) && s->components && !g_hash_table_contains(s->components, key) ? 0 : 1;
+    }
     if (!valid_key(key) || s->counter_label || s->pages_presented || s->list_parent) return 1;
     if (s->components && (g_hash_table_contains(s->components, key) || g_hash_table_size(s->components) >= 256)) return 1;
     return 0;
@@ -472,12 +560,34 @@ int32_t tarn_ui_gtk_add_page(void *raw, const char *key) {
     return 0;
 }
 
+/* Parent in the UI tree: GTK 4 unparents a collapsed expander's content, so
+ * content boxes remember their host. */
+static GtkWidget *ui_parent(GtkWidget *widget) {
+    GtkWidget *host = g_object_get_data(G_OBJECT(widget), "tarn-ui-host");
+    return host ? host : gtk_widget_get_parent(widget);
+}
+static gboolean ui_within(GtkWidget *widget, GtkWidget *ancestor) {
+    for (GtkWidget *p = ui_parent(widget); p; p = ui_parent(p)) if (p == ancestor) return TRUE;
+    return FALSE;
+}
+/* The child a keyed widget occupies in its parent box (a caption box, frame,
+ * expander or scrolled window), or the widget itself. */
+static GtkWidget *ui_slot(GtkWidget *widget) {
+    GtkWidget *outer = g_object_get_data(G_OBJECT(widget), "tarn-ui-outer");
+    return outer ? outer : widget;
+}
+
 static GtkWidget *component_parent(Session *s, const char *key) {
+    if (s->forced_parent) return s->forced_parent;
     if (!key || !s->components) return NULL;
     GtkWidget *parent = g_hash_table_lookup(s->components, key);
-    if (!parent || !GTK_IS_BOX(parent) || (g_object_get_data(G_OBJECT(parent), "tarn-ui-list") || g_object_get_data(G_OBJECT(parent), "tarn-ui-tree") || g_object_get_data(G_OBJECT(parent), "tarn-ui-tree-kind")) || !gtk_widget_is_ancestor(parent, s->pages)) return NULL;
+    if (!parent || !GTK_IS_BOX(parent) || g_object_get_data(G_OBJECT(parent), "tarn-ui-tabs") || (g_object_get_data(G_OBJECT(parent), "tarn-ui-list") || g_object_get_data(G_OBJECT(parent), "tarn-ui-tree") || g_object_get_data(G_OBJECT(parent), "tarn-ui-tree-kind"))) return NULL;
+    /* GTK 4 unparents a collapsed expander's child: climb from the expander. */
+    GtkWidget *anchor = parent;
     unsigned depth = 0;
-    for (GtkWidget *p = parent; p && p != s->pages; p = gtk_widget_get_parent(p)) ++depth;
+    for (GtkWidget *host; (host = g_object_get_data(G_OBJECT(anchor), "tarn-ui-host")) != NULL; anchor = host) ++depth;
+    if (!gtk_widget_is_ancestor(anchor, s->pages)) return NULL;
+    for (GtkWidget *p = anchor; p && p != s->pages; p = gtk_widget_get_parent(p)) ++depth;
     return depth <= 16 ? parent : NULL;
 }
 
@@ -667,6 +777,7 @@ uint32_t test_counter_updates(void) { return stats.counter_updates; }
 uint32_t test_heading_updates(void) { return stats.heading_updates; }
 uint32_t test_component_text_calls(void) { return stats.component_text_calls; }
 uint32_t test_page_calls(void) { return stats.page_calls; }
+uint32_t test_pending_events(void) { return active ? active->pending_increments : 0; }
 void test_fail_at(int stage) { fail_stage = stage; }
 GtkWindow *test_window(void *raw) {
     return validate(raw) == 0 ? ((Session *)raw)->window : NULL;
@@ -778,6 +889,17 @@ int32_t tarn_ui_gtk_set_input(void *raw, const char *key, const char *text) {
     GtkWidget *widget = NULL;
     int32_t status = component_lookup(raw, key, &widget);
     if (status) return status;
+    GtkWidget *state = g_object_get_data(G_OBJECT(widget), "tarn-ui-state");
+    if (state) widget = state;
+    if (is_control(widget)) {
+        int64_t value;
+        return text && parse_value(text, &value) ? control_write(widget, raw, value) : 1;
+    }
+    if (GTK_IS_TEXT_VIEW(widget)) {
+        if (!text || !g_utf8_validate(text, -1, NULL) || g_utf8_strlen(text, -1) > 4096) return 1;
+        text_view_write(widget, raw, text);
+        return 0;
+    }
     if (!GTK_IS_ENTRY(widget) || !text || !g_utf8_validate(text, -1, NULL) || g_utf8_strlen(text, -1) > 256) return 1;
     if (!strcmp(gtk_editable_get_text(GTK_EDITABLE(widget)), text)) return 0;
     /* Model writes must never enqueue a second user edit. */
@@ -890,6 +1012,15 @@ int32_t tarn_ui_gtk_list_end(void *raw) {
 
 /* Whole-region traversal: parents precede children; keys cannot move parents or
  * change native type. Native GTK internals never enter the keyed registry. */
+/* Orders a reconciled node after its previous sibling and marks it seen. */
+static void tree_place(Session *s, GtkWidget *parent, const char *key, GtkWidget *widget) {
+    GtkWidget *slot = ui_slot(widget);
+    GtkWidget *previous = g_hash_table_lookup(s->tree_last, parent);
+    if (gtk_widget_get_prev_sibling(slot) != previous) gtk_box_reorder_child_after(GTK_BOX(parent), slot, previous);
+    g_hash_table_insert(s->tree_last, parent, slot);
+    g_hash_table_add(s->list_seen, g_strdup(key));
+}
+
 int32_t tarn_ui_gtk_tree_begin(void *raw, const char *key, uint32_t count) {
     GtkWidget *root = NULL;
     int32_t status = component_lookup(raw, key, &root);
@@ -904,7 +1035,7 @@ int32_t tarn_ui_gtk_tree_begin(void *raw, const char *key, uint32_t count) {
     gpointer value;
     g_hash_table_iter_init(&iter, s->components);
     while (g_hash_table_iter_next(&iter, NULL, &value))
-        if (gtk_widget_is_ancestor(value, root)) ++old_count;
+        if (ui_within(value, root)) ++old_count;
     if (g_hash_table_size(s->components) - old_count + count > 256) return 1;
     g_object_set_data(G_OBJECT(root), "tarn-ui-tree", GINT_TO_POINTER(1));
     s->list_parent = root;
@@ -930,9 +1061,9 @@ int32_t tarn_ui_gtk_tree_node(void *raw, const char *parent_key, const char *key
     if (kind == 5 && g_utf8_strlen(text, -1) > 256) return 1;
     GtkWidget *parent = parent_key ? g_hash_table_lookup(s->components, parent_key) : NULL;
     if (!parent || !GTK_IS_BOX(parent) || (parent != s->list_parent &&
-        (!g_hash_table_contains(s->list_seen, parent_key) || !gtk_widget_is_ancestor(parent, s->list_parent)))) return 1;
+        (!g_hash_table_contains(s->list_seen, parent_key) || !ui_within(parent, s->list_parent)))) return 1;
     unsigned depth = 0;
-    for (GtkWidget *p = parent; p != s->list_parent; p = gtk_widget_get_parent(p)) if (++depth > 12) return 1;
+    for (GtkWidget *p = parent; p != s->list_parent; p = ui_parent(p)) if (++depth > 12) return 1;
     if (kind >= 6 && depth >= 12) return 1;
     GtkWidget *widget = g_hash_table_lookup(s->components, key);
     if (widget) {
@@ -975,10 +1106,7 @@ int32_t tarn_ui_gtk_tree_node(void *raw, const char *parent_key, const char *key
     } else if (kind >= 3) {
         if (strcmp(gtk_button_get_label(GTK_BUTTON(widget)), text)) gtk_button_set_label(GTK_BUTTON(widget), text);
     } else if (strcmp(gtk_label_get_text(GTK_LABEL(widget)), text)) gtk_label_set_text(GTK_LABEL(widget), text);
-    GtkWidget *previous = g_hash_table_lookup(s->tree_last, parent);
-    if (gtk_widget_get_prev_sibling(widget) != previous) gtk_box_reorder_child_after(GTK_BOX(parent), widget, previous);
-    g_hash_table_insert(s->tree_last, parent, widget);
-    g_hash_table_add(s->list_seen, g_strdup(key));
+    tree_place(s, parent, key, widget);
     return 0;
 }
 
@@ -995,9 +1123,12 @@ static void tree_remove(Session *s, GtkWidget *parent, GtkWidget *child) {
     g_hash_table_iter_init(&iter, s->components);
     while (g_hash_table_iter_next(&iter, NULL, &value)) {
         GtkWidget *widget = value;
-        if (widget != child && !gtk_widget_is_ancestor(widget, child)) continue;
+        if (widget != child && !ui_within(widget, child)) continue;
         unsigned disconnected = g_signal_handlers_disconnect_by_func(widget, component_clicked, s);
         disconnected += g_signal_handlers_disconnect_by_func(widget, entry_changed, s);
+        if (GTK_IS_TEXT_VIEW(widget))
+            disconnected += g_signal_handlers_disconnect_by_func(gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget)), text_changed, s);
+        control_disconnect(widget, s, &disconnected);
 #ifdef TARN_UI_TESTING
         stats.disconnected += disconnected;
 #else
@@ -1015,11 +1146,12 @@ static void tree_prune(Session *s, GtkWidget *parent) {
         GHashTableIter iter;
         gpointer key, value;
         g_hash_table_iter_init(&iter, s->components);
+        GtkWidget *keyed = NULL;
         while (g_hash_table_iter_next(&iter, &key, &value)) {
-            if (value == child) { keep = g_hash_table_contains(s->list_seen, key); break; }
+            if (ui_slot(value) == child) { keep = g_hash_table_contains(s->list_seen, key); keyed = value; break; }
         }
         if (!keep) tree_remove(s, parent, child);
-        else if (GTK_IS_BOX(child)) tree_prune(s, child);
+        else if (GTK_IS_BOX(keyed) && !g_object_get_data(G_OBJECT(keyed), "tarn-ui-tabs")) tree_prune(s, keyed);
         child = next;
     }
 }
@@ -1039,5 +1171,641 @@ int32_t tarn_ui_gtk_tree_end(void *raw) {
     s->tree_mode = FALSE;
     g_clear_pointer(&s->list_seen, g_hash_table_unref);
     g_clear_pointer(&s->tree_last, g_hash_table_unref);
+    return 0;
+}
+
+/* Form controls. Each keyed control queues its action with the new value as a
+ * decimal event-text snapshot; model writes through set_input never enqueue. */
+enum { CONTROL_SWITCH, CONTROL_CHECK, CONTROL_SCALE, CONTROL_SPIN, CONTROL_DROPDOWN,
+       CONTROL_PROGRESS, CONTROL_LEVEL, CONTROL_SPINNER, CONTROL_KINDS };
+
+/* Indicators are display-only controls: action 0, no user signal, and the
+ * model writes them through set_input like any other control. */
+static gboolean kind_is_indicator(uint32_t kind) { return kind >= CONTROL_PROGRESS && kind < CONTROL_KINDS; }
+static gboolean is_indicator(GtkWidget *widget) {
+    uintptr_t tag = GPOINTER_TO_UINT(widget ? g_object_get_data(G_OBJECT(widget), "tarn-ui-control") : NULL);
+    return tag && kind_is_indicator((uint32_t)tag - 1);
+}
+
+static gboolean is_control(GtkWidget *widget) {
+    return widget && g_object_get_data(G_OBJECT(widget), "tarn-ui-control") != NULL;
+}
+
+static int64_t control_value(GtkWidget *widget) {
+    if (GTK_IS_EXPANDER(widget)) return gtk_expander_get_expanded(GTK_EXPANDER(widget));
+    if (GTK_IS_NOTEBOOK(widget)) return MAX(gtk_notebook_get_current_page(GTK_NOTEBOOK(widget)), 0);
+    if (is_indicator(widget)) return (int64_t)(intptr_t)g_object_get_data(G_OBJECT(widget), "tarn-ui-value");
+    if (GTK_IS_SWITCH(widget)) return gtk_switch_get_active(GTK_SWITCH(widget));
+    if (GTK_IS_CHECK_BUTTON(widget)) return gtk_check_button_get_active(GTK_CHECK_BUTTON(widget));
+    if (GTK_IS_DROP_DOWN(widget)) return gtk_drop_down_get_selected(GTK_DROP_DOWN(widget));
+    if (GTK_IS_SPIN_BUTTON(widget)) return gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(widget));
+    return (int64_t)gtk_range_get_value(GTK_RANGE(widget));
+}
+
+static void control_enqueue(GtkWidget *widget, Session *s) {
+    if (s->closed || s->queue_full) return;
+    unsigned slot = (s->increment_head + s->pending_increments) % 64;
+    unsigned action = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(widget), "tarn-ui-action"));
+    int64_t value = control_value(widget);
+    enqueue(s, 1000 + (int32_t)action);
+    if (!s->queue_full) s->event_texts[slot] = g_strdup_printf("%" PRId64, value);
+}
+static void control_notified(GObject *object, GParamSpec *pspec, gpointer data) {
+    (void)pspec;
+    control_enqueue(GTK_WIDGET(object), data);
+}
+static void control_changed(GtkWidget *widget, gpointer data) { control_enqueue(widget, data); }
+
+static void control_disconnect(GtkWidget *widget, Session *s, unsigned *count) {
+    /* A stateful container is keyed by its content box; its state widget
+     * (expander or stack) carries the handler. */
+    GtkWidget *state = g_object_get_data(G_OBJECT(widget), "tarn-ui-state");
+    if (state) control_disconnect(state, s, count);
+    *count += g_signal_handlers_disconnect_by_func(widget, control_notified, s);
+    *count += g_signal_handlers_disconnect_by_func(widget, control_changed, s);
+}
+
+/* Model write without a user event; out-of-range values are rejected. */
+static gboolean control_accepts(GtkWidget *widget, int64_t value) {
+    int64_t min = (int64_t)(intptr_t)g_object_get_data(G_OBJECT(widget), "tarn-ui-min");
+    int64_t max = (int64_t)(intptr_t)g_object_get_data(G_OBJECT(widget), "tarn-ui-max");
+    return value >= min && value <= max;
+}
+static int32_t control_write(GtkWidget *widget, Session *s, int64_t value) {
+    if (!control_accepts(widget, value)) return 1;
+    g_signal_handlers_block_by_func(widget, control_notified, s);
+    g_signal_handlers_block_by_func(widget, control_changed, s);
+    if (is_indicator(widget)) {
+        int64_t min = (int64_t)(intptr_t)g_object_get_data(G_OBJECT(widget), "tarn-ui-min");
+        int64_t max = (int64_t)(intptr_t)g_object_get_data(G_OBJECT(widget), "tarn-ui-max");
+        g_object_set_data(G_OBJECT(widget), "tarn-ui-value", (gpointer)(intptr_t)value);
+        if (GTK_IS_PROGRESS_BAR(widget)) {
+            double fraction = max > min ? (double)(value - min) / (double)(max - min) : 0;
+            char *percent = g_strdup_printf("%d %%", (int)(fraction * 100 + 0.5));
+            gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(widget), fraction);
+            gtk_progress_bar_set_text(GTK_PROGRESS_BAR(widget), percent);
+            g_free(percent);
+        } else if (GTK_IS_LEVEL_BAR(widget)) {
+            gtk_level_bar_set_value(GTK_LEVEL_BAR(widget), (double)value);
+        } else {
+            gtk_spinner_set_spinning(GTK_SPINNER(widget), value != 0);
+        }
+        return 0;
+    }
+    if (GTK_IS_EXPANDER(widget)) gtk_expander_set_expanded(GTK_EXPANDER(widget), value != 0);
+    else if (GTK_IS_NOTEBOOK(widget)) gtk_notebook_set_current_page(GTK_NOTEBOOK(widget), (int)value);
+    else if (GTK_IS_SWITCH(widget)) gtk_switch_set_active(GTK_SWITCH(widget), value != 0);
+    else if (GTK_IS_CHECK_BUTTON(widget)) gtk_check_button_set_active(GTK_CHECK_BUTTON(widget), value != 0);
+    else if (GTK_IS_DROP_DOWN(widget)) gtk_drop_down_set_selected(GTK_DROP_DOWN(widget), (guint)value);
+    else if (GTK_IS_SPIN_BUTTON(widget)) gtk_spin_button_set_value(GTK_SPIN_BUTTON(widget), (double)value);
+    else gtk_range_set_value(GTK_RANGE(widget), (double)value);
+    g_signal_handlers_unblock_by_func(widget, control_notified, s);
+    g_signal_handlers_unblock_by_func(widget, control_changed, s);
+    return 0;
+}
+
+static gboolean parse_value(const char *text, int64_t *out) {
+    if (!text || !*text) return FALSE;
+    char *end = NULL;
+    gint64 value = g_ascii_strtoll(text, &end, 10);
+    if (*end || (value == 0 && strcmp(text, "0") && strcmp(text, "-0"))) return FALSE;
+    *out = value;
+    return TRUE;
+}
+
+int32_t tarn_ui_gtk_add_control(void *raw, const char *parent_key, const char *key, uint32_t kind,
+                                const char *text, uint32_t action, int64_t value, int64_t min, int64_t max) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    status = component_admit(s, key);
+    if (status) return status;
+    GtkWidget *parent = component_parent(s, parent_key);
+    gboolean indicator = kind_is_indicator(kind);
+    if (!parent || kind >= CONTROL_KINDS || (indicator ? action != 0 : (action < 1 || action > 1024)) || !text ||
+        !g_utf8_validate(text, -1, NULL) || g_utf8_strlen(text, -1) > 256) return 1;
+    if (kind <= CONTROL_CHECK || kind == CONTROL_SPINNER) { min = 0; max = 1; }
+    char **lines = NULL;
+    const char *caption_text = text;
+    if (kind == CONTROL_DROPDOWN) {
+        /* First line is the caption; then 1..64 non-empty options. */
+        lines = g_strsplit(text, "\n", 66);
+        guint count = g_strv_length(lines);
+        gboolean valid = count >= 2 && count <= 65;
+        for (guint i = 1; valid && i < count; ++i) valid = lines[i][0] != 0;
+        if (!valid) { g_strfreev(lines); return 1; }
+        caption_text = lines[0];
+        min = 0;
+        max = count - 2;
+    } else if (strchr(text, '\n')) return 1;
+    if (min > max || min < -1000000000 || max > 1000000000 || value < min || value > max) {
+        g_strfreev(lines);
+        return 1;
+    }
+    GtkWidget *widget, *outer;
+    if (kind == CONTROL_CHECK) {
+        widget = gtk_check_button_new_with_label(text);
+        outer = widget;
+    } else {
+        if (kind == CONTROL_SWITCH) {
+            widget = gtk_switch_new();
+            gtk_widget_set_valign(widget, GTK_ALIGN_CENTER);
+        } else if (kind == CONTROL_SCALE) {
+            widget = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, (double)min, (double)max, 1);
+            gtk_scale_set_digits(GTK_SCALE(widget), 0);
+            gtk_scale_set_draw_value(GTK_SCALE(widget), TRUE);
+            gtk_widget_set_hexpand(widget, TRUE);
+        } else if (kind == CONTROL_SPIN) {
+            widget = gtk_spin_button_new_with_range((double)min, (double)max, 1);
+        } else if (kind == CONTROL_PROGRESS) {
+            widget = gtk_progress_bar_new();
+            gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(widget), TRUE);
+            gtk_widget_set_hexpand(widget, TRUE);
+        } else if (kind == CONTROL_LEVEL) {
+            widget = gtk_level_bar_new_for_interval((double)min, (double)max);
+            gtk_level_bar_set_mode(GTK_LEVEL_BAR(widget), GTK_LEVEL_BAR_MODE_CONTINUOUS);
+            gtk_widget_set_hexpand(widget, TRUE);
+            gtk_widget_set_valign(widget, GTK_ALIGN_CENTER);
+        } else if (kind == CONTROL_SPINNER) {
+            widget = gtk_spinner_new();
+        } else {
+            widget = gtk_drop_down_new_from_strings((const char *const *)lines + 1);
+        }
+        /* A visible caption, also the control's accessible label. A slider needs
+         * the full width, so its caption sits above it. */
+        gboolean stacked = kind == CONTROL_SCALE || kind == CONTROL_PROGRESS;
+        outer = gtk_box_new(stacked ? GTK_ORIENTATION_VERTICAL : GTK_ORIENTATION_HORIZONTAL, stacked ? 6 : 12);
+        GtkWidget *caption = gtk_label_new(caption_text);
+        wrap_label(caption);
+        gtk_label_set_xalign(GTK_LABEL(caption), 0);
+        gtk_widget_set_hexpand(caption, TRUE);
+        gtk_box_append(GTK_BOX(outer), caption);
+        gtk_box_append(GTK_BOX(outer), widget);
+        gtk_accessible_update_relation(GTK_ACCESSIBLE(widget), GTK_ACCESSIBLE_RELATION_LABELLED_BY, caption, NULL, -1);
+        component_track(outer);
+    }
+    g_strfreev(lines);
+    component_track(widget);
+    if (outer != widget) g_object_set_data(G_OBJECT(widget), "tarn-ui-outer", outer);
+    g_object_set_data(G_OBJECT(widget), "tarn-ui-control", GUINT_TO_POINTER(kind + 1));
+    g_object_set_data(G_OBJECT(widget), "tarn-ui-action", GUINT_TO_POINTER(action));
+    g_object_set_data(G_OBJECT(widget), "tarn-ui-min", (gpointer)(intptr_t)min);
+    g_object_set_data(G_OBJECT(widget), "tarn-ui-max", (gpointer)(intptr_t)max);
+    char *owned = g_strdup(key);
+    g_hash_table_insert(s->components, owned, widget);
+    UI_ID(widget, owned);
+    gtk_box_append(GTK_BOX(parent), outer);
+    control_write(widget, s, value);
+    if (indicator) return 0;
+    if (kind == CONTROL_SWITCH) g_signal_connect(widget, "notify::active", G_CALLBACK(control_notified), s);
+    else if (kind == CONTROL_CHECK) g_signal_connect(widget, "toggled", G_CALLBACK(control_changed), s);
+    else if (kind == CONTROL_DROPDOWN) g_signal_connect(widget, "notify::selected", G_CALLBACK(control_notified), s);
+    else g_signal_connect(widget, "value-changed", G_CALLBACK(control_changed), s);
+#ifdef TARN_UI_TESTING
+    ++stats.connected;
+#endif
+    return 0;
+}
+
+/* Containers. A frame groups its children under a title. An expander shows
+ * them on demand; open/closed (0/1) is model state like a control. Tabs host
+ * only tab containers; the selected index is model state. Each container is
+ * keyed by its content box, so children use the container key as parent. A
+ * stateful container with action 0 never queues events. */
+enum { CONTAINER_FRAME, CONTAINER_EXPANDER, CONTAINER_TABS, CONTAINER_TAB, CONTAINER_KINDS };
+
+static GtkWidget *content_box(void) {
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(box, 12);
+    gtk_widget_set_margin_end(box, 12);
+    gtk_widget_set_margin_top(box, 12);
+    gtk_widget_set_margin_bottom(box, 12);
+    return box;
+}
+
+static void state_tag(GtkWidget *state, GtkWidget *box, uint32_t action, int64_t max, Session *s, const char *signal) {
+    g_object_set_data(G_OBJECT(state), "tarn-ui-control", GUINT_TO_POINTER(CONTROL_KINDS + 1));
+    g_object_set_data(G_OBJECT(state), "tarn-ui-action", GUINT_TO_POINTER(action));
+    g_object_set_data(G_OBJECT(state), "tarn-ui-min", (gpointer)(intptr_t)0);
+    g_object_set_data(G_OBJECT(state), "tarn-ui-max", (gpointer)(intptr_t)max);
+    g_object_set_data(G_OBJECT(box), "tarn-ui-state", state);
+    if (action) {
+        g_signal_connect(state, signal, G_CALLBACK(control_notified), s);
+#ifdef TARN_UI_TESTING
+        ++stats.connected;
+#endif
+    }
+}
+
+int32_t tarn_ui_gtk_add_container(void *raw, const char *parent_key, const char *key, uint32_t kind,
+                                  const char *title, uint32_t action, int64_t value) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    status = component_admit(s, key);
+    if (status) return status;
+    if (kind >= CONTAINER_KINDS || action > 1024 || !title || !g_utf8_validate(title, -1, NULL) ||
+        g_utf8_strlen(title, -1) > 128 || strchr(title, '\n')) return 1;
+    GtkWidget *parent = NULL, *stack = NULL;
+    if (kind == CONTAINER_TAB) {
+        /* A tab's parent is a tabs container, which accepts nothing else. */
+        parent = parent_key && s->components ? g_hash_table_lookup(s->components, parent_key) : NULL;
+        stack = parent ? g_object_get_data(G_OBJECT(parent), "tarn-ui-tabs") : NULL; /* the notebook */
+        if (!stack || !title[0] || action || value) return 1;
+    } else {
+        parent = component_parent(s, parent_key);
+        if (!parent) return 1;
+    }
+    if ((kind == CONTAINER_FRAME && (action || value)) || (kind == CONTAINER_EXPANDER && (value < 0 || value > 1)) ||
+        (kind == CONTAINER_TABS && (value < 0 || value > 31 || title[0])) || (kind == CONTAINER_EXPANDER && !title[0])) return 1;
+    GtkWidget *box, *outer, *ided;
+    if (kind == CONTAINER_FRAME) {
+        box = content_box();
+        outer = gtk_frame_new(title[0] ? title : NULL);
+        gtk_frame_set_child(GTK_FRAME(outer), box);
+        ided = box;
+    } else if (kind == CONTAINER_EXPANDER) {
+        box = content_box();
+        outer = gtk_expander_new(title);
+        gtk_expander_set_child(GTK_EXPANDER(outer), box);
+        g_object_set_data(G_OBJECT(box), "tarn-ui-host", outer);
+        gtk_expander_set_expanded(GTK_EXPANDER(outer), value != 0);
+        state_tag(outer, box, action, 1, s, "notify::expanded");
+        ided = outer;
+    } else if (kind == CONTAINER_TABS) {
+        /* The notebook sits in a box so the container key has a box like the
+         * others; component_parent refuses that box for anything but tabs. */
+        box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        GtkWidget *tabs = gtk_notebook_new();
+        gtk_box_append(GTK_BOX(box), tabs);
+        g_object_set_data(G_OBJECT(box), "tarn-ui-tabs", tabs);
+        g_object_set_data(G_OBJECT(tabs), "tarn-ui-wanted", (gpointer)(intptr_t)value);
+        state_tag(tabs, box, action, -1, s, "notify::page");
+        outer = box;
+        ided = tabs;
+    } else {
+        box = content_box();
+        int64_t index = (int64_t)(intptr_t)g_object_get_data(G_OBJECT(stack), "tarn-ui-max") + 1;
+        if (index >= 32) return 1;
+        /* Adding a page may change the visible child: never report it. */
+        g_signal_handlers_block_by_func(stack, control_notified, s);
+        gtk_notebook_append_page(GTK_NOTEBOOK(stack), box, gtk_label_new(title));
+        g_object_set_data(G_OBJECT(stack), "tarn-ui-max", (gpointer)(intptr_t)index);
+        if ((int64_t)(intptr_t)g_object_get_data(G_OBJECT(stack), "tarn-ui-wanted") == index)
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(stack), (int)index);
+        g_signal_handlers_unblock_by_func(stack, control_notified, s);
+        outer = NULL;
+        ided = box;
+    }
+    component_track(box);
+    char *owned = g_strdup(key);
+    g_hash_table_insert(s->components, owned, box);
+    UI_ID(ided, owned);
+    (void)ided; /* UI_ID is empty outside development builds */
+    if (outer) {
+        if (outer != box) {
+            component_track(outer);
+            g_object_set_data(G_OBJECT(box), "tarn-ui-outer", outer);
+        }
+        gtk_box_append(GTK_BOX(parent), outer);
+    }
+    return 0;
+}
+
+/* Multiline text: a GtkTextView in a scrolled frame. Like an entry, each user
+ * edit queues the action with a full snapshot (at most 4096 characters);
+ * model writes through set_input never queue. */
+static char *text_view_text(GtkWidget *view) {
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(buffer, &start, &end);
+    return gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+}
+
+static void text_changed(GtkTextBuffer *buffer, gpointer data) {
+    Session *s = data;
+    if (s->closed || s->queue_full) return;
+    GtkWidget *view = g_object_get_data(G_OBJECT(buffer), "tarn-ui-view");
+    char *text = text_view_text(view);
+    if (g_utf8_strlen(text, -1) > 4096) {
+        /* Over the limit: keep the last accepted snapshot in the widget. */
+        const char *previous = g_object_get_data(G_OBJECT(view), "tarn-ui-last");
+        g_free(text);
+        text_view_write(view, s, previous ? previous : "");
+        return;
+    }
+    g_object_set_data_full(G_OBJECT(view), "tarn-ui-last", g_strdup(text), g_free);
+    unsigned slot = (s->increment_head + s->pending_increments) % 64;
+    unsigned action = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(view), "tarn-ui-action"));
+    enqueue(s, 1000 + (int32_t)action);
+    if (!s->queue_full) s->event_texts[slot] = text;
+    else g_free(text);
+}
+
+static void text_view_write(GtkWidget *view, Session *s, const char *text) {
+    char *current = text_view_text(view);
+    gboolean same = !strcmp(current, text);
+    g_free(current);
+    if (same) return;
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
+    g_signal_handlers_block_by_func(buffer, text_changed, s);
+    gtk_text_buffer_set_text(buffer, text, -1);
+    g_signal_handlers_unblock_by_func(buffer, text_changed, s);
+    g_object_set_data_full(G_OBJECT(view), "tarn-ui-last", g_strdup(text), g_free);
+}
+
+int32_t tarn_ui_gtk_add_text_area(void *raw, const char *parent_key, const char *key, const char *text,
+                                  uint32_t action, uint32_t lines) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    status = component_admit(s, key);
+    if (status) return status;
+    GtkWidget *parent = component_parent(s, parent_key);
+    if (!parent || !text || !g_utf8_validate(text, -1, NULL) || g_utf8_strlen(text, -1) > 4096 ||
+        action < 1 || action > 1024 || lines < 2 || lines > 20) return 1;
+    GtkWidget *view = gtk_text_view_new();
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(view), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_accepts_tab(GTK_TEXT_VIEW(view), FALSE); /* Tab keeps moving focus */
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(view), 6);
+    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(view), 6);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(view), 6);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(view), 6);
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
+    gtk_text_buffer_set_text(buffer, text, -1);
+    g_object_set_data_full(G_OBJECT(view), "tarn-ui-last", g_strdup(text), g_free);
+    g_object_set_data(G_OBJECT(buffer), "tarn-ui-view", view);
+    GtkWidget *scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_has_frame(GTK_SCROLLED_WINDOW(scroll), TRUE);
+    /* Line height from the theme font: about 1.5 em per line. */
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scroll), (int)lines * 22);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), view);
+    component_track(view);
+    component_track(scroll);
+    char *owned = g_strdup(key);
+    g_hash_table_insert(s->components, owned, view);
+    UI_ID(view, owned);
+    g_object_set_data(G_OBJECT(view), "tarn-ui-action", GUINT_TO_POINTER(action));
+    g_object_set_data(G_OBJECT(view), "tarn-ui-outer", scroll);
+    gtk_box_append(GTK_BOX(parent), scroll);
+    g_signal_connect(buffer, "changed", G_CALLBACK(text_changed), s);
+#ifdef TARN_UI_TESTING
+    ++stats.connected;
+#endif
+    return 0;
+}
+
+/* Header bar and its menu. The header replaces the window title bar; its
+ * buttons are keyed components (set_text/set_enabled work on them). Menu
+ * entries are window actions "tarn.<key>" shown in a primary menu button;
+ * activating one queues 1000 + action like a button. */
+static void menu_activated(GSimpleAction *item, GVariant *parameter, gpointer data) {
+    (void)parameter;
+    unsigned action = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(item), "tarn-ui-action"));
+    enqueue(data, 1000 + (int32_t)action);
+}
+
+static GtkWidget *header_of(Session *s) {
+    GtkWidget *header = gtk_window_get_titlebar(s->window);
+    return GTK_IS_HEADER_BAR(header) ? header : NULL;
+}
+
+int32_t tarn_ui_gtk_set_header(void *raw, const char *subtitle) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    if (!subtitle || !g_utf8_validate(subtitle, -1, NULL) || g_utf8_strlen(subtitle, -1) > 128 || strchr(subtitle, '\n')) return 1;
+    GtkWidget *header = header_of(s);
+    if (!header) {
+        header = gtk_header_bar_new();
+        /* GTK only accepts a title bar on an unrealized window: create presents
+         * it, so take it down briefly. Apps call this while building their UI,
+         * before the first event, so the user sees no flicker. */
+        gboolean visible = gtk_widget_get_visible(GTK_WIDGET(s->window));
+        gtk_widget_set_visible(GTK_WIDGET(s->window), FALSE);
+        gtk_widget_unrealize(GTK_WIDGET(s->window));
+        gtk_window_set_titlebar(s->window, header);
+        if (visible) gtk_window_present(s->window);
+    }
+    GtkWidget *title = NULL;
+    if (subtitle[0]) {
+        /* Title and subtitle stacked, as in GNOME's window title widget. */
+        title = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        gtk_widget_set_valign(title, GTK_ALIGN_CENTER);
+        GtkWidget *main_title = gtk_label_new(gtk_window_get_title(s->window));
+        gtk_widget_add_css_class(main_title, "title");
+        GtkWidget *sub = gtk_label_new(subtitle);
+        gtk_widget_add_css_class(sub, "subtitle");
+        gtk_box_append(GTK_BOX(title), main_title);
+        gtk_box_append(GTK_BOX(title), sub);
+    }
+    gtk_header_bar_set_title_widget(GTK_HEADER_BAR(header), title);
+    return 0;
+}
+
+int32_t tarn_ui_gtk_add_header_button(void *raw, const char *key, const char *text, const char *icon,
+                                      uint32_t action, uint32_t end) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    status = component_admit(s, key);
+    if (status) return status;
+    GtkWidget *header = header_of(s);
+    if (!header || !s->components || !text || !icon || !g_utf8_validate(text, -1, NULL) || !text[0] || g_utf8_strlen(text, -1) > 64 ||
+        strchr(text, '\n') || !g_utf8_validate(icon, -1, NULL) || strlen(icon) > 128 || action < 1 || action > 1024 || end > 1) return 1;
+    GtkWidget *button;
+    if (icon[0]) {
+        /* Icon-only buttons keep the text as tooltip and accessible name. */
+        button = gtk_button_new_from_icon_name(icon);
+        gtk_widget_set_tooltip_text(button, text);
+        gtk_accessible_update_property(GTK_ACCESSIBLE(button), GTK_ACCESSIBLE_PROPERTY_LABEL, text, -1);
+    } else button = gtk_button_new_with_label(text);
+    /* Some themes (Breeze) align header children by baseline, which icon
+     * buttons cannot report; centering avoids GTK's baseline warning. */
+    gtk_widget_set_valign(button, GTK_ALIGN_CENTER);
+    component_track(button);
+    char *owned = g_strdup(key);
+    g_hash_table_insert(s->components, owned, button);
+    UI_ID(button, owned);
+    g_object_set_data(G_OBJECT(button), "tarn-ui-action", GUINT_TO_POINTER(action));
+    if (end) gtk_header_bar_pack_end(GTK_HEADER_BAR(header), button);
+    else gtk_header_bar_pack_start(GTK_HEADER_BAR(header), button);
+    g_signal_connect(button, "clicked", G_CALLBACK(component_clicked), s);
+#ifdef TARN_UI_TESTING
+    ++stats.connected;
+#endif
+    return 0;
+}
+
+int32_t tarn_ui_gtk_add_menu_item(void *raw, const char *key, const char *text, uint32_t action) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    GtkWidget *header = header_of(s);
+    if (!header || !key || !text || !g_utf8_validate(text, -1, NULL) || !text[0] || g_utf8_strlen(text, -1) > 64 ||
+        strchr(text, '\n') || action < 1 || action > 1024) return 1;
+    /* Keys become action names: ASCII letters, digits and '-' only. */
+    size_t length = strlen(key);
+    if (!length || length > 64) return 1;
+    for (size_t i = 0; i < length; ++i) if (!g_ascii_isalnum(key[i]) && key[i] != '-') return 1;
+    GSimpleActionGroup *group = g_object_get_data(G_OBJECT(s->window), "tarn-ui-menu-actions");
+    GMenu *menu = g_object_get_data(G_OBJECT(s->window), "tarn-ui-menu");
+    if (!group) {
+        group = g_simple_action_group_new();
+        menu = g_menu_new();
+        gtk_widget_insert_action_group(GTK_WIDGET(s->window), "tarn", G_ACTION_GROUP(group));
+        g_object_set_data_full(G_OBJECT(s->window), "tarn-ui-menu-actions", group, g_object_unref);
+        g_object_set_data_full(G_OBJECT(s->window), "tarn-ui-menu", menu, g_object_unref);
+        GtkWidget *button = gtk_menu_button_new();
+        gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(button), "open-menu-symbolic");
+        gtk_menu_button_set_primary(GTK_MENU_BUTTON(button), TRUE);
+        gtk_widget_set_valign(button, GTK_ALIGN_CENTER);
+        gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(button), G_MENU_MODEL(menu));
+        gtk_widget_set_tooltip_text(button, "Menú principal");
+        gtk_accessible_update_property(GTK_ACCESSIBLE(button), GTK_ACCESSIBLE_PROPERTY_LABEL, "Menú principal", -1);
+        UI_ID(button, "menu");
+        gtk_header_bar_pack_end(GTK_HEADER_BAR(header), button);
+    }
+    if (g_action_map_lookup_action(G_ACTION_MAP(group), key)) return 1;
+    if (g_menu_model_get_n_items(G_MENU_MODEL(menu)) >= 32) return 1;
+    GSimpleAction *item = g_simple_action_new(key, NULL);
+    g_object_set_data(G_OBJECT(item), "tarn-ui-action", GUINT_TO_POINTER(action));
+    g_signal_connect(item, "activate", G_CALLBACK(menu_activated), s);
+    g_action_map_add_action(G_ACTION_MAP(group), G_ACTION(item));
+    g_object_unref(item);
+    char *detailed = g_strconcat("tarn.", key, NULL);
+    g_menu_append(menu, text, detailed);
+    g_free(detailed);
+    return 0;
+}
+
+#ifdef TARN_UI_DEVTOOLS
+/* Menu entries are not widgets until the popover opens; tests activate them
+ * by key through the same action the menu uses. */
+static gboolean menu_activate_key(Session *s, const char *key) {
+    GSimpleActionGroup *group = g_object_get_data(G_OBJECT(s->window), "tarn-ui-menu-actions");
+    GAction *item = group && key ? g_action_map_lookup_action(G_ACTION_MAP(group), key) : NULL;
+    if (!item || !g_action_get_enabled(item)) return FALSE;
+    g_action_activate(item, NULL);
+    return TRUE;
+}
+#endif
+
+/* Region reconciliation for controls, containers and multiline text. A new
+ * key is built by the static creator under the region parent; an existing key
+ * must keep its family, kind, parent and action, and gets its text and value
+ * written without queuing events. Tabs stay static-only. */
+enum { TREE_CONTROL = 100, TREE_CONTAINER = 200, TREE_AREA = 300 };
+
+static int32_t tree_prepare(void *raw, const char *parent_key, const char *key, uint32_t family,
+                            GtkWidget **parent_out, GtkWidget **existing) {
+    int32_t status = validate(raw);
+    if (status) return status;
+    Session *s = raw;
+    if (s->closed) return 6;
+    if (s->queue_full) return 8;
+    if (!s->tree_mode || !s->list_parent || !valid_key(key) || g_hash_table_contains(s->list_seen, key) ||
+        g_hash_table_size(s->list_seen) >= s->list_expected) return 1;
+    GtkWidget *parent = parent_key ? g_hash_table_lookup(s->components, parent_key) : NULL;
+    if (!parent || !GTK_IS_BOX(parent) || g_object_get_data(G_OBJECT(parent), "tarn-ui-tabs") || (parent != s->list_parent &&
+        (!g_hash_table_contains(s->list_seen, parent_key) || !ui_within(parent, s->list_parent)))) return 1;
+    unsigned depth = 0;
+    for (GtkWidget *p = parent; p != s->list_parent; p = ui_parent(p)) if (++depth > 12) return 1;
+    GtkWidget *widget = g_hash_table_lookup(s->components, key);
+    if (widget) {
+        guint tag = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(widget), "tarn-ui-tree-kind"));
+        if (gtk_widget_get_parent(ui_slot(widget)) != parent || tag / 100 * 100 != family) return 1;
+    } else if (g_hash_table_size(s->components) >= 512) return 1;
+    *parent_out = parent;
+    *existing = widget;
+    return 0;
+}
+
+static int32_t tree_create(Session *s, GtkWidget *parent, const char *key, guint tag, int32_t status) {
+    s->forced_parent = NULL;
+    if (status) return status;
+    GtkWidget *widget = g_hash_table_lookup(s->components, key);
+    g_object_set_data(G_OBJECT(widget), "tarn-ui-tree-kind", GUINT_TO_POINTER(tag));
+#ifdef TARN_UI_DEVTOOLS
+    /* Region keys are freed with the tree; give the id its own copy. */
+    GtkWidget *ided = g_object_get_data(G_OBJECT(widget), "tarn-ui-state");
+    if (!ided || !g_object_get_data(G_OBJECT(ided), "tarn-ui-id")) ided = widget;
+    g_object_set_data_full(G_OBJECT(ided), "tarn-ui-id", g_strdup(key), g_free);
+#endif
+    tree_place(s, parent, key, widget);
+    return 0;
+}
+
+int32_t tarn_ui_gtk_tree_control(void *raw, const char *parent_key, const char *key, uint32_t kind, const char *text,
+                                 uint32_t action, int64_t value, int64_t min, int64_t max) {
+    GtkWidget *parent = NULL, *widget = NULL;
+    int32_t status = tree_prepare(raw, parent_key, key, TREE_CONTROL, &parent, &widget);
+    if (status) return status;
+    Session *s = raw;
+    if (!widget) {
+        s->forced_parent = parent;
+        return tree_create(s, parent, key, TREE_CONTROL + kind,
+                           tarn_ui_gtk_add_control(raw, parent_key, key, kind, text, action, value, min, max));
+    }
+    guint tag = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(widget), "tarn-ui-tree-kind"));
+    if (tag != TREE_CONTROL + kind || GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(widget), "tarn-ui-action")) != action) return 1;
+    /* Range and options are fixed per key; the caption is not re-read. */
+    if (kind != CONTROL_DROPDOWN && kind > CONTROL_CHECK && kind != CONTROL_SPINNER &&
+        ((int64_t)(intptr_t)g_object_get_data(G_OBJECT(widget), "tarn-ui-min") != min ||
+         (int64_t)(intptr_t)g_object_get_data(G_OBJECT(widget), "tarn-ui-max") != max)) return 1;
+    status = control_write(widget, s, value);
+    if (status) return status;
+    tree_place(s, parent, key, widget);
+    return 0;
+}
+
+int32_t tarn_ui_gtk_tree_container(void *raw, const char *parent_key, const char *key, uint32_t kind,
+                                   const char *title, uint32_t action, int64_t value) {
+    if (kind != CONTAINER_FRAME && kind != CONTAINER_EXPANDER) return 1;
+    GtkWidget *parent = NULL, *box = NULL;
+    int32_t status = tree_prepare(raw, parent_key, key, TREE_CONTAINER, &parent, &box);
+    if (status) return status;
+    Session *s = raw;
+    if (!box) {
+        s->forced_parent = parent;
+        return tree_create(s, parent, key, TREE_CONTAINER + kind,
+                           tarn_ui_gtk_add_container(raw, parent_key, key, kind, title, action, value));
+    }
+    GtkWidget *outer = ui_slot(box);
+    GtkWidget *state = g_object_get_data(G_OBJECT(box), "tarn-ui-state");
+    guint tag = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(box), "tarn-ui-tree-kind"));
+    if (tag != TREE_CONTAINER + kind || !title || !g_utf8_validate(title, -1, NULL) || g_utf8_strlen(title, -1) > 128 ||
+        strchr(title, '\n') || (state && GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(state), "tarn-ui-action")) != action)) return 1;
+    if (kind == CONTAINER_FRAME) {
+        if (action || value) return 1;
+        if (g_strcmp0(gtk_frame_get_label(GTK_FRAME(outer)), title[0] ? title : NULL))
+            gtk_frame_set_label(GTK_FRAME(outer), title[0] ? title : NULL);
+    } else {
+        if (!title[0] || value < 0 || value > 1) return 1;
+        if (strcmp(gtk_expander_get_label(GTK_EXPANDER(outer)), title)) gtk_expander_set_label(GTK_EXPANDER(outer), title);
+        status = control_write(state, s, value);
+        if (status) return status;
+    }
+    tree_place(s, parent, key, box);
+    return 0;
+}
+
+int32_t tarn_ui_gtk_tree_text_area(void *raw, const char *parent_key, const char *key, const char *text,
+                                   uint32_t action, uint32_t lines) {
+    GtkWidget *parent = NULL, *view = NULL;
+    int32_t status = tree_prepare(raw, parent_key, key, TREE_AREA, &parent, &view);
+    if (status) return status;
+    Session *s = raw;
+    if (!view) {
+        s->forced_parent = parent;
+        return tree_create(s, parent, key, TREE_AREA, tarn_ui_gtk_add_text_area(raw, parent_key, key, text, action, lines));
+    }
+    if (GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(view), "tarn-ui-action")) != action || !text ||
+        !g_utf8_validate(text, -1, NULL) || g_utf8_strlen(text, -1) > 4096) return 1;
+    text_view_write(view, s, text);
+    tree_place(s, parent, key, view);
     return 0;
 }

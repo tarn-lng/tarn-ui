@@ -190,7 +190,7 @@ def main():
     large = next(s for s in scenarios if s["scenario"] == "large-text")
     if large["heading"]["height"] <= base["heading"]["height"]:
         findings.append({"scenario": "large-text", "code": "FONT_SETTING_NOT_APPLIED"})
-    report = {"abi": 12, **monitor_data, "min_text_contrast": MIN_CONTRAST, "scenarios": scenarios,
+    report = {"abi": 14, **monitor_data, "min_text_contrast": MIN_CONTRAST, "scenarios": scenarios,
               "findings": findings, "layout_gate_passed": not findings,
               "note": ("Contrast is the darkest/lightest opaque pixel ratio inside each enabled text "
                        "allocation; it measures rendered legibility, not a screen reader or WCAG audit.")}

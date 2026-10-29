@@ -184,9 +184,15 @@ static JsonObject *dev_widget(DevChannel *d, GtkWidget *widget, GtkWidget *root,
     const char *text = NULL;
     if (d->allow_text) {
         if (GTK_IS_ENTRY(widget)) text = gtk_editable_get_text(GTK_EDITABLE(widget));
+        else if (GTK_IS_TEXT_VIEW(widget)) text = g_object_get_data(G_OBJECT(widget), "tarn-ui-last");
         else if (GTK_IS_LABEL(widget)) text = gtk_label_get_text(GTK_LABEL(widget));
         else if (GTK_IS_BUTTON(widget)) text = gtk_button_get_label(GTK_BUTTON(widget));
         else if (GTK_IS_WINDOW(widget)) text = gtk_window_get_title(GTK_WINDOW(widget));
+    }
+    char value_text[32];
+    if (d->allow_text && is_control(widget)) {
+        snprintf(value_text, sizeof(value_text), "%" PRId64, control_value(widget));
+        text = value_text;
     }
     dev_string(o, "text", text);
     dev_bool(o, "redacted", !d->allow_text);
@@ -376,13 +382,13 @@ static void dev_request(Session *s, const char *record, gsize length) {
     if (!dev_get_string(params, "window_id") || ((click || fill) && !dev_get_string(params, "element_id"))) goto done;
     if (fill) {
         const char *text = dev_get_string(params, "text");
-        if (!text || !g_utf8_validate(text, -1, NULL) || g_utf8_strlen(text, -1) > 256) goto done;
-        /* GtkEntry is single-line; reject rather than silently transforming input. */
-        if (strchr(text, '\n') || strchr(text, '\r')) goto done;
+        if (!text || !g_utf8_validate(text, -1, NULL) || g_utf8_strlen(text, -1) > 4096) goto done;
     }
     if (g_strcmp0(dev_get_string(params, "window_id"), "main") != 0) { error = "NOT_FOUND"; goto done; }
     if (s->closed || d->closed) { error = "WINDOW_CLOSED"; goto done; }
-    if (!gtk_widget_get_mapped(GTK_WIDGET(s->window)) || gtk_widget_get_width(GTK_WIDGET(s->window)) <= 0) { error = "NOT_READY"; goto done; }
+    /* A window hidden in background mode can still be inspected (visible=false). */
+    gboolean hidden = s->background && !gtk_widget_get_visible(GTK_WIDGET(s->window));
+    if (!(inspect && hidden) && (!gtk_widget_get_mapped(GTK_WIDGET(s->window)) || gtk_widget_get_width(GTK_WIDGET(s->window)) <= 0)) { error = "NOT_READY"; goto done; }
     if (capture) {
         JsonNode *minimum = json_object_get_member(params, "min_revision");
         if (minimum && (!JSON_NODE_HOLDS_VALUE(minimum) || json_node_get_value_type(minimum) != G_TYPE_INT64 || json_node_get_int(minimum) < 0)) goto done;
@@ -420,11 +426,37 @@ static void dev_request(Session *s, const char *record, gsize length) {
         gtk_window_close(s->window);
     } else {
         GtkWidget *target = dev_find(GTK_WIDGET(s->window), dev_get_string(params, "element_id"));
+        GtkWidget *titlebar = gtk_window_get_titlebar(s->window);
+        if (!target && titlebar) target = dev_find(titlebar, dev_get_string(params, "element_id"));
+        if (!target && click) {
+            /* A menu entry: activate its action by key, like choosing it. */
+            if (s->queue_full || s->pending_increments >= 64) { error = "QUEUE_FULL"; goto done; }
+            d->pending_id = g_strdup(id);
+            d->pending_token = ++d->sequence;
+            d->deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+            s->enqueue_token = d->pending_token;
+            gboolean found = menu_activate_key(s, dev_get_string(params, "element_id"));
+            s->enqueue_token = 0;
+            if (!found) { dev_clear_pending(d); error = "NOT_FOUND"; goto done; }
+            d->timer = g_timeout_add(2000, dev_timeout, d);
+            error = NULL;
+            goto done;
+        }
         if (!target) { error = "NOT_FOUND"; goto done; }
-        if ((fill && !GTK_IS_ENTRY(target)) || (!fill && !GTK_IS_BUTTON(target))) { error = "WRONG_ELEMENT_TYPE"; goto done; }
+        /* Entries are single-line; reject rather than silently transforming input. */
+        if (fill && !GTK_IS_TEXT_VIEW(target)) {
+            const char *text = dev_get_string(params, "text");
+            if (g_utf8_strlen(text, -1) > 256 || strchr(text, '\n') || strchr(text, '\r')) goto done;
+        }
+        gboolean control = is_control(target);
+        if (is_indicator(target)) { error = "WRONG_ELEMENT_TYPE"; goto done; }
+        int64_t control_target = 0;
+        if ((fill && !GTK_IS_ENTRY(target) && !GTK_IS_TEXT_VIEW(target) && !control) || (!fill && !GTK_IS_BUTTON(target))) { error = "WRONG_ELEMENT_TYPE"; goto done; }
+        if (fill && control && (!parse_value(dev_get_string(params, "text"), &control_target) ||
+                                !control_accepts(target, control_target))) { error = "INVALID_REQUEST"; goto done; }
         if (!gtk_widget_is_sensitive(target)) { error = "DISABLED"; goto done; }
         if (!gtk_widget_is_visible(target) || !gtk_widget_get_mapped(target)) { error = "HIDDEN"; goto done; }
-        if (fill && !gtk_editable_get_editable(GTK_EDITABLE(target))) { error = "DISABLED"; goto done; }
+        if (fill && GTK_IS_ENTRY(target) && !gtk_editable_get_editable(GTK_EDITABLE(target))) { error = "DISABLED"; goto done; }
         if (s->queue_full || s->pending_increments >= 64) { error = "QUEUE_FULL"; goto done; }
         d->pending_id = g_strdup(id);
         d->pending_token = ++d->sequence;
@@ -432,7 +464,18 @@ static void dev_request(Session *s, const char *record, gsize length) {
         s->enqueue_token = d->pending_token;
         /* Native semantic activation: emits GTK's clicked signal synchronously.
          * The C callback only queues an event, carrying this action token. */
-        if (fill) {
+        if (fill && control) {
+            gtk_widget_grab_focus(target);
+            control_write(target, s, control_target);
+            control_enqueue(target, s);
+        } else if (fill && GTK_IS_TEXT_VIEW(target)) {
+            gtk_widget_grab_focus(target);
+            GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(target));
+            g_signal_handlers_block_by_func(buffer, text_changed, s);
+            gtk_text_buffer_set_text(buffer, dev_get_string(params, "text"), -1);
+            g_signal_handlers_unblock_by_func(buffer, text_changed, s);
+            text_changed(buffer, s);
+        } else if (fill) {
             gtk_widget_grab_focus(target);
             /* Replace atomically: GTK may emit changed for deletion and insertion.
              * Queue one final snapshot and acknowledge after Tarn applies its view,
@@ -534,6 +577,16 @@ static void dev_complete(Session *s, int32_t status) {
         dev_reply(d, d->pending_id, status ? NULL : dev_result(d), status ? "NATIVE_ERROR" : NULL);
         dev_clear_pending(d);
     }
+}
+/* Background mode: ui.close hides the window and the session lives on, so the
+ * close request is answered here with "hidden" instead of at disposal. */
+static void dev_hidden(Session *s) {
+    DevChannel *d = s->dev;
+    if (!d || !d->close_id) return;
+    JsonObject *result = dev_result(d);
+    dev_bool(result, "hidden", TRUE);
+    dev_reply(d, d->close_id, result, NULL);
+    g_clear_pointer(&d->close_id, g_free);
 }
 static void dev_dispose(Session *s, gboolean window_closed) {
     DevChannel *d = s->dev;
