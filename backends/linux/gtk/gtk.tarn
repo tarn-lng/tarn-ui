@@ -20,6 +20,12 @@ pub const POLICY_NEVER i32 = 2
 pub const TRANSITION_NONE i32 = 0
 pub const ORIENTATION_HORIZONTAL i32 = 0
 pub const ORIENTATION_VERTICAL i32 = 1
+pub const ALIGN_CENTER i32 = 3
+pub const LEVEL_BAR_MODE_CONTINUOUS i32 = 0
+// GtkWrapMode (text views), unlike WRAP_WORD_CHAR (PangoWrapMode, labels).
+pub const TEXT_WRAP_WORD_CHAR i32 = 3
+pub const RELATION_LABELLED_BY i32 = 10
+pub const TEXT_ITER_SIZE usize = 80
 
 pub extern "C" fn gtk_init_check() i32
 pub extern "C" fn gtk_window_new() *mut Widget
@@ -92,6 +98,93 @@ pub extern "C" fn gdk_monitor_get_geometry(monitor *mut Widget, rectangle *mut u
 pub extern "C" fn gtk_accessible_role_get_type() usize
 pub extern "C" fn gtk_accessible_update_property_value(accessible *mut Widget, count i32, properties *mut i32, values *mut u8) void
 
+// G4: controls, indicators, containers, text views, header bar and menu.
+pub extern "C" fn gtk_widget_set_valign(widget *mut Widget, align i32) void
+pub extern "C" fn gtk_widget_set_tooltip_text(widget *mut Widget, text *u8) void
+pub extern "C" fn gtk_widget_unrealize(widget *mut Widget) void
+pub extern "C" fn gtk_widget_insert_action_group(widget *mut Widget, name *u8, group *mut Widget) void
+pub extern "C" fn gtk_label_set_xalign(label *mut Widget, xalign f32) void
+pub extern "C" fn gtk_check_button_new_with_label(text *u8) *mut Widget
+pub extern "C" fn gtk_check_button_get_active(check *mut Widget) i32
+pub extern "C" fn gtk_check_button_set_active(check *mut Widget, active i32) void
+pub extern "C" fn gtk_switch_new() *mut Widget
+pub extern "C" fn gtk_switch_get_active(toggle *mut Widget) i32
+pub extern "C" fn gtk_switch_set_active(toggle *mut Widget, active i32) void
+pub extern "C" fn gtk_scale_new_with_range(orientation i32, min f64, max f64, step f64) *mut Widget
+pub extern "C" fn gtk_scale_set_digits(scale *mut Widget, digits i32) void
+pub extern "C" fn gtk_scale_set_draw_value(scale *mut Widget, draw i32) void
+pub extern "C" fn gtk_range_get_value(range *mut Widget) f64
+pub extern "C" fn gtk_range_set_value(range *mut Widget, value f64) void
+pub extern "C" fn gtk_spin_button_new_with_range(min f64, max f64, step f64) *mut Widget
+pub extern "C" fn gtk_spin_button_get_value_as_int(spin *mut Widget) i32
+pub extern "C" fn gtk_spin_button_set_value(spin *mut Widget, value f64) void
+pub extern "C" fn gtk_progress_bar_new() *mut Widget
+pub extern "C" fn gtk_progress_bar_set_show_text(bar *mut Widget, show i32) void
+pub extern "C" fn gtk_progress_bar_set_fraction(bar *mut Widget, fraction f64) void
+pub extern "C" fn gtk_progress_bar_set_text(bar *mut Widget, text *u8) void
+pub extern "C" fn gtk_level_bar_new_for_interval(min f64, max f64) *mut Widget
+pub extern "C" fn gtk_level_bar_set_mode(bar *mut Widget, mode i32) void
+pub extern "C" fn gtk_level_bar_set_value(bar *mut Widget, value f64) void
+pub extern "C" fn gtk_spinner_new() *mut Widget
+pub extern "C" fn gtk_spinner_set_spinning(spinner *mut Widget, spinning i32) void
+// `strings` is a NULL-terminated char ** (addresses in a Vec<usize>).
+pub extern "C" fn gtk_drop_down_new_from_strings(strings *mut usize) *mut Widget
+pub extern "C" fn gtk_drop_down_get_selected(dropdown *mut Widget) u32
+pub extern "C" fn gtk_drop_down_set_selected(dropdown *mut Widget, position u32) void
+pub extern "C" fn gtk_accessible_list_get_type() usize
+// The list is copied; the caller frees its GList.
+pub extern "C" fn gtk_accessible_list_new_from_list(list *mut u8) *mut u8
+pub extern "C" fn g_list_append(list *mut u8, data *mut Widget) *mut u8
+pub extern "C" fn gtk_accessible_update_relation_value(accessible *mut Widget, count i32, relations *mut i32, values *mut u8) void
+pub extern "C" fn gtk_frame_new(label *u8) *mut Widget
+pub extern "C" fn gtk_frame_set_child(frame *mut Widget, child *mut Widget) void
+pub extern "C" fn gtk_frame_get_label(frame *mut Widget) *u8
+pub extern "C" fn gtk_frame_set_label(frame *mut Widget, label *u8) void
+pub extern "C" fn gtk_expander_new(label *u8) *mut Widget
+pub extern "C" fn gtk_expander_set_child(expander *mut Widget, child *mut Widget) void
+pub extern "C" fn gtk_expander_get_expanded(expander *mut Widget) i32
+pub extern "C" fn gtk_expander_set_expanded(expander *mut Widget, expanded i32) void
+pub extern "C" fn gtk_expander_get_label(expander *mut Widget) *u8
+pub extern "C" fn gtk_expander_set_label(expander *mut Widget, label *u8) void
+pub extern "C" fn gtk_notebook_new() *mut Widget
+pub extern "C" fn gtk_notebook_append_page(notebook *mut Widget, child *mut Widget, label *mut Widget) i32
+pub extern "C" fn gtk_notebook_get_current_page(notebook *mut Widget) i32
+pub extern "C" fn gtk_notebook_set_current_page(notebook *mut Widget, page i32) void
+pub extern "C" fn gtk_text_view_new() *mut Widget
+pub extern "C" fn gtk_text_view_get_buffer(view *mut Widget) *mut Widget
+pub extern "C" fn gtk_text_view_set_wrap_mode(view *mut Widget, mode i32) void
+pub extern "C" fn gtk_text_view_set_accepts_tab(view *mut Widget, accepts i32) void
+pub extern "C" fn gtk_text_view_set_top_margin(view *mut Widget, margin i32) void
+pub extern "C" fn gtk_text_view_set_bottom_margin(view *mut Widget, margin i32) void
+pub extern "C" fn gtk_text_view_set_left_margin(view *mut Widget, margin i32) void
+pub extern "C" fn gtk_text_view_set_right_margin(view *mut Widget, margin i32) void
+pub extern "C" fn gtk_text_buffer_set_text(buffer *mut Widget, text *u8, length i32) void
+// GtkTextIter: TEXT_ITER_SIZE caller-owned bytes each.
+pub extern "C" fn gtk_text_buffer_get_bounds(buffer *mut Widget, start *mut u8, end *mut u8) void
+pub extern "C" fn gtk_text_buffer_get_text(buffer *mut Widget, start *mut u8, end *mut u8, hidden i32) *mut u8
+pub extern "C" fn gtk_scrolled_window_set_has_frame(scroll *mut Widget, frame i32) void
+pub extern "C" fn gtk_scrolled_window_set_min_content_height(scroll *mut Widget, height i32) void
+pub extern "C" fn gtk_window_get_title(window *mut Widget) *u8
+pub extern "C" fn gtk_window_set_titlebar(window *mut Widget, titlebar *mut Widget) void
+pub extern "C" fn gtk_header_bar_new() *mut Widget
+pub extern "C" fn gtk_header_bar_set_title_widget(header *mut Widget, title *mut Widget) void
+pub extern "C" fn gtk_header_bar_pack_start(header *mut Widget, child *mut Widget) void
+pub extern "C" fn gtk_header_bar_pack_end(header *mut Widget, child *mut Widget) void
+pub extern "C" fn gtk_button_new_from_icon_name(icon *u8) *mut Widget
+pub extern "C" fn gtk_menu_button_new() *mut Widget
+pub extern "C" fn gtk_menu_button_set_icon_name(button *mut Widget, icon *u8) void
+pub extern "C" fn gtk_menu_button_set_primary(button *mut Widget, primary i32) void
+pub extern "C" fn gtk_menu_button_set_menu_model(button *mut Widget, model *mut Widget) void
+pub extern "C" fn g_simple_action_group_new() *mut Widget
+pub extern "C" fn g_simple_action_new(name *u8, parameter *u8) *mut Widget
+pub extern "C" fn g_action_map_lookup_action(map *mut Widget, name *u8) *mut Widget
+pub extern "C" fn g_action_map_add_action(map *mut Widget, action *mut Widget) void
+pub extern "C" fn g_menu_new() *mut Widget
+pub extern "C" fn g_menu_append(menu *mut Widget, label *u8, action *u8) void
+pub extern "C" fn g_menu_model_get_n_items(model *mut Widget) i32
+pub extern "C" fn g_value_take_boxed(value *mut u8, boxed *mut u8) void
+pub extern "C" fn g_object_set_data_full(object *mut Widget, key *u8, data *mut u8, destroy *u8) void
+
 pub extern "C" fn g_object_new_with_properties(gtype usize, count u32, names *mut usize, values *mut u8) *mut Widget
 pub extern "C" fn g_object_ref(object *mut Widget) *mut Widget
 pub extern "C" fn g_object_unref(object *mut Widget) void
@@ -112,6 +205,7 @@ pub extern "C" fn g_free(memory *mut u8) void
 pub extern "C" fn g_strdup(text *u8) *mut u8
 pub extern "C" fn g_utf8_strlen(text *u8, length isize) i64
 pub extern "C" fn g_utf8_validate(text *u8, length isize, end *mut u8) i32
+pub extern "C" fn g_list_free(list *mut u8) void
 pub extern "C" fn g_queue_new() *mut Queue
 pub extern "C" fn g_queue_push_tail(queue *mut Queue, data *mut u8) void
 pub extern "C" fn g_queue_pop_head(queue *mut Queue) *mut u8

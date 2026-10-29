@@ -1,0 +1,143 @@
+// G4 smoke for the Tarn GTK backend: controls, indicators, containers,
+// multiline text, header bar and menu, statically and inside a tree region.
+import "ffi"
+import "gtk/gtk"
+import "gtk/native"
+
+extern "C" fn gtk_widget_activate(widget *mut gtk.Widget) i32
+extern "C" fn gtk_widget_activate_action_variant(widget *mut gtk.Widget, name *u8, parameter *u8) i32
+extern "C" fn gtk_text_buffer_insert_at_cursor(buffer *mut gtk.Widget, text *u8, length i32) void
+
+fn check(value bool, what string) { if !value { panic("widgets: " + what) } }
+fn cstring(text &string) ffi.CString { return ffi.CString.new(text).expect("NUL") }
+fn text_of(ui &native.Native) string { return ui.event_text().expect("no event text") }
+fn value_of(ui &native.Native, key &string) i64 { return ui.value(key).expect("no value") }
+// The next event as "code:text", for readable failures.
+fn event(ui &mut native.Native) string {
+    code := ui.next()
+    return code.to_string() + ":" + ui.event_text().unwrap_or("")
+}
+fn expect(ui &mut native.Native, wanted string) {
+    got := event(ui)
+    check(got.eq(&wanted), "expected " + wanted + ", got " + got)
+}
+fn host_of(box *mut gtk.Widget) *mut gtk.Widget {
+    key := cstring(&"tarn-ui-host")
+    unsafe { return ffi.from_address(ffi.address(gtk.g_object_get_data(box, key.as_ptr()))) }
+}
+fn first(parent *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_first_child(parent) } }
+fn after(widget *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_next_sibling(widget) } }
+
+fn main() {
+    var ui = match native.create(&"Controles", &"Controles en Tarn") {
+        Ok(value) => value
+        Err(code) => { panic("create failed: " + code.to_string()) }
+    }
+    // Apps set the header while building, before the first event.
+    check(ui.set_header(&"Subtítulo") == 0, "header")
+    check(ui.set_header(&"dos\nlíneas") == 1, "header newline")
+    check(ui.add_header_button(&"refresh", &"Actualizar", &"view-refresh-symbolic", 20, false) == 0, "header button")
+    check(ui.add_header_button(&"plain", &"Texto", &"", 21, true) == 0, "text header button")
+    check(ui.add_header_button(&"nope", &"", &"", 22, true) == 1, "empty header button")
+    check(ui.add_menu_item(&"about", &"Acerca de", 30) == 0, "menu item")
+    check(ui.add_menu_item(&"about", &"Otra vez", 31) == 1, "duplicate menu key")
+    check(ui.add_menu_item(&"bad_key", &"Mal", 32) == 1, "menu key charset")
+
+    check(ui.add_page(&"home") == 0, "page")
+    check(ui.add_control(&"home", &"wifi", 0, &"Wi-Fi", 1, 1, 0, 0) == 0, "switch")
+    check(ui.add_control(&"home", &"agree", 1, &"Acepto", 2, 0, 0, 0) == 0, "check")
+    check(ui.add_control(&"home", &"volume", 2, &"Volumen", 3, 40, 0, 100) == 0, "scale")
+    check(ui.add_control(&"home", &"count", 3, &"Cantidad", 4, 5, 1, 9) == 0, "spin")
+    check(ui.add_control(&"home", &"color", 4, &"Color\nRojo\nVerde\nAzul", 5, 2, 0, 0) == 0, "dropdown")
+    check(ui.add_control(&"home", &"empty", 4, &"Color\nRojo\n\nAzul", 6, 0, 0, 0) == 1, "empty option")
+    check(ui.add_control(&"home", &"done", 5, &"Progreso", 0, 25, 0, 100) == 0, "progress")
+    check(ui.add_control(&"home", &"level", 6, &"Nivel", 0, 3, 0, 10) == 0, "level")
+    check(ui.add_control(&"home", &"busy", 7, &"Ocupado", 0, 1, 0, 0) == 0, "spinner")
+    check(ui.add_control(&"home", &"bad", 5, &"Indicador", 7, 0, 0, 1) == 1, "indicator with action")
+    check(ui.add_control(&"home", &"far", 2, &"Lejos", 8, 0, 0, 2000000000) == 1, "range limit")
+    check(ui.add_control(&"home", &"out", 3, &"Fuera", 9, 10, 1, 9) == 1, "value outside range")
+    check(ui.add_control(&"home", &"two", 0, &"a\nb", 10, 0, 0, 0) == 1, "caption newline")
+
+    check(ui.add_container(&"home", &"group", 0, &"Grupo", 0, 0) == 0, "frame")
+    check(ui.add_label(&"group", &"inside", &"Dentro del marco") == 0, "frame child")
+    check(ui.add_container(&"home", &"more", 1, &"Más", 11, 0) == 0, "expander")
+    check(ui.add_label(&"more", &"hidden", &"Oculto") == 0, "collapsed expander child")
+    check(ui.add_container(&"home", &"tabs", 2, &"", 12, 1) == 0, "tabs")
+    check(ui.add_label(&"tabs", &"loose", &"x") == 1, "tabs host only tabs")
+    check(ui.add_container(&"tabs", &"one", 3, &"Uno", 0, 0) == 0, "tab one")
+    check(ui.add_container(&"tabs", &"two-tab", 3, &"Dos", 0, 0) == 0, "tab two")
+    check(ui.add_container(&"home", &"stray", 3, &"Suelta", 0, 0) == 1, "tab outside tabs")
+    check(ui.add_label(&"two-tab", &"in-tab", &"En la pestaña") == 0, "tab child")
+    check(value_of(&ui, &"tabs") == 1, "wanted tab selected")
+    check(ui.add_text_area(&"home", &"notes", &"", 13, 4) == 0, "text area")
+    check(ui.add_text_area(&"home", &"short", &"", 14, 1) == 1, "text area lines")
+    check(ui.add_box(&"home", &"form", false, 6) == 0, "region host")
+    check(ui.show_page(&"home") == 0, "show")
+    check(ui.next() == 1, "opened")
+
+    // Model writes: no events, ranges enforced.
+    check(ui.set_input(&"volume", &"70") == 0 && value_of(&ui, &"volume") == 70, "scale write")
+    check(ui.set_input(&"volume", &"101") == 1, "scale range")
+    check(ui.set_input(&"volume", &"7x") == 1, "not a number")
+    check(ui.set_input(&"color", &"3") == 1, "dropdown range")
+    check(ui.set_input(&"done", &"50") == 0 && value_of(&ui, &"done") == 50, "progress write")
+    check(ui.set_input(&"more", &"1") == 0 && value_of(&ui, &"more") == 1, "expander write")
+    check(ui.set_input(&"tabs", &"0") == 0 && value_of(&ui, &"tabs") == 0, "tabs write")
+    check(ui.set_input(&"tabs", &"2") == 1, "tabs range")
+    check(ui.set_input(&"notes", &"línea 1\nlínea 2") == 0, "text area write")
+
+    // User changes queue 1000 + action with the new value.
+    unsafe {
+        gtk.gtk_switch_set_active(ui.widget(&"wifi"), 0)
+        gtk.gtk_check_button_set_active(ui.widget(&"agree"), 1)
+        gtk.gtk_range_set_value(ui.widget(&"volume"), 12.0)
+        gtk.gtk_spin_button_set_value(ui.widget(&"count"), 8.0)
+        gtk.gtk_drop_down_set_selected(ui.widget(&"color"), 0)
+        gtk.gtk_expander_set_expanded(host_of(ui.widget(&"more")), 0)
+        gtk.gtk_notebook_set_current_page(first(ui.widget(&"tabs")), 1)
+        text := cstring(&"!")
+        gtk_text_buffer_insert_at_cursor(gtk.gtk_text_view_get_buffer(ui.widget(&"notes")), text.as_ptr(), -1)
+    }
+    expect(&mut ui, "1001:0")
+    expect(&mut ui, "1002:1")
+    expect(&mut ui, "1003:12")
+    expect(&mut ui, "1004:8")
+    expect(&mut ui, "1005:0")
+    expect(&mut ui, "1011:0")
+    expect(&mut ui, "1012:1")
+    expect(&mut ui, "1013:línea 1\nlínea 2!")
+
+    // Header button and menu entry.
+    unsafe { check(gtk_widget_activate(ui.widget(&"plain")) == 1, "activate header button") }
+    check(ui.next() == 1021, "header button event")
+    action := cstring(&"tarn.about")
+    unsafe { check(gtk_widget_activate_action_variant(ui.native_window(), action.as_ptr(), ffi.null()) == 1, "menu action") }
+    check(ui.next() == 1030, "menu event")
+
+    // A tree region with controls, an expander and a text area.
+    check(ui.tree_begin(&"form", 4) == 0, "tree begin")
+    check(ui.tree_container(&"form", &"box", 1, &"Opciones", 40, 1) == 0, "tree expander")
+    check(ui.tree_control(&"box", &"speed", 2, &"Velocidad", 41, 3, 0, 10) == 0, "tree scale")
+    check(ui.tree_control(&"box", &"on", 0, &"Activo", 42, 0, 0, 0) == 0, "tree switch")
+    check(ui.tree_text_area(&"form", &"memo", &"hola", 43, 3) == 0, "tree area")
+    check(ui.tree_end() == 0, "tree end")
+    speed := ui.widget(&"speed")
+    memo := ui.widget(&"memo")
+    check(ui.tree_begin(&"form", 3) == 0, "rewrite begin")
+    check(ui.tree_text_area(&"form", &"memo", &"adiós", 43, 3) == 0, "area first")
+    check(ui.tree_container(&"form", &"box", 1, &"Más opciones", 40, 0) == 0, "expander rewrite")
+    check(ui.tree_control(&"box", &"speed", 2, &"Velocidad", 41, 9, 0, 10) == 0, "scale rewrite")
+    check(ui.tree_end() == 0, "rewrite end")
+    check(ui.widget(&"speed") == speed && ui.widget(&"memo") == memo, "identity kept")
+    check(ui.widget(&"on") == ffi.null(), "absent switch removed")
+    check(value_of(&ui, &"speed") == 9 && value_of(&ui, &"box") == 0, "values written")
+    check(after(first(ui.widget(&"form"))) != ffi.null() && ui.widget(&"memo") != ffi.null(), "order kept")
+    check(ui.tree_begin(&"form", 1) == 0, "mismatch begin")
+    check(ui.tree_control(&"form", &"memo", 2, &"x", 43, 0, 0, 1) == 1, "family is fixed")
+
+    check(ui.request_close() == 0, "close")
+    // Model writes queued nothing: the next event is the close.
+    check(ui.next() == 2, "closed")
+    check(ui.release() == 0, "release")
+    print("widgets ok")
+}

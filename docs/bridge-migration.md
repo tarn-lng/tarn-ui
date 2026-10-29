@@ -21,7 +21,9 @@ con los límites de la FFI:
 | Propiedades de construcción (`accessible-role`) | `g_object_new_with_properties` (no variádica) |
 | Arreglos `char **` | `Vec<usize>` de direcciones `CString` terminado en 0 |
 
-Notas: GTK emite `clicked` de `gtk_widget_activate` tras un timeout, igual que
+Notas: `gtk_accessible_list_new_from_array` rechaza arreglos válidos en GTK
+4.24 (aserción invertida); la relación `labelled-by` usa
+`gtk_accessible_list_new_from_list`. GTK emite `clicked` de `gtk_widget_activate` tras un timeout, igual que
 desde C. Los punteros no retienen préstamos: cada `CString`, `Vec` o bloque
 pasado a GTK debe vivir mientras GTK lo use.
 
@@ -47,7 +49,7 @@ pasado a GTK debe vivir mientras GTK lo use.
 | G1 ✓ | `gtk.tarn`, bloque de banderas, cola de eventos; ciclo de vida: create, next, request_close, release, finish, wake, background, present/hide, is_visible; contador | smoke Tarn del ciclo de vida y contador, sin fugas de sesión |
 | G2 ✓ | páginas, etiquetas, botones, cajas, texto, entradas, `set_*`, foco, accesibilidad | `tests/native/components.tarn`: los mismos casos que `session-smoke`, más finalización de widgets |
 | G3 ✓ | listas y regiones (`list_*`, `tree_*`) | `tests/native/regions.tarn`: identidad, orden, reescritura y eliminación |
-| G4 | controles, indicadores, contenedores, texto multilínea, barra de título y menú | ejemplo `widgets` |
+| G4 ✓ | controles, indicadores, contenedores, texto multilínea, barra de título y menú | `tests/native/widgets.tarn`: eventos de usuario, escrituras sin evento, rangos, contenedores, cabecera, menú y sus nodos de región |
 | G5 | devtools (`ui.inspect`, `ui.fill`, `ui.click`, `ui.close`) en Tarn; json-glib o JSON propio | suites Python (widgets, navigation, reactive, devtools, tray) sin cambios |
 | G6 | `session.tarn` usa el backend Tarn por defecto; se borran `bridge.c`, `bridge.h`, `devtools.inc`, scripts de compilación de C | todas las suites + ASan sobre el binario Tarn |
 
