@@ -8,8 +8,8 @@ fn main() {
     unsafe {
         match session.run("Tarn UI", "Hola desde Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
             return reactive.drive_counter(ui, &mut state,
-                fn(value i64, event session.Event) Result<i64, session.Error> { return counter.reduce(value, event) },
-                fn(value i64) reactive.CounterView { return counter.view(value) })
+                counter.reduce,
+                counter.view)
         }) {
             Ok(_) => { print("closed") }
             Err(error) => {

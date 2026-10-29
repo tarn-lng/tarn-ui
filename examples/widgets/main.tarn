@@ -169,8 +169,7 @@ fn run(ui &mut session.Session) Result<void, session.Error> {
 
 fn main() {
     unsafe {
-        match session.run("Tarn UI · controles", "Controles nativos",
-            fn(ui &mut session.Session) Result<void, session.Error> { return run(ui) }) {
+        match session.run("Tarn UI · controles", "Controles nativos", run) {
             Ok(_) => { print("closed") }
             Err(error) => { print(error.message())
                 os.exit(1) }

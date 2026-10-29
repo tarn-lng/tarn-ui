@@ -106,10 +106,10 @@ fn run(ui &mut session.Session, desk &mut desktop.Desktop) Result<void, session.
                 try ui.complete_event()
             }
         }
-        signals := try desk.poll().map_err(fn(failure error.Error) session.Error { return dbus(failure) })
+        signals := try desk.poll().map_err(dbus)
         for signal in signals { try on_signal(ui, &mut app, signal) }
         try ui.set_text("summary", summary(&app))
-        try desk.apply(&tray(&app)).map_err(fn(failure error.Error) session.Error { return dbus(failure) })
+        try desk.apply(&tray(&app)).map_err(dbus)
     }
     return ui.request_close()
 }
