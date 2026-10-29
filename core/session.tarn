@@ -362,8 +362,7 @@ pub fn Session.unwatch_fd(&mut self, id u32) Result<void, Error> {
     for index < self.watches.len() {
         if self.watches.get(index) == id {
             self.watches.swap_remove(index)
-            var removed: i32 = 0
-            unsafe { removed = g_source_remove(id) }
+            unsafe { g_source_remove(id) }
             return Ok(())
         }
         index = index + 1
@@ -373,8 +372,7 @@ pub fn Session.unwatch_fd(&mut self, id u32) Result<void, Error> {
 
 fn Session.unwatch_all(&mut self) {
     for id in &self.watches {
-        var removed: i32 = 0
-        unsafe { removed = g_source_remove(id) }
+        unsafe { g_source_remove(id) }
     }
     self.watches = Vec.new()
 }
