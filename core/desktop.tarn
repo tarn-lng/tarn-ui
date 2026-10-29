@@ -1,0 +1,125 @@
+// Desktop integration for Tarn UI apps: a tray icon with a menu and
+// notifications with actions, over tarn-dbus (pure Tarn, no C). The session
+// watches the bus socket (Session.watch_fd) and the app calls `poll` after
+// each action, so no thread and no busy loop is involved.
+import "core/session"
+import "desktop/dbusmenu"
+import "desktop/notifications"
+import "desktop/status_notifier"
+import "src/connection"
+import "src/error"
+
+/// What the tray shows. Reapplying an unchanged view sends nothing: every
+/// tray property and the menu are compared before they are published.
+pub struct TrayView { pub icon string
+    pub title string
+    pub tooltip string
+    pub attention bool
+    pub items Vec<dbusmenu.Item> }
+
+pub struct Chosen { pub notification u32
+    pub action string }
+
+pub enum Signal {
+    /// Primary click on the tray icon.
+    Activate
+    /// A menu entry was clicked.
+    Menu(i32)
+    /// A notification action ("default" is the notification body).
+    Notification(Chosen)
+    /// The tray host appeared or returned after a restart.
+    TrayShown
+    /// The tray host went away; the icon is not visible until it returns.
+    TrayGone
+}
+
+pub struct Desktop { bus connection.Connection
+    tray status_notifier.Tray }
+
+/// Converts a D-Bus failure into a UI error after reporting it.
+pub fn ui_error(failure error.Error) session.Error {
+    print("desktop: " + failure.name + ": " + failure.message)
+    return session.Error{code: 40}
+}
+
+/// Connects to the session bus, publishes the tray item and subscribes to
+/// notification events. `id` is a stable application identifier.
+pub fn connect(id &string, view &TrayView) Result<Desktop, error.Error> {
+    path := try connection.session_path()
+    var bus = try connection.open(&path)
+    var tray = try status_notifier.start(&mut bus, id, &view.title, &view.icon, clone_items(&view.items))
+    try notifications.subscribe(&mut bus)
+    var desktop = Desktop{bus: bus, tray: tray}
+    try desktop.apply(view)
+    return Ok(desktop)
+}
+
+fn clone_items(items &Vec<dbusmenu.Item>) Vec<dbusmenu.Item> {
+    var out: Vec<dbusmenu.Item> = Vec.new()
+    for item in items.as_slice() { out.push(item.clone()) }
+    return out
+}
+
+/// True while a tray host shows the icon. Without one, an app must not hide
+/// its only window: it would become unreachable.
+pub fn Desktop.has_tray(&self) bool { return self.tray.is_registered() }
+
+/// The bus socket, for Session.watch_fd.
+pub fn Desktop.fd(&self) i32 { return self.bus.raw_fd() }
+
+pub fn Desktop.apply(&mut self, view &TrayView) Result<void, error.Error> {
+    try self.tray.set_title(&mut self.bus, &view.title)
+    try self.tray.set_icon_name(&mut self.bus, &view.icon)
+    try self.tray.set_tooltip(&mut self.bus, &view.icon, &view.title, &view.tooltip)
+    if view.attention { try self.tray.set_status(&mut self.bus, status_notifier.Status.NeedsAttention)
+    } else { try self.tray.set_status(&mut self.bus, status_notifier.Status.Active) }
+    try self.tray.set_menu(&mut self.bus, clone_items(&view.items))
+    return self.bus.flush(1000)
+}
+
+/// Never blocks: answers tray and menu calls, and returns what the user did.
+/// Call it on Action.Wake and after every other action, since blocking calls
+/// such as `notify` may have queued messages without waking the session.
+pub fn Desktop.poll(&mut self) Result<Vec<Signal>, error.Error> {
+    var out: Vec<Signal> = Vec.new()
+    for {
+        batch := try self.bus.dispatch(64)
+        if batch.is_empty() { break }
+        for incoming in batch {
+            events := try self.tray.handle(&mut self.bus, incoming)
+            for event in &events { signal_of(event, &mut out) }
+        }
+    }
+    try self.bus.flush(1000)
+    return Ok(out)
+}
+
+fn signal_of(event &status_notifier.Event, out &mut Vec<Signal>) {
+    match event {
+        status_notifier.Event.Activate(_) => { out.push(Signal.Activate) }
+        status_notifier.Event.Menu(item) => {
+            if item.kind.eq(&"clicked") { out.push(Signal.Menu(item.id)) }
+        }
+        status_notifier.Event.Registered => { out.push(Signal.TrayShown) }
+        status_notifier.Event.WatcherGone => { out.push(Signal.TrayGone) }
+        status_notifier.Event.Other(other) => {
+            match notifications.event(other) {
+                Some(notifications.Event.ActionInvoked(chosen)) => {
+                    out.push(Signal.Notification(Chosen{notification: chosen.id, action: chosen.text}))
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Shows a notification; actions come back through `poll`.
+pub fn Desktop.notify(&mut self, item &notifications.Notification) Result<u32, error.Error> {
+    return notifications.notify(&mut self.bus, item, 2000)
+}
+
+/// Unpublishes the tray item: the watcher drops it when the name goes away.
+pub fn Desktop.close(&mut self) {
+    self.bus.close()
+}
