@@ -1,5 +1,4 @@
 // G1 smoke for the Tarn GTK backend: lifecycle, events, counter, background.
-import "string"
 import "gtk/gtk"
 import "gtk/native"
 
@@ -10,7 +9,7 @@ fn check(value bool, what string) { if !value { panic("lifecycle: " + what) } }
 fn open(title string) native.Native {
     match native.create(&title, &"Hola desde Tarn") {
         Ok(value) => { return value }
-        Err(code) => { panic("create failed: " + string.from_i64(i64(code))) }
+        Err(code) => { panic("create failed: " + code.to_string()) }
     }
 }
 

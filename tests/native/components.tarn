@@ -1,7 +1,6 @@
 // G2 smoke for the Tarn GTK backend: pages, components, entries, focus,
 // accessibility, and that release finalizes every widget it created.
 import "ffi"
-import "string"
 import "gtk/gtk"
 import "gtk/native"
 
@@ -11,7 +10,7 @@ extern "C" fn g_object_weak_ref(object *mut gtk.Widget, notify *u8, data *mut i3
 
 fn check(value bool, what string) { if !value { panic("components: " + what) } }
 fn finalized(data *mut i32, object *mut gtk.Widget) void {
-    unsafe { ffi.write(data, ffi.read(ffi.to_const(data)) + 1) }
+    unsafe { ffi.write(data, ffi.read(data) + 1) }
 }
 
 fn main() {
@@ -59,7 +58,7 @@ fn main() {
         g_object_weak_ref(ui.native_window(), ffi.callback(finalized), ffi.of_mut(&mut gone))
         check(gtk_widget_activate(go) == 1, "activate")
         click := ui.next()
-        check(click == 1007, "click event " + string.from_i64(i64(click)))
+        check(click == 1007, "click event " + click.to_string())
         check(text_of(&ui).is_empty(), "click carries no text")
         typed := cstring(&"Ana María")
         gtk_editable_set_text(name, typed.as_ptr())
@@ -80,7 +79,7 @@ fn main() {
     check(ui.release() == 0, "release")
     unsafe {
         for gtk.g_main_context_iteration(ffi.null(), 0) != 0 {}
-        check(ffi.read(ffi.to_const(ffi.of_mut(&mut gone))) == 3, "widgets finalized: " + string.from_i64(i64(gone)))
+        check(ffi.read(ffi.of(&gone)) == 3, "widgets finalized: " + gone.to_string())
     }
     print("components ok")
 }
@@ -88,19 +87,9 @@ fn main() {
 fn match_open() native.Native {
     match native.create(&"Componentes", &"Componentes en Tarn") {
         Ok(value) => { return value }
-        Err(code) => { panic("create failed: " + string.from_i64(i64(code))) }
+        Err(code) => { panic("create failed: " + code.to_string()) }
     }
 }
 
-fn text_of(ui &native.Native) string {
-    match ui.event_text() {
-        Some(text) => { return text }
-        None => { panic("no event text") }
-    }
-}
-fn cstring(text &string) ffi.CString {
-    match ffi.CString.new(text) {
-        Some(value) => { return value }
-        None => { panic("NUL") }
-    }
-}
+fn text_of(ui &native.Native) string { return ui.event_text().expect("no event text") }
+fn cstring(text &string) ffi.CString { return ffi.CString.new(text).expect("NUL") }

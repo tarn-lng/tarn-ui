@@ -3,63 +3,66 @@
 // 4 no display, 5 creation failure, 6 closed, 8 queue full; next returns
 // 1 Opened, 2 Closed, 3 Increment, 4 Hidden, 5 Wake or a negative status.
 import "ffi"
-import "string"
 import "collections"
 import "gtk/gtk"
 
 // Signal handlers cannot reach Tarn values, so what they write lives in a
 // GLib block: i32 flags in slots 0..5, the event queue pointer at byte 32.
 // Queued events are 16-byte records: i32 code, then an owned text pointer.
-fn OPENED() usize { return 0 }
-fn CLOSED() usize { return 1 }
-fn HIDDEN() usize { return 2 }
-fn WOKEN() usize { return 3 }
-fn FULL() usize { return 4 }
-fn BACKGROUND() usize { return 5 }
-fn BLOCK_SIZE() usize { return 40 }
-fn QUEUE_CAPACITY() u32 { return 64 }
+const OPENED usize = 0
+const CLOSED usize = 1
+const HIDDEN usize = 2
+const WOKEN usize = 3
+const FULL usize = 4
+const BACKGROUND usize = 5
+const QUEUE_SLOT usize = 32
+const BLOCK_SIZE usize = QUEUE_SLOT + 8
+const QUEUE_CAPACITY u32 = 64
+const RECORD_SIZE usize = 16
+const RECORD_TEXT usize = 8
 
-fn byte_at(base *mut u8, offset usize) *mut u8 {
-    return ffi.from_address(ffi.address(ffi.to_const(base)) + offset)
+// A typed cell `offset` bytes into GLib memory.
+fn cell<T>(base *mut u8, offset usize) *mut T {
+    return ffi.from_address(ffi.address(base) + offset)
 }
 fn flag(block *mut u8, slot usize) i32 {
-    var cell: *mut i32 = ffi.from_address(ffi.address(ffi.to_const(block)) + slot * 4)
-    unsafe { return ffi.read(ffi.to_const(cell)) }
+    var flags: *mut i32 = cell(block, 0)
+    unsafe { return ffi.read(ffi.offset(flags, slot)) }
 }
 fn set_flag(block *mut u8, slot usize, value i32) {
-    var cell: *mut i32 = ffi.from_address(ffi.address(ffi.to_const(block)) + slot * 4)
-    unsafe { ffi.write(cell, value) }
+    var flags: *mut i32 = cell(block, 0)
+    unsafe { ffi.write(ffi.offset_mut(flags, slot), value) }
 }
 fn queue(block *mut u8) *mut gtk.Queue {
-    var cell: *mut *mut gtk.Queue = ffi.from_address(ffi.address(ffi.to_const(block)) + 32)
-    unsafe { return ffi.read(ffi.to_const(cell)) }
+    var slot: *mut *mut gtk.Queue = cell(block, QUEUE_SLOT)
+    unsafe { return ffi.read(slot) }
 }
 fn record_code(record *mut u8) i32 {
-    var cell: *mut i32 = ffi.from_address(ffi.address(ffi.to_const(record)))
-    unsafe { return ffi.read(ffi.to_const(cell)) }
+    var code: *mut i32 = cell(record, 0)
+    unsafe { return ffi.read(code) }
 }
 fn record_text(record *mut u8) *mut u8 {
-    var cell: *mut *mut u8 = ffi.from_address(ffi.address(ffi.to_const(record)) + 8)
-    unsafe { return ffi.read(ffi.to_const(cell)) }
+    var text: *mut *mut u8 = cell(record, RECORD_TEXT)
+    unsafe { return ffi.read(text) }
 }
 
 // Takes ownership of `text` (may be null).
 fn enqueue(block *mut u8, code i32, text *mut u8) {
     unsafe {
         events := queue(block)
-        if flag(block, CLOSED()) != 0 || flag(block, FULL()) != 0 {
+        if flag(block, CLOSED) != 0 || flag(block, FULL) != 0 {
             gtk.g_free(text)
             return
         }
-        if gtk.g_queue_get_length(events) == QUEUE_CAPACITY() {
-            set_flag(block, FULL(), 1)
+        if gtk.g_queue_get_length(events) == QUEUE_CAPACITY {
+            set_flag(block, FULL, 1)
             gtk.g_free(text)
             return
         }
-        record := gtk.g_malloc0(16)
-        var code_cell: *mut i32 = ffi.from_address(ffi.address(ffi.to_const(record)))
+        record := gtk.g_malloc0(RECORD_SIZE)
+        var code_cell: *mut i32 = cell(record, 0)
         ffi.write(code_cell, code)
-        var text_cell: *mut *mut u8 = ffi.from_address(ffi.address(ffi.to_const(record)) + 8)
+        var text_cell: *mut *mut u8 = cell(record, RECORD_TEXT)
         ffi.write(text_cell, text)
         gtk.g_queue_push_tail(events, record)
     }
@@ -68,7 +71,7 @@ fn drain(block *mut u8) {
     unsafe {
         events := queue(block)
         var record = gtk.g_queue_pop_head(events)
-        for !ffi.is_null(ffi.to_const(record)) {
+        for !ffi.is_null(record) {
             gtk.g_free(record_text(record))
             gtk.g_free(record)
             record = gtk.g_queue_pop_head(events)
@@ -79,17 +82,17 @@ fn drain(block *mut u8) {
 // Signal handlers (C ABI through ffi.callback).
 fn clicked(button *mut gtk.Widget, block *mut u8) void { enqueue(block, 3, ffi.null()) }
 fn mapped(window *mut gtk.Widget, block *mut u8) void {
-    if flag(block, CLOSED()) == 0 { set_flag(block, OPENED(), 1) }
+    if flag(block, CLOSED) == 0 { set_flag(block, OPENED, 1) }
 }
 fn close_requested(window *mut gtk.Widget, block *mut u8) i32 {
-    if flag(block, BACKGROUND()) != 0 {
+    if flag(block, BACKGROUND) != 0 {
         // Background mode: the window hides; the session and its events stay.
         unsafe { gtk.gtk_widget_set_visible(window, 0) }
-        set_flag(block, HIDDEN(), 1)
+        set_flag(block, HIDDEN, 1)
         return 1
     }
-    set_flag(block, CLOSED(), 1)
-    set_flag(block, OPENED(), 0)
+    set_flag(block, CLOSED, 1)
+    set_flag(block, OPENED, 0)
     drain(block)
     // Queue closure only; next() hides the window and release() destroys it.
     return 1
@@ -123,11 +126,11 @@ pub struct Native {
 }
 
 // What a key names. Handlers are disconnected on release.
-fn PAGE() u32 { return 0 }
-fn BOX() u32 { return 1 }
-fn LABEL() u32 { return 2 }
-fn BUTTON() u32 { return 3 }
-fn ENTRY() u32 { return 4 }
+const PAGE u32 = 0
+const BOX u32 = 1
+const LABEL u32 = 2
+const BUTTON u32 = 3
+const ENTRY u32 = 4
 copy struct Part {
     widget *mut gtk.Widget
     kind u32
@@ -138,40 +141,36 @@ copy struct Part {
     tree_kind u32
     action u32
 }
-fn REGION_LIST() u32 { return 1 }
-fn REGION_TREE() u32 { return 2 }
+const REGION_LIST u32 = 1
+const REGION_TREE u32 = 2
 fn blank() Part {
     return Part { widget: ffi.null(), kind: 0, horizontal: false, handler: 0, region: 0, tree_kind: 0, action: 0 }
 }
 
-fn c(text &string) Result<ffi.CString, i32> {
-    match ffi.CString.new(text) {
-        Some(value) => { return Ok(value) }
-        None => { return Err(1) }
-    }
-}
+const MAX_ACTION u32 = 1024
+const MAX_PARTS usize = 256
+const MAX_INPUT i64 = 256
+const SESSION_KEY string = "tarn-ui-session"
+const ACTION_KEY string = "tarn-ui-action"
+const FOCUS_KEY string = "tarn-ui-last-focus"
+
+fn c(text &string) Result<ffi.CString, i32> { return ffi.CString.new(text).ok_or(1) }
 // Fixed text without NUL bytes.
-fn literal(text &string) ffi.CString {
-    match ffi.CString.new(text) {
-        Some(value) => { return value }
-        None => { panic("literal with NUL") }
-    }
-}
+fn literal(text &string) ffi.CString { return ffi.CString.new(text).expect("literal with NUL") }
 fn main_thread() bool {
     unsafe { return gtk.gettid() == gtk.getpid() }
 }
-fn session_key() ffi.CString { return literal(&"tarn-ui-session") }
 
 // One session per process: a live one marks its window.
 fn session_active() bool {
     unsafe {
-        key := session_key()
+        key := literal(&SESSION_KEY)
         windows := gtk.gtk_window_get_toplevels()
         count := gtk.g_list_model_get_n_items(windows)
         var i: u32 = 0
         for i < count {
             window := gtk.g_list_model_get_item(windows, i)
-            marked := !ffi.is_null(ffi.to_const(gtk.g_object_get_data(window, key.as_ptr())))
+            marked := !ffi.is_null(gtk.g_object_get_data(window, key.as_ptr()))
             gtk.g_object_unref(window)
             if marked { return true }
             i = i + 1
@@ -184,7 +183,7 @@ fn session_active() bool {
 fn wrap_label(label *mut gtk.Widget) {
     unsafe {
         gtk.gtk_label_set_wrap(label, 1)
-        gtk.gtk_label_set_wrap_mode(label, gtk.WRAP_WORD_CHAR())
+        gtk.gtk_label_set_wrap_mode(label, gtk.WRAP_WORD_CHAR)
     }
 }
 fn margins(widget *mut gtk.Widget, start i32, end i32, top i32, bottom i32) {
@@ -205,41 +204,41 @@ fn zeroed(size usize) Vec<u8> {
     return bytes
 }
 fn set_accessible_int(widget *mut gtk.Widget, property i32, number i32) {
-    var value = zeroed(gtk.GVALUE_SIZE())
+    var value = zeroed(gtk.GVALUE_SIZE)
     var properties: Vec<i32> = Vec.new()
     properties.push(property)
     unsafe {
-        initialized := gtk.g_value_init(ffi.slice_mut(value.as_mut_slice()), gtk.TYPE_INT())
-        gtk.g_value_set_int(ffi.slice_mut(value.as_mut_slice()), number)
-        gtk.gtk_accessible_update_property_value(widget, 1, ffi.slice_mut(properties.as_mut_slice()), ffi.slice_mut(value.as_mut_slice()))
-        gtk.g_value_unset(ffi.slice_mut(value.as_mut_slice()))
+        gvalue := ffi.vec_mut(&mut value)
+        initialized := gtk.g_value_init(gvalue, gtk.TYPE_INT)
+        gtk.g_value_set_int(gvalue, number)
+        gtk.gtk_accessible_update_property_value(widget, 1, ffi.vec_mut(&mut properties), gvalue)
+        gtk.g_value_unset(gvalue)
     }
 }
 // A label whose accessible role is heading: the role is construct-only.
 fn heading_label(text &ffi.CString) Result<*mut gtk.Widget, i32> {
-    role_name := try c(&"accessible-role")
-    label_name := try c(&"label")
+    role_name := literal(&"accessible-role")
+    label_name := literal(&"label")
     var names: Vec<usize> = Vec.new()
     names.push(ffi.address(role_name.as_ptr()))
     names.push(ffi.address(label_name.as_ptr()))
-    size := gtk.GVALUE_SIZE()
-    var values = zeroed(size * 2)
+    var values = zeroed(gtk.GVALUE_SIZE * 2)
     unsafe {
-        first := ffi.slice_mut(values.as_mut_slice())
-        second := byte_at(first, size)
+        first := ffi.vec_mut(&mut values)
+        second := ffi.offset_mut(first, gtk.GVALUE_SIZE)
         role := gtk.g_value_init(first, gtk.gtk_accessible_role_get_type())
-        gtk.g_value_set_enum(first, gtk.ROLE_HEADING())
-        string_value := gtk.g_value_init(second, gtk.TYPE_STRING())
+        gtk.g_value_set_enum(first, gtk.ROLE_HEADING)
+        string_value := gtk.g_value_init(second, gtk.TYPE_STRING)
         gtk.g_value_set_string(second, text.as_ptr())
-        label := gtk.g_object_new_with_properties(gtk.gtk_label_get_type(), 2, ffi.slice_mut(names.as_mut_slice()), first)
+        label := gtk.g_object_new_with_properties(gtk.gtk_label_get_type(), 2, ffi.vec_mut(&mut names), first)
         gtk.g_value_unset(first)
         gtk.g_value_unset(second)
         return Ok(label)
     }
 }
-fn connect(instance *mut gtk.Widget, signal &string, handler *u8, data *mut u8) Result<u64, i32> {
-    name := try c(signal)
-    unsafe { return Ok(gtk.g_signal_connect_data(instance, name.as_ptr(), handler, data, ffi.to_const(ffi.null()), 0)) }
+fn connect(instance *mut gtk.Widget, signal &string, handler *u8, data *mut u8) u64 {
+    name := literal(signal)
+    unsafe { return gtk.g_signal_connect_data(instance, name.as_ptr(), handler, data, ffi.null(), 0) }
 }
 
 pub fn abi() u32 { return 14 }
@@ -248,9 +247,9 @@ pub fn abi() u32 { return 14 }
 pub fn Native.native_window(&self) *mut gtk.Widget { return self.window }
 pub fn Native.counter_button(&self) *mut gtk.Widget { return self.button }
 pub fn Native.widget(&self, key &string) *mut gtk.Widget {
-    match collections.get_copy(&self.parts, key) {
-        Some(part) => { return part.widget }
-        None => { return ffi.null() }
+    return match collections.get_copy(&self.parts, key) {
+        Some(part) => part.widget
+        None => ffi.null()
     }
 }
 
@@ -261,21 +260,20 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
     if session_active() { return Err(3) }
     unsafe {
         if gtk.gtk_init_check() == 0 { return Err(4) }
-        block := gtk.g_malloc0(BLOCK_SIZE())
-        var queue_cell: *mut *mut gtk.Queue = ffi.from_address(ffi.address(ffi.to_const(block)) + 32)
-        ffi.write(queue_cell, gtk.g_queue_new())
+        block := gtk.g_malloc0(BLOCK_SIZE)
+        var queue_slot: *mut *mut gtk.Queue = cell(block, QUEUE_SLOT)
+        ffi.write(queue_slot, gtk.g_queue_new())
         window := gtk.gtk_window_new()
         // Explicit ref in addition to GTK's toplevel ref; release() drops it.
         held := gtk.g_object_ref(window)
-        key := session_key()
+        key := literal(&SESSION_KEY)
         gtk.g_object_set_data(window, key.as_ptr(), block)
         gtk.gtk_window_set_title(window, title_text.as_ptr())
         gtk.gtk_window_set_default_size(window, 480, 240)
         label := try heading_label(&heading_text)
-        set_accessible_int(label, gtk.PROPERTY_LEVEL(), 1)
+        set_accessible_int(label, gtk.PROPERTY_LEVEL, 1)
         wrap_label(label)
-        class := try c(&"title-1")
-        gtk.gtk_widget_add_css_class(label, class.as_ptr())
+        css(label, &"title-1", true)
         margins(label, 24, 24, 24, 24)
         // The parent sinks the child's floating ref; no extra child owner.
         gtk.gtk_window_set_child(window, label)
@@ -287,8 +285,8 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
             region: ffi.null(), tree_mode: false, expected: 0, seen: collections.Set.new(),
             previous: ffi.null(), tree_last: collections.Map.new(), focus_removed: false,
         }
-        native.handlers.push(try connect(window, &"close-request", ffi.callback(close_requested), block))
-        native.handlers.push(try connect(window, &"map", ffi.callback(mapped), block))
+        native.handlers.push(connect(window, &"close-request", ffi.callback(close_requested), block))
+        native.handlers.push(connect(window, &"map", ffi.callback(mapped), block))
         gtk.gtk_window_present(window)
         return Ok(native)
     }
@@ -298,7 +296,7 @@ fn Native.check(&self) i32 {
     if !main_thread() { return 2 }
     return 0
 }
-fn Native.closed(&self) bool { return flag(self.block, CLOSED()) != 0 }
+fn Native.closed(&self) bool { return flag(self.block, CLOSED) != 0 }
 
 pub fn Native.next(&mut self) i32 {
     status := self.check()
@@ -311,21 +309,21 @@ pub fn Native.next(&mut self) i32 {
                 self.delivered_closed = true
                 return 2
             }
-            if flag(self.block, FULL()) != 0 { return -8 }
-            if flag(self.block, HIDDEN()) != 0 {
-                set_flag(self.block, HIDDEN(), 0)
+            if flag(self.block, FULL) != 0 { return -8 }
+            if flag(self.block, HIDDEN) != 0 {
+                set_flag(self.block, HIDDEN, 0)
                 return 4
             }
-            if flag(self.block, WOKEN()) != 0 {
-                set_flag(self.block, WOKEN(), 0)
+            if flag(self.block, WOKEN) != 0 {
+                set_flag(self.block, WOKEN, 0)
                 return 5
             }
-            if flag(self.block, OPENED()) != 0 {
-                set_flag(self.block, OPENED(), 0)
+            if flag(self.block, OPENED) != 0 {
+                set_flag(self.block, OPENED, 0)
                 return 1
             }
             record := gtk.g_queue_pop_head(queue(self.block))
-            if !ffi.is_null(ffi.to_const(record)) {
+            if !ffi.is_null(record) {
                 gtk.g_free(self.text)
                 self.text = record_text(record)
                 code := record_code(record)
@@ -341,8 +339,8 @@ pub fn Native.next(&mut self) i32 {
 // Text of the last dispatched event, borrowed until the next next().
 pub fn Native.event_text(&self) Option<string> {
     if self.check() != 0 || self.closed() { return None }
-    if ffi.is_null(ffi.to_const(self.text)) { return Some("") }
-    unsafe { return ffi.string_from_c(ffi.to_const(self.text)) }
+    if ffi.is_null(self.text) { return Some("") }
+    unsafe { return ffi.string_from_c(self.text) }
 }
 
 pub fn Native.request_close(&mut self) i32 {
@@ -350,28 +348,28 @@ pub fn Native.request_close(&mut self) i32 {
     if status != 0 { return status }
     if self.closed() { return 6 }
     // An explicit close ends the session even in background mode.
-    set_flag(self.block, BACKGROUND(), 0)
+    set_flag(self.block, BACKGROUND, 0)
     unsafe { gtk.gtk_window_close(self.window) }
     return 0
 }
 
 // Coalesced: any number of wakes before next() become one Wake event.
 // Safe from a GLib source callback on the main thread; `data` is wake_data().
-pub fn wake(data *mut u8) { set_flag(data, WOKEN(), 1) }
+pub fn wake(data *mut u8) { set_flag(data, WOKEN, 1) }
 pub fn Native.wake_data(&self) *mut u8 { return self.block }
 
 pub fn Native.set_background(&mut self, enabled bool) i32 {
     status := self.check()
     if status != 0 { return status }
     if self.closed() { return 6 }
-    if enabled { set_flag(self.block, BACKGROUND(), 1) } else { set_flag(self.block, BACKGROUND(), 0) }
+    set_flag(self.block, BACKGROUND, gbool(enabled))
     return 0
 }
 pub fn Native.present(&mut self) i32 {
     status := self.check()
     if status != 0 { return status }
     if self.closed() { return 6 }
-    set_flag(self.block, HIDDEN(), 0)
+    set_flag(self.block, HIDDEN, 0)
     unsafe { gtk.gtk_window_present(self.window) }
     return 0
 }
@@ -392,13 +390,13 @@ pub fn Native.enable_counter(&mut self, value i64) i32 {
     status := self.check()
     if status != 0 { return status }
     if self.closed() { return 6 }
-    if !ffi.is_null(ffi.to_const(self.counter)) || !ffi.is_null(ffi.to_const(self.pages)) { return 1 }
+    if !ffi.is_null(self.counter) || !ffi.is_null(self.pages) { return 1 }
     unsafe {
         heading := gtk.gtk_window_get_child(self.window)
         // Keep the heading alive while it moves between parents.
         held := gtk.g_object_ref(heading)
         gtk.gtk_window_set_child(self.window, ffi.null())
-        column := gtk.gtk_box_new(1, 12)
+        column := gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12)
         gtk.gtk_window_set_child(self.window, column)
         gtk.gtk_box_append(column, heading)
         gtk.g_object_unref(heading)
@@ -410,10 +408,7 @@ pub fn Native.enable_counter(&mut self, value i64) i32 {
         self.button = gtk.gtk_button_new_with_label(caption.as_ptr())
         margins(self.button, 24, 24, 0, 24)
         gtk.gtk_box_append(column, self.button)
-        match connect(self.button, &"clicked", ffi.callback(clicked), self.block) {
-            Ok(id) => { self.click_handler = id }
-            Err(failure) => { return failure }
-        }
+        self.click_handler = connect(self.button, &"clicked", ffi.callback(clicked), self.block)
     }
     return self.set_counter(value)
 }
@@ -421,22 +416,21 @@ pub fn Native.set_counter(&mut self, value i64) i32 {
     status := self.check()
     if status != 0 { return status }
     if self.closed() { return 6 }
-    if flag(self.block, FULL()) != 0 { return 8 }
-    if ffi.is_null(ffi.to_const(self.counter)) { return 1 }
-    match c(&string.from_i64(value)) {
-        Ok(text) => { unsafe { gtk.gtk_label_set_text(self.counter, text.as_ptr()) } }
-        Err(failure) => { return failure }
-    }
+    if flag(self.block, FULL) != 0 { return 8 }
+    if ffi.is_null(self.counter) { return 1 }
+    text := literal(&value.to_string())
+    unsafe { gtk.gtk_label_set_text(self.counter, text.as_ptr()) }
     return 0
 }
 pub fn Native.set_heading(&mut self, text &string) i32 {
     status := self.check()
     if status != 0 { return status }
     if self.closed() { return 6 }
-    match c(text) {
-        Ok(value) => { unsafe { gtk.gtk_label_set_text(self.heading, value.as_ptr()) } }
+    value := match c(text) {
+        Ok(converted) => converted
         Err(failure) => { return failure }
     }
+    unsafe { gtk.gtk_label_set_text(self.heading, value.as_ptr()) }
     return 0
 }
 
@@ -444,22 +438,21 @@ pub fn Native.set_heading(&mut self, text &string) i32 {
 pub fn Native.release(self) i32 {
     if !main_thread() { return 2 }
     unsafe {
-        set_flag(self.block, CLOSED(), 1)
+        set_flag(self.block, CLOSED, 1)
         drain(self.block)
         gtk.g_free(self.text)
         if self.click_handler != 0 { gtk.g_signal_handler_disconnect(self.button, self.click_handler) }
         var cursor: usize = 0
         for true {
-            match self.parts.next_slot(&mut cursor) {
-                Some(slot) => {
-                    part := self.parts.entry_at(slot).value
-                    if part.handler != 0 { gtk.g_signal_handler_disconnect(part.widget, part.handler) }
-                }
+            slot := match self.parts.next_slot(&mut cursor) {
+                Some(found) => found
                 None => { break }
             }
+            part := self.parts.entry_at(slot).value
+            if part.handler != 0 { gtk.g_signal_handler_disconnect(part.widget, part.handler) }
         }
         for id in &self.handlers { gtk.g_signal_handler_disconnect(self.window, id) }
-        key := session_key()
+        key := literal(&SESSION_KEY)
         gtk.g_object_set_data(self.window, key.as_ptr(), ffi.null())
         gtk.gtk_window_destroy(self.window)
         gtk.g_object_unref(self.window)
@@ -480,13 +473,14 @@ fn entry_changed(entry *mut gtk.Widget, block *mut u8) void {
     unsafe { enqueue(block, 1000 + action_of(entry), gtk.g_strdup(gtk.gtk_editable_get_text(entry))) }
 }
 fn action_of(widget *mut gtk.Widget) i32 {
-    key := literal(&"tarn-ui-action")
-    unsafe { return i32(ffi.address(ffi.to_const(gtk.g_object_get_data(widget, key.as_ptr())))) }
+    key := literal(&ACTION_KEY)
+    unsafe { return i32(ffi.address(gtk.g_object_get_data(widget, key.as_ptr()))) }
 }
 fn set_action(widget *mut gtk.Widget, action u32) {
-    key := literal(&"tarn-ui-action")
+    key := literal(&ACTION_KEY)
     unsafe { gtk.g_object_set_data(widget, key.as_ptr(), ffi.from_address(usize(action))) }
 }
+fn valid_action(action u32) bool { return action != 0 && action <= MAX_ACTION }
 fn reserved(key &string) bool {
     return key.eq(&"main") || key.eq(&"heading") || key.eq(&"content") || key.eq(&"pages") || key.eq(&"scroll")
 }
@@ -502,12 +496,11 @@ fn chars(text &ffi.CString) i64 {
     unsafe { return gtk.g_utf8_strlen(text.as_ptr(), -1) }
 }
 fn read_text(text *u8) string {
-    unsafe {
-        match ffi.string_from_c(text) {
-            Some(value) => { return value }
-            None => { return "" }
-        }
-    }
+    unsafe { return ffi.string_from_c(text).unwrap_or("") }
+}
+fn gbool(value bool) i32 {
+    if value { return 1 }
+    return 0
 }
 fn css(widget *mut gtk.Widget, name &string, on bool) {
     class := literal(name)
@@ -515,8 +508,15 @@ fn css(widget *mut gtk.Widget, name &string, on bool) {
         if on { gtk.gtk_widget_add_css_class(widget, class.as_ptr()) } else { gtk.gtk_widget_remove_css_class(widget, class.as_ptr()) }
     }
 }
-fn is_null(widget *mut gtk.Widget) bool { return ffi.is_null(ffi.to_const(widget)) }
-fn same(a *mut gtk.Widget, b *mut gtk.Widget) bool { return ffi.address(ffi.to_const(a)) == ffi.address(ffi.to_const(b)) }
+// The widget saved under FOCUS_KEY on a page, or null.
+fn saved_focus(page *mut gtk.Widget) *mut gtk.Widget {
+    key := literal(&FOCUS_KEY)
+    unsafe { return ffi.from_address(ffi.address(gtk.g_object_get_data(page, key.as_ptr()))) }
+}
+fn save_focus(page *mut gtk.Widget, widget *mut gtk.Widget) {
+    key := literal(&FOCUS_KEY)
+    unsafe { gtk.g_object_set_data(page, key.as_ptr(), ffi.from_address(ffi.address(widget))) }
+}
 
 // Default height bounded by the first monitor; pages scroll past it.
 fn window_height_limit() i32 {
@@ -525,10 +525,11 @@ fn window_height_limit() i32 {
         monitors := gtk.gdk_display_get_monitors(gtk.gdk_display_get_default())
         if gtk.g_list_model_get_n_items(monitors) > 0 {
             monitor := gtk.g_list_model_get_item(monitors, 0)
+            // GdkRectangle: x, y, width, height.
             var rectangle = zeroed(16)
-            gtk.gdk_monitor_get_geometry(monitor, ffi.slice_mut(rectangle.as_mut_slice()))
-            var cell: *mut i32 = ffi.from_address(ffi.address(ffi.slice(rectangle.as_slice())) + 12)
-            height = ffi.read(ffi.to_const(cell))
+            gtk.gdk_monitor_get_geometry(monitor, ffi.vec_mut(&mut rectangle))
+            var fields: *mut i32 = cell(ffi.vec_mut(&mut rectangle), 0)
+            height = ffi.read(ffi.offset(fields, 3))
             gtk.g_object_unref(monitor)
         }
     }
@@ -539,44 +540,34 @@ fn window_height_limit() i32 {
 }
 
 fn Native.admit(&self, key &string) i32 {
-    status := self.check()
+    status := self.writable()
     if status != 0 { return status }
-    if self.closed() { return 6 }
-    if flag(self.block, FULL()) != 0 { return 8 }
-    if !valid_key(key) || !is_null(self.counter) || self.pages_presented || !is_null(self.region) { return 1 }
-    if self.parts.contains(key) || self.parts.len() >= 256 { return 1 }
+    if !valid_key(key) || !ffi.is_null(self.counter) || self.pages_presented || !ffi.is_null(self.region) { return 1 }
+    if self.parts.contains(key) || self.parts.len() >= MAX_PARTS { return 1 }
     return 0
 }
 // A page or box at most 16 levels below the page stack.
 fn Native.parent(&self, key &string) Option<Part> {
-    match collections.get_copy(&self.parts, key) {
-        Some(part) => {
-            if part.kind != PAGE() && part.kind != BOX() { return None }
-            // Regions own their children; static widgets stay outside them.
-            if part.region != 0 || part.tree_kind != 0 { return None }
-            var depth = 0
-            var widget = part.widget
-            unsafe {
-                for !is_null(widget) && !same(widget, self.pages) {
-                    depth = depth + 1
-                    widget = gtk.gtk_widget_get_parent(widget)
-                }
-            }
-            if is_null(widget) || depth > 16 { return None }
-            return Some(part)
-        }
+    part := match collections.get_copy(&self.parts, key) {
+        Some(found) => found
         None => { return None }
     }
+    if part.kind != PAGE && part.kind != BOX { return None }
+    // Regions own their children; static widgets stay outside them.
+    if part.region != 0 || part.tree_kind != 0 { return None }
+    var depth = 0
+    var widget = part.widget
+    for !ffi.is_null(widget) && widget != self.pages {
+        depth = depth + 1
+        widget = parent_of(widget)
+    }
+    if ffi.is_null(widget) || depth > 16 { return None }
+    return Some(part)
 }
 fn Native.lookup(&self, key &string) Result<Part, i32> {
-    status := self.check()
+    status := self.writable()
     if status != 0 { return Err(status) }
-    if self.closed() { return Err(6) }
-    if flag(self.block, FULL()) != 0 { return Err(8) }
-    match collections.get_copy(&self.parts, key) {
-        Some(part) => { return Ok(part) }
-        None => { return Err(1) }
-    }
+    return collections.get_copy(&self.parts, key).ok_or(1)
 }
 fn Native.insert(&mut self, key &string, widget *mut gtk.Widget, kind u32, horizontal bool, handler u64) {
     var part = blank()
@@ -590,19 +581,19 @@ fn Native.insert(&mut self, key &string, widget *mut gtk.Widget, kind u32, horiz
 // The first page replaces the heading-only content with heading + scrolled stack.
 fn Native.make_pages(&mut self) {
     unsafe {
-        root := gtk.gtk_box_new(1, 12)
+        root := gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12)
         held := gtk.g_object_ref(self.heading)
         gtk.gtk_window_set_child(self.window, ffi.null())
         gtk.gtk_window_set_child(self.window, root)
         gtk.gtk_box_append(root, self.heading)
         gtk.g_object_unref(self.heading)
         scroll := gtk.gtk_scrolled_window_new()
-        gtk.gtk_scrolled_window_set_policy(scroll, gtk.POLICY_NEVER(), gtk.POLICY_AUTOMATIC())
+        gtk.gtk_scrolled_window_set_policy(scroll, gtk.POLICY_NEVER, gtk.POLICY_AUTOMATIC)
         gtk.gtk_window_set_default_size(self.window, 480, window_height_limit())
         gtk.gtk_widget_set_vexpand(scroll, 1)
         gtk.gtk_box_append(root, scroll)
         self.pages = gtk.gtk_stack_new()
-        gtk.gtk_stack_set_transition_type(self.pages, gtk.TRANSITION_NONE())
+        gtk.gtk_stack_set_transition_type(self.pages, gtk.TRANSITION_NONE)
         // Size to the visible page; hidden long pages must not add space.
         gtk.gtk_stack_set_vhomogeneous(self.pages, 0)
         // The automatic GtkViewport scrolls focused descendants into view.
@@ -614,39 +605,55 @@ pub fn Native.add_page(&mut self, key &string) i32 {
     status := self.admit(key)
     if status != 0 { return status }
     if self.page_count >= 32 { return 1 }
-    var name = literal(&"")
-    match ffi.CString.new(key) {
-        Some(converted) => { name = converted }
-        None => { return 1 }
-    }
-    if is_null(self.pages) { self.make_pages() }
+    name := literal(key)
+    if ffi.is_null(self.pages) { self.make_pages() }
     unsafe {
-        page := gtk.gtk_box_new(1, 12)
+        page := gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12)
         margins(page, 24, 24, 0, 24)
         stack_page := gtk.gtk_stack_add_named(self.pages, page, name.as_ptr())
-        self.insert(key, page, PAGE(), false, 0)
+        self.insert(key, page, PAGE, false, 0)
     }
     self.page_count = self.page_count + 1
     return 0
+}
+
+fn orientation(horizontal bool) i32 {
+    if horizontal { return gtk.ORIENTATION_HORIZONTAL }
+    return gtk.ORIENTATION_VERTICAL
 }
 
 pub fn Native.add_box(&mut self, parent &string, key &string, horizontal bool, spacing u32) i32 {
     status := self.admit(key)
     if status != 0 { return status }
     if spacing > 64 { return 1 }
-    match self.parent(parent) {
-        Some(host) => {
-            unsafe {
-                var orientation: i32 = 1
-                if horizontal { orientation = 0 }
-                column := gtk.gtk_box_new(orientation, i32(spacing))
-                gtk.gtk_box_append(host.widget, column)
-                self.insert(key, column, BOX(), horizontal, 0)
-            }
-            return 0
-        }
+    host := match self.parent(parent) {
+        Some(found) => found
         None => { return 1 }
     }
+    unsafe {
+        column := gtk.gtk_box_new(orientation(horizontal), i32(spacing))
+        gtk.gtk_box_append(host.widget, column)
+        self.insert(key, column, BOX, horizontal, 0)
+    }
+    return 0
+}
+
+// A wrapping text label: 0 body, 1 heading (level 2), 2 prominent value.
+fn text_label(text &ffi.CString, style u32) *mut gtk.Widget {
+    var widget: *mut gtk.Widget = ffi.null()
+    unsafe {
+        if style == 1 {
+            // heading_label only fails on NUL in its fixed property names.
+            widget = heading_label(text).expect("heading label")
+            set_accessible_int(widget, gtk.PROPERTY_LEVEL, 2)
+            css(widget, &"title-2", true)
+        } else {
+            widget = gtk.gtk_label_new(text.as_ptr())
+            if style == 2 { css(widget, &"title-1", true) }
+        }
+    }
+    wrap_label(widget)
+    return widget
 }
 
 // Text styles: 0 body, 1 heading (level 2), 2 prominent value.
@@ -654,104 +661,71 @@ fn Native.add_leaf(&mut self, parent &string, key &string, text &string, action 
     status := self.admit(key)
     if status != 0 { return status }
     if style > 2 || (action != 0 && style != 0) { return 1 }
-    var host = blank()
-    match self.parent(parent) {
-        Some(found) => { host = found }
+    host := match self.parent(parent) {
+        Some(found) => found
         None => { return 1 }
     }
-    var value = literal(&"")
-    match ffi.CString.new(text) {
-        Some(converted) => { value = converted }
-        None => { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var part = blank()
+    if action != 0 {
+        part = self.action_button(&value, action)
+    } else {
+        part.widget = text_label(&value, style)
+        part.kind = LABEL
     }
     unsafe {
-        var widget: *mut gtk.Widget = ffi.null()
-        var kind = LABEL()
-        var handler: u64 = 0
-        if action != 0 {
-            widget = gtk.gtk_button_new_with_label(value.as_ptr())
-            // gtk_button_set_label reuses this label child, so wrapping persists.
-            wrap_label(gtk.gtk_button_get_child(widget))
-            kind = BUTTON()
-        } else if style == 1 {
-            match heading_label(&value) {
-                Ok(label) => { widget = label }
-                Err(failure) => { return failure }
-            }
-            set_accessible_int(widget, gtk.PROPERTY_LEVEL(), 2)
-            css(widget, &"title-2", true)
-        } else {
-            widget = gtk.gtk_label_new(value.as_ptr())
-            if style == 2 { css(widget, &"title-1", true) }
-        }
-        if action == 0 { wrap_label(widget) }
-        if host.horizontal { gtk.gtk_widget_set_hexpand(widget, 1) }
-        gtk.gtk_box_append(host.widget, widget)
-        if action != 0 {
-            set_action(widget, action)
-            match connect(widget, &"clicked", ffi.callback(component_clicked), self.block) {
-                Ok(id) => { handler = id }
-                Err(failure) => { return failure }
-            }
-        }
-        self.insert(key, widget, kind, false, handler)
+        if host.horizontal { gtk.gtk_widget_set_hexpand(part.widget, 1) }
+        gtk.gtk_box_append(host.widget, part.widget)
     }
+    // Static components do not keep their action; only region nodes compare it.
+    part.action = 0
+    previous := self.parts.insert(key.clone(), part)
     return 0
 }
 pub fn Native.add_label(&mut self, page &string, key &string, text &string) i32 { return self.add_leaf(page, key, text, 0, 0) }
 pub fn Native.add_text(&mut self, parent &string, key &string, text &string, style u32) i32 { return self.add_leaf(parent, key, text, 0, style) }
 pub fn Native.add_button(&mut self, page &string, key &string, text &string, action u32) i32 {
     if !main_thread() { return 2 }
-    if action == 0 || action > 1024 { return 1 }
+    if !valid_action(action) { return 1 }
     return self.add_leaf(page, key, text, action, 0)
 }
 
 pub fn Native.add_entry(&mut self, parent &string, key &string, text &string, action u32) i32 {
     status := self.admit(key)
     if status != 0 { return status }
-    if action == 0 || action > 1024 { return 1 }
-    var host = blank()
-    match self.parent(parent) {
-        Some(found) => { host = found }
+    if !valid_action(action) { return 1 }
+    host := match self.parent(parent) {
+        Some(found) => found
         None => { return 1 }
     }
-    var value = literal(&"")
-    match ffi.CString.new(text) {
-        Some(converted) => { value = converted }
-        None => { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
     }
-    if chars(&value) > 256 { return 1 }
+    if chars(&value) > MAX_INPUT { return 1 }
     unsafe {
         entry := gtk.gtk_entry_new()
-        gtk.gtk_entry_set_max_length(entry, 256)
+        gtk.gtk_entry_set_max_length(entry, i32(MAX_INPUT))
         gtk.gtk_editable_set_text(entry, value.as_ptr())
         set_action(entry, action)
         gtk.gtk_box_append(host.widget, entry)
-        match connect(entry, &"changed", ffi.callback(entry_changed), self.block) {
-            Ok(id) => { self.insert(key, entry, ENTRY(), false, id) }
-            Err(failure) => { return failure }
-        }
+        handler := connect(entry, &"changed", ffi.callback(entry_changed), self.block)
+        self.insert(key, entry, ENTRY, false, handler)
     }
     return 0
 }
 
-pub fn Native.set_text(&mut self, key &string, text &string) i32 {
-    var part = blank()
-    match self.lookup(key) {
-        Ok(found) => { part = found }
-        Err(status) => { return status }
-    }
-    var value = literal(&"")
-    match ffi.CString.new(text) {
-        Some(converted) => { value = converted }
-        None => { return 1 }
-    }
+// Sets a label's or button's text if it changed; 1 for other kinds.
+fn show_text(part Part, text &string, value &ffi.CString) i32 {
     unsafe {
-        if part.kind == LABEL() {
+        if part.kind == LABEL {
             if !read_text(gtk.gtk_label_get_text(part.widget)).eq(text) { gtk.gtk_label_set_text(part.widget, value.as_ptr()) }
             return 0
         }
-        if part.kind == BUTTON() {
+        if part.kind == BUTTON {
             if !read_text(gtk.gtk_button_get_label(part.widget)).eq(text) { gtk.gtk_button_set_label(part.widget, value.as_ptr()) }
             return 0
         }
@@ -759,62 +733,66 @@ pub fn Native.set_text(&mut self, key &string, text &string) i32 {
     return 1
 }
 
-pub fn Native.set_primary(&mut self, key &string, primary bool) i32 {
-    match self.lookup(key) {
-        Ok(part) => {
-            if part.kind != BUTTON() { return 1 }
-            css(part.widget, &"suggested-action", primary)
-            return 0
-        }
+pub fn Native.set_text(&mut self, key &string, text &string) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
         Err(status) => { return status }
     }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    return show_text(part, text, &value)
+}
+
+pub fn Native.set_primary(&mut self, key &string, primary bool) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != BUTTON { return 1 }
+    css(part.widget, &"suggested-action", primary)
+    return 0
 }
 
 pub fn Native.set_enabled(&mut self, key &string, enabled bool) i32 {
-    match self.lookup(key) {
-        Ok(part) => {
-            unsafe {
-                if enabled { gtk.gtk_widget_set_sensitive(part.widget, 1) } else { gtk.gtk_widget_set_sensitive(part.widget, 0) }
-            }
-            return 0
-        }
+    part := match self.lookup(key) {
+        Ok(found) => found
         Err(status) => { return status }
     }
+    unsafe { gtk.gtk_widget_set_sensitive(part.widget, gbool(enabled)) }
+    return 0
 }
 
 pub fn Native.set_accessible(&mut self, key &string, label &string, description &string) i32 {
-    var part = blank()
-    match self.lookup(key) {
-        Ok(found) => { part = found }
+    part := match self.lookup(key) {
+        Ok(found) => found
         Err(status) => { return status }
     }
     if label.is_empty() { return 1 }
-    var label_text = literal(&"")
-    var description_text = literal(&"")
-    match ffi.CString.new(label) {
-        Some(converted) => { label_text = converted }
-        None => { return 1 }
+    label_text := match c(label) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
     }
-    match ffi.CString.new(description) {
-        Some(converted) => { description_text = converted }
-        None => { return 1 }
+    description_text := match c(description) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
     }
     // Unchanged pairs skip the accessibility update.
     remembered := label.clone() + "\n" + description
     if self.accessible.contains(key) && self.accessible.get(key).eq(&remembered) { return 0 }
-    size := gtk.GVALUE_SIZE()
-    var values = zeroed(size * 2)
+    var values = zeroed(gtk.GVALUE_SIZE * 2)
     var properties: Vec<i32> = Vec.new()
-    properties.push(gtk.PROPERTY_LABEL())
-    properties.push(gtk.PROPERTY_DESCRIPTION())
+    properties.push(gtk.PROPERTY_LABEL)
+    properties.push(gtk.PROPERTY_DESCRIPTION)
     unsafe {
-        first := ffi.slice_mut(values.as_mut_slice())
-        second := byte_at(first, size)
-        a := gtk.g_value_init(first, gtk.TYPE_STRING())
+        first := ffi.vec_mut(&mut values)
+        second := ffi.offset_mut(first, gtk.GVALUE_SIZE)
+        a := gtk.g_value_init(first, gtk.TYPE_STRING)
         gtk.g_value_set_string(first, label_text.as_ptr())
-        b := gtk.g_value_init(second, gtk.TYPE_STRING())
+        b := gtk.g_value_init(second, gtk.TYPE_STRING)
         gtk.g_value_set_string(second, description_text.as_ptr())
-        gtk.gtk_accessible_update_property_value(part.widget, 2, ffi.slice_mut(properties.as_mut_slice()), first)
+        gtk.gtk_accessible_update_property_value(part.widget, 2, ffi.vec_mut(&mut properties), first)
         gtk.g_value_unset(first)
         gtk.g_value_unset(second)
     }
@@ -830,60 +808,56 @@ fn first_focusable(widget *mut gtk.Widget) *mut gtk.Widget {
     unsafe {
         if gtk.gtk_widget_get_focusable(widget) != 0 { return widget }
         var child = gtk.gtk_widget_get_first_child(widget)
-        for !is_null(child) {
+        for !ffi.is_null(child) {
             target := first_focusable(child)
-            if !is_null(target) { return target }
+            if !ffi.is_null(target) { return target }
             child = gtk.gtk_widget_get_next_sibling(child)
         }
     }
     return ffi.null()
 }
+fn grab(widget *mut gtk.Widget) bool {
+    unsafe { return gtk.gtk_widget_grab_focus(widget) != 0 }
+}
 
 pub fn Native.focus(&mut self, key &string) i32 {
-    match self.lookup(key) {
-        Ok(part) => {
-            if is_null(self.pages) { return 1 }
-            unsafe {
-                page := gtk.gtk_stack_get_visible_child(self.pages)
-                if !can_focus(part.widget) || gtk.gtk_widget_is_ancestor(part.widget, page) == 0 { return 1 }
-                if gtk.gtk_widget_grab_focus(part.widget) != 0 { return 0 }
-            }
-            return 1
-        }
+    part := match self.lookup(key) {
+        Ok(found) => found
         Err(status) => { return status }
     }
+    if ffi.is_null(self.pages) { return 1 }
+    unsafe {
+        page := gtk.gtk_stack_get_visible_child(self.pages)
+        if !can_focus(part.widget) || !within(part.widget, page) { return 1 }
+    }
+    if grab(part.widget) { return 0 }
+    return 1
 }
 
 pub fn Native.show_page(&mut self, key &string) i32 {
-    status := self.check()
+    status := self.writable()
     if status != 0 { return status }
-    if self.closed() { return 6 }
-    if flag(self.block, FULL()) != 0 { return 8 }
-    if is_null(self.pages) { return 1 }
-    var name = literal(&"")
-    match ffi.CString.new(key) {
-        Some(converted) => { name = converted }
-        None => { return 1 }
+    if ffi.is_null(self.pages) { return 1 }
+    name := match c(key) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
     }
-    focus_key := literal(&"tarn-ui-last-focus")
     unsafe {
         page := gtk.gtk_stack_get_child_by_name(self.pages, name.as_ptr())
-        if is_null(page) { return 1 }
+        if ffi.is_null(page) { return 1 }
         previous := gtk.gtk_stack_get_visible_child(self.pages)
-        if !same(previous, page) || !self.pages_presented {
+        if previous != page || !self.pages_presented {
             // Each page remembers its focus for the way back.
             focused := gtk.gtk_window_get_focus(self.window)
-            if !is_null(previous) && !is_null(focused) && gtk.gtk_widget_is_ancestor(focused, previous) != 0 {
-                gtk.g_object_set_data(previous, focus_key.as_ptr(), ffi.from_address(ffi.address(ffi.to_const(focused))))
-            }
+            if !ffi.is_null(previous) && !ffi.is_null(focused) && within(focused, previous) { save_focus(previous, focused) }
             gtk.gtk_stack_set_visible_child(self.pages, page)
-            if !same(previous, page) {
-                scroll := gtk.gtk_widget_get_parent(gtk.gtk_widget_get_parent(self.pages))
+            if previous != page {
+                scroll := parent_of(parent_of(self.pages))
                 gtk.gtk_adjustment_set_value(gtk.gtk_scrolled_window_get_vadjustment(scroll), 0.0)
             }
-            var target: *mut gtk.Widget = ffi.from_address(ffi.address(ffi.to_const(gtk.g_object_get_data(page, focus_key.as_ptr()))))
-            if is_null(target) || !can_focus(target) { target = first_focusable(page) }
-            if !is_null(target) { focused_now := gtk.gtk_widget_grab_focus(target) }
+            var target = saved_focus(page)
+            if ffi.is_null(target) || !can_focus(target) { target = first_focusable(page) }
+            if !ffi.is_null(target) { focused_now := grab(target) }
         }
     }
     self.pages_presented = true
@@ -892,18 +866,16 @@ pub fn Native.show_page(&mut self, key &string) i32 {
 
 // Model write without a changed event; entries hold at most 256 characters.
 pub fn Native.set_input(&mut self, key &string, text &string) i32 {
-    var part = blank()
-    match self.lookup(key) {
-        Ok(found) => { part = found }
+    part := match self.lookup(key) {
+        Ok(found) => found
         Err(status) => { return status }
     }
-    if part.kind != ENTRY() { return 1 }
-    var value = literal(&"")
-    match ffi.CString.new(text) {
-        Some(converted) => { value = converted }
-        None => { return 1 }
+    if part.kind != ENTRY { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
     }
-    if chars(&value) > 256 { return 1 }
+    if chars(&value) > MAX_INPUT { return 1 }
     unsafe {
         if read_text(gtk.gtk_editable_get_text(part.widget)).eq(text) { return 0 }
         gtk.g_signal_handler_block(part.widget, part.handler)
@@ -921,8 +893,15 @@ pub fn Native.complete_event(&mut self, status i32) i32 { return self.check() }
 // preorder of nodes: body=0, heading=1, value=2, button=3, primary=4,
 // input=5, column=6, row=7. Stable keys keep their widgets, kind, parent and
 // action; begin(count), nodes in the desired order, end removes the rest.
+const NODE_BUTTON u32 = 3
+const NODE_PRIMARY u32 = 4
+const NODE_INPUT u32 = 5
+const NODE_COLUMN u32 = 6
+const NODE_ROW u32 = 7
+// Replacement may briefly hold old and new nodes.
+const MAX_STAGED usize = MAX_PARTS * 2
+const MAX_TREE_DEPTH u32 = 12
 
-fn address(widget *mut gtk.Widget) usize { return ffi.address(ffi.to_const(widget)) }
 fn within(widget *mut gtk.Widget, ancestor *mut gtk.Widget) bool {
     unsafe { return gtk.gtk_widget_is_ancestor(widget, ancestor) != 0 }
 }
@@ -933,7 +912,7 @@ fn child_count(parent *mut gtk.Widget) u32 {
     var count: u32 = 0
     unsafe {
         var child = gtk.gtk_widget_get_first_child(parent)
-        for !is_null(child) {
+        for !ffi.is_null(child) {
             count = count + 1
             child = gtk.gtk_widget_get_next_sibling(child)
         }
@@ -941,43 +920,42 @@ fn child_count(parent *mut gtk.Widget) u32 {
     return count
 }
 // A wrapping button with a click handler; returns the part to register.
-fn Native.action_button(&mut self, text &ffi.CString, action u32) Result<Part, i32> {
+fn Native.action_button(&mut self, text &ffi.CString, action u32) Part {
     unsafe {
         widget := gtk.gtk_button_new_with_label(text.as_ptr())
+        // gtk_button_set_label reuses this label child, so wrapping persists.
         wrap_label(gtk.gtk_button_get_child(widget))
         set_action(widget, action)
         var part = blank()
         part.widget = widget
-        part.kind = BUTTON()
+        part.kind = BUTTON
         part.action = action
-        part.handler = try connect(widget, &"clicked", ffi.callback(component_clicked), self.block)
-        return Ok(part)
+        part.handler = connect(widget, &"clicked", ffi.callback(component_clicked), self.block)
+        return part
     }
 }
 fn Native.keys_within(&self, root *mut gtk.Widget, inclusive bool) Vec<string> {
     var keys: Vec<string> = Vec.new()
     var cursor: usize = 0
     for true {
-        match self.parts.next_slot(&mut cursor) {
-            Some(slot) => {
-                entry := self.parts.entry_at(slot)
-                if within(entry.value.widget, root) || (inclusive && same(entry.value.widget, root)) { keys.push(entry.key.clone()) }
-            }
+        slot := match self.parts.next_slot(&mut cursor) {
+            Some(found) => found
             None => { break }
         }
+        entry := self.parts.entry_at(slot)
+        if within(entry.value.widget, root) || (inclusive && entry.value.widget == root) { keys.push(entry.key.clone()) }
     }
     return keys
 }
 fn Native.key_of(&self, widget *mut gtk.Widget) Option<string> {
     var cursor: usize = 0
     for true {
-        match self.parts.next_slot(&mut cursor) {
-            Some(slot) => {
-                entry := self.parts.entry_at(slot)
-                if same(entry.value.widget, widget) { return Some(entry.key.clone()) }
-            }
+        slot := match self.parts.next_slot(&mut cursor) {
+            Some(found) => found
             None => { break }
         }
+        entry := self.parts.entry_at(slot)
+        if entry.value.widget == widget { return Some(entry.key.clone()) }
     }
     return None
 }
@@ -1002,14 +980,13 @@ fn Native.open(&mut self, root *mut gtk.Widget, count u32, tree bool) {
 }
 // Drops `child` and every keyed widget inside it, forgetting saved focus.
 fn Native.remove_subtree(&mut self, parent *mut gtk.Widget, child *mut gtk.Widget) {
-    focus_key := literal(&"tarn-ui-last-focus")
     unsafe {
         focused := gtk.gtk_window_get_focus(self.window)
-        if !is_null(focused) && (same(focused, child) || within(focused, child)) { self.focus_removed = true }
+        if !ffi.is_null(focused) && (focused == child || within(focused, child)) { self.focus_removed = true }
         var page = gtk.gtk_widget_get_first_child(self.pages)
-        for !is_null(page) {
-            var saved: *mut gtk.Widget = ffi.from_address(ffi.address(ffi.to_const(gtk.g_object_get_data(page, focus_key.as_ptr()))))
-            if !is_null(saved) && (same(saved, child) || within(saved, child)) { gtk.g_object_set_data(page, focus_key.as_ptr(), ffi.null()) }
+        for !ffi.is_null(page) {
+            saved := saved_focus(page)
+            if !ffi.is_null(saved) && (saved == child || within(saved, child)) { save_focus(page, ffi.null()) }
             page = gtk.gtk_widget_get_next_sibling(page)
         }
         for key in self.keys_within(child, true) {
@@ -1028,7 +1005,7 @@ fn Native.close_region(&mut self) {
     if self.focus_removed {
         unsafe {
             target := first_focusable(gtk.gtk_stack_get_visible_child(self.pages))
-            if !is_null(target) { focused := gtk.gtk_widget_grab_focus(target) }
+            if !ffi.is_null(target) { focused := grab(target) }
         }
     }
     self.region = ffi.null()
@@ -1041,21 +1018,20 @@ fn Native.writable(&self) i32 {
     status := self.check()
     if status != 0 { return status }
     if self.closed() { return 6 }
-    if flag(self.block, FULL()) != 0 { return 8 }
+    if flag(self.block, FULL) != 0 { return 8 }
     return 0
 }
 
 pub fn Native.list_begin(&mut self, parent &string, count u32) i32 {
-    var part = blank()
-    match self.lookup(parent) {
-        Ok(found) => { part = found }
+    part := match self.lookup(parent) {
+        Ok(found) => found
         Err(status) => { return status }
     }
-    if !is_null(self.region) || (part.kind != PAGE() && part.kind != BOX()) || part.region == REGION_TREE() || part.tree_kind != 0 || count > 256 { return 1 }
+    if !ffi.is_null(self.region) || (part.kind != PAGE && part.kind != BOX) || part.region == REGION_TREE || part.tree_kind != 0 || count > 256 { return 1 }
     old := child_count(part.widget)
-    if part.region != REGION_LIST() && old != 0 { return 1 }
-    if self.parts.len() - usize(old) + usize(count) > 256 { return 1 }
-    self.set_region(parent, REGION_LIST())
+    if part.region != REGION_LIST && old != 0 { return 1 }
+    if self.parts.len() - usize(old) + usize(count) > MAX_PARTS { return 1 }
+    self.set_region(parent, REGION_LIST)
     self.open(part.widget, count, false)
     return 0
 }
@@ -1063,36 +1039,28 @@ pub fn Native.list_begin(&mut self, parent &string, count u32) i32 {
 pub fn Native.list_item(&mut self, key &string, text &string, action u32) i32 {
     status := self.writable()
     if status != 0 { return status }
-    if is_null(self.region) || self.tree_mode || !valid_key(key) || action == 0 || action > 1024 || self.seen.contains(key) { return 1 }
+    if ffi.is_null(self.region) || self.tree_mode || !valid_key(key) || !valid_action(action) || self.seen.contains(key) { return 1 }
     if u32(self.seen.len()) >= self.expected { return 1 }
-    var value = literal(&"")
-    match ffi.CString.new(text) {
-        Some(converted) => { value = converted }
-        None => { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
     }
     var widget: *mut gtk.Widget = ffi.null()
-    unsafe {
-        match collections.get_copy(&self.parts, key) {
-            Some(part) => {
-                if !same(parent_of(part.widget), self.region) || part.kind != BUTTON() || part.action != action { return 1 }
-                if !read_text(gtk.gtk_button_get_label(part.widget)).eq(text) { gtk.gtk_button_set_label(part.widget, value.as_ptr()) }
-                widget = part.widget
-            }
-            None => {
-                // Replacement may briefly hold old and new rows: at most 512 keys.
-                if self.parts.len() >= 512 { return 1 }
-                match self.action_button(&value, action) {
-                    Ok(part) => {
-                        widget = part.widget
-                        gtk.gtk_box_append(self.region, widget)
-                        previous := self.parts.insert(key.clone(), part)
-                    }
-                    Err(failure) => { return failure }
-                }
-            }
+    match collections.get_copy(&self.parts, key) {
+        Some(part) => {
+            if parent_of(part.widget) != self.region || part.kind != BUTTON || part.action != action { return 1 }
+            shown := show_text(part, text, &value)
+            widget = part.widget
         }
-        gtk.gtk_box_reorder_child_after(self.region, widget, self.previous)
+        None => {
+            if self.parts.len() >= MAX_STAGED { return 1 }
+            part := self.action_button(&value, action)
+            widget = part.widget
+            unsafe { gtk.gtk_box_append(self.region, widget) }
+            previous := self.parts.insert(key.clone(), part)
+        }
     }
+    unsafe { gtk.gtk_box_reorder_child_after(self.region, widget, self.previous) }
     self.previous = widget
     added := self.seen.insert(key.clone())
     return 0
@@ -1101,14 +1069,16 @@ pub fn Native.list_item(&mut self, key &string, text &string, action u32) i32 {
 pub fn Native.list_end(&mut self) i32 {
     status := self.writable()
     if status != 0 { return status }
-    if is_null(self.region) || self.tree_mode || u32(self.seen.len()) != self.expected { return 1 }
+    if ffi.is_null(self.region) || self.tree_mode || u32(self.seen.len()) != self.expected { return 1 }
     region := self.region
     unsafe {
         var child = gtk.gtk_widget_get_first_child(region)
-        for !is_null(child) {
+        for !ffi.is_null(child) {
             next := gtk.gtk_widget_get_next_sibling(child)
             match self.key_of(child) {
-                Some(key) => { if !self.seen.contains(&key) { self.remove_subtree(region, child) } }
+                Some(key) => {
+                    if !self.seen.contains(&key) { self.remove_subtree(region, child) }
+                }
                 None => {}
             }
             child = next
@@ -1119,128 +1089,120 @@ pub fn Native.list_end(&mut self) i32 {
 }
 
 pub fn Native.tree_begin(&mut self, key &string, count u32) i32 {
-    var part = blank()
-    match self.lookup(key) {
-        Ok(found) => { part = found }
+    part := match self.lookup(key) {
+        Ok(found) => found
         Err(status) => { return status }
     }
-    if !is_null(self.region) || (part.kind != PAGE() && part.kind != BOX()) || count > 256 || part.region == REGION_LIST() { return 1 }
-    if part.region != REGION_TREE() && child_count(part.widget) != 0 { return 1 }
+    if !ffi.is_null(self.region) || (part.kind != PAGE && part.kind != BOX) || count > 256 || part.region == REGION_LIST { return 1 }
+    if part.region != REGION_TREE && child_count(part.widget) != 0 { return 1 }
     // A nested owned group cannot become a separately controlled region.
     if part.tree_kind != 0 { return 1 }
     old := self.keys_within(part.widget, false).len()
-    if self.parts.len() - old + usize(count) > 256 { return 1 }
-    self.set_region(key, REGION_TREE())
+    if self.parts.len() - old + usize(count) > MAX_PARTS { return 1 }
+    self.set_region(key, REGION_TREE)
     self.open(part.widget, count, true)
     return 0
+}
+
+// A new tree node widget of `kind`; GTK owns it once appended.
+fn Native.new_node(&mut self, kind u32, value &ffi.CString, action u32, spacing u32) Part {
+    if kind == NODE_BUTTON || kind == NODE_PRIMARY {
+        part := self.action_button(value, action)
+        if kind == NODE_PRIMARY { css(part.widget, &"suggested-action", true) }
+        return part
+    }
+    var part = blank()
+    part.action = action
+    unsafe {
+        if kind >= NODE_COLUMN {
+            part.widget = gtk.gtk_box_new(orientation(kind == NODE_ROW), i32(spacing))
+            part.kind = BOX
+            part.horizontal = kind == NODE_ROW
+        } else if kind == NODE_INPUT {
+            part.widget = gtk.gtk_entry_new()
+            gtk.gtk_entry_set_max_length(part.widget, i32(MAX_INPUT))
+            set_action(part.widget, action)
+            part.kind = ENTRY
+        } else {
+            part.widget = text_label(value, kind)
+            part.kind = LABEL
+        }
+    }
+    return part
+}
+
+// The existing node under `key`, or a new one appended to `parent`.
+fn Native.node_part(&mut self, parent &Part, key &string, kind u32, value &ffi.CString, action u32, spacing u32) Result<Part, i32> {
+    match collections.get_copy(&self.parts, key) {
+        Some(found) => {
+            if parent_of(found.widget) != parent.widget || found.tree_kind != kind + 1 || found.action != action { return Err(1) }
+            return Ok(found)
+        }
+        None => {}
+    }
+    if self.parts.len() >= MAX_STAGED { return Err(1) }
+    var created = self.new_node(kind, value, action, spacing)
+    created.tree_kind = kind + 1
+    unsafe {
+        gtk.gtk_box_append(parent.widget, created.widget)
+        if kind == NODE_INPUT {
+            // Connected after the initial text so creation queues no edit.
+            gtk.gtk_editable_set_text(created.widget, value.as_ptr())
+            created.handler = connect(created.widget, &"changed", ffi.callback(entry_changed), self.block)
+        }
+    }
+    previous := self.parts.insert(key.clone(), created)
+    return Ok(created)
 }
 
 pub fn Native.tree_node(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, spacing u32) i32 {
     status := self.writable()
     if status != 0 { return status }
-    if !self.tree_mode || is_null(self.region) || !valid_key(key) || kind > 7 || spacing > 64 { return 1 }
+    if !self.tree_mode || ffi.is_null(self.region) || !valid_key(key) || kind > NODE_ROW || spacing > 64 { return 1 }
     if self.seen.contains(key) || u32(self.seen.len()) >= self.expected { return 1 }
-    if kind >= 3 && kind <= 5 {
-        if action == 0 || action > 1024 { return 1 }
-    } else if action != 0 { return 1 }
-    var value = literal(&"")
-    match ffi.CString.new(text) {
-        Some(converted) => { value = converted }
+    takes_action := kind >= NODE_BUTTON && kind <= NODE_INPUT
+    if takes_action && !valid_action(action) { return 1 }
+    if !takes_action && action != 0 { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if kind == NODE_INPUT && chars(&value) > MAX_INPUT { return 1 }
+    parent := match collections.get_copy(&self.parts, parent_key) {
+        Some(found) => found
         None => { return 1 }
     }
-    if kind == 5 && chars(&value) > 256 { return 1 }
-    var parent = blank()
-    match collections.get_copy(&self.parts, parent_key) {
-        Some(found) => { parent = found }
-        None => { return 1 }
-    }
-    if parent.kind != PAGE() && parent.kind != BOX() { return 1 }
-    if !same(parent.widget, self.region) && (!self.seen.contains(parent_key) || !within(parent.widget, self.region)) { return 1 }
-    var depth = 0
+    if parent.kind != PAGE && parent.kind != BOX { return 1 }
+    if parent.widget != self.region && (!self.seen.contains(parent_key) || !within(parent.widget, self.region)) { return 1 }
+    var depth: u32 = 0
     var climb = parent.widget
-    for !same(climb, self.region) {
+    for climb != self.region {
         depth = depth + 1
-        if depth > 12 { return 1 }
+        if depth > MAX_TREE_DEPTH { return 1 }
         climb = parent_of(climb)
     }
-    if kind >= 6 && depth >= 12 { return 1 }
-    var part = blank()
+    if kind >= NODE_COLUMN && depth >= MAX_TREE_DEPTH { return 1 }
+    part := match self.node_part(&parent, key, kind, &value, action, spacing) {
+        Ok(found) => found
+        Err(failure) => { return failure }
+    }
     unsafe {
-        match collections.get_copy(&self.parts, key) {
-            Some(found) => {
-                if !same(parent_of(found.widget), parent.widget) || found.tree_kind != kind + 1 || found.action != action { return 1 }
-                part = found
-            }
-            None => {
-                if self.parts.len() >= 512 { return 1 }
-                if kind >= 6 {
-                    var orientation: i32 = 1
-                    if kind == 7 { orientation = 0 }
-                    part.widget = gtk.gtk_box_new(orientation, i32(spacing))
-                    part.kind = BOX()
-                    part.horizontal = kind == 7
-                } else if kind == 5 {
-                    part.widget = gtk.gtk_entry_new()
-                    gtk.gtk_entry_set_max_length(part.widget, 256)
-                    set_action(part.widget, action)
-                    part.kind = ENTRY()
-                    part.handler = 0
-                } else if kind == 3 || kind == 4 {
-                    match self.action_button(&value, action) {
-                        Ok(button) => { part = button }
-                        Err(failure) => { return failure }
-                    }
-                    if kind == 4 { css(part.widget, &"suggested-action", true) }
-                } else {
-                    if kind == 1 {
-                        match heading_label(&value) {
-                            Ok(label) => { part.widget = label }
-                            Err(failure) => { return failure }
-                        }
-                        set_accessible_int(part.widget, gtk.PROPERTY_LEVEL(), 2)
-                        css(part.widget, &"title-2", true)
-                    } else {
-                        part.widget = gtk.gtk_label_new(value.as_ptr())
-                        if kind == 2 { css(part.widget, &"title-1", true) }
-                    }
-                    wrap_label(part.widget)
-                    part.kind = LABEL()
-                }
-                part.tree_kind = kind + 1
-                part.action = action
-                gtk.gtk_box_append(parent.widget, part.widget)
-                if kind == 5 {
-                    // Connected after the initial text so creation queues no edit.
-                    gtk.gtk_editable_set_text(part.widget, value.as_ptr())
-                    match connect(part.widget, &"changed", ffi.callback(entry_changed), self.block) {
-                        Ok(id) => { part.handler = id }
-                        Err(failure) => { return failure }
-                    }
-                }
-                previous := self.parts.insert(key.clone(), part)
-            }
-        }
-        if kind >= 6 {
+        if kind >= NODE_COLUMN {
             if gtk.gtk_box_get_spacing(part.widget) != i32(spacing) { gtk.gtk_box_set_spacing(part.widget, i32(spacing)) }
-        } else if kind == 5 {
+        } else if kind == NODE_INPUT {
             written := self.set_input(key, text)
             if written != 0 { return written }
-        } else if kind >= 3 {
-            if !read_text(gtk.gtk_button_get_label(part.widget)).eq(text) { gtk.gtk_button_set_label(part.widget, value.as_ptr()) }
-        } else if !read_text(gtk.gtk_label_get_text(part.widget)).eq(text) {
-            gtk.gtk_label_set_text(part.widget, value.as_ptr())
+        } else {
+            shown := show_text(part, text, &value)
         }
         // Order after the previous node placed under the same parent.
-        var previous: *mut gtk.Widget = ffi.null()
-        match collections.get_copy(&self.tree_last, &address(parent.widget)) {
-            Some(last) => { previous = ffi.from_address(last) }
-            None => {}
-        }
-        if !same(gtk.gtk_widget_get_prev_sibling(part.widget), previous) {
+        last := collections.get_copy(&self.tree_last, &ffi.address(parent.widget)).unwrap_or(0)
+        var previous: *mut gtk.Widget = ffi.from_address(last)
+        if gtk.gtk_widget_get_prev_sibling(part.widget) != previous {
             gtk.gtk_box_reorder_child_after(parent.widget, part.widget, previous)
         }
     }
-    replaced := self.tree_last.insert(address(parent.widget), address(part.widget))
+    replaced := self.tree_last.insert(ffi.address(parent.widget), ffi.address(part.widget))
     added := self.seen.insert(key.clone())
     return 0
 }
@@ -1248,16 +1210,16 @@ pub fn Native.tree_node(&mut self, parent_key &string, key &string, kind u32, te
 fn Native.prune(&mut self, parent *mut gtk.Widget) {
     unsafe {
         var child = gtk.gtk_widget_get_first_child(parent)
-        for !is_null(child) {
+        for !ffi.is_null(child) {
             next := gtk.gtk_widget_get_next_sibling(child)
             var keep = false
             var nested = false
             match self.key_of(child) {
                 Some(key) => {
                     keep = self.seen.contains(&key)
-                    match collections.get_copy(&self.parts, &key) {
-                        Some(part) => { nested = part.kind == BOX() }
-                        None => {}
+                    nested = match collections.get_copy(&self.parts, &key) {
+                        Some(part) => part.kind == BOX
+                        None => false
                     }
                 }
                 None => {}
@@ -1271,7 +1233,7 @@ fn Native.prune(&mut self, parent *mut gtk.Widget) {
 pub fn Native.tree_end(&mut self) i32 {
     status := self.writable()
     if status != 0 { return status }
-    if !self.tree_mode || is_null(self.region) || u32(self.seen.len()) != self.expected { return 1 }
+    if !self.tree_mode || ffi.is_null(self.region) || u32(self.seen.len()) != self.expected { return 1 }
     self.prune(self.region)
     self.close_region()
     return 0

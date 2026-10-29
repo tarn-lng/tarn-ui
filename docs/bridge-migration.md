@@ -51,6 +51,11 @@ pasado a GTK debe vivir mientras GTK lo use.
 | G5 | devtools (`ui.inspect`, `ui.fill`, `ui.click`, `ui.close`) en Tarn; json-glib o JSON propio | suites Python (widgets, navigation, reactive, devtools, tray) sin cambios |
 | G6 | `session.tarn` usa el backend Tarn por defecto; se borran `bridge.c`, `bridge.h`, `devtools.inc`, scripts de compilación de C | todas las suites + ASan sobre el binario Tarn |
 
+Desde G3 el backend usa constantes, `match` como expresión, comparación de
+punteros con `==`, `ffi.offset`/`ffi.vec_mut`, `unwrap`/`expect` y
+`to_string()` (ADR 0088–0090 del compilador). Necesita un `tarn` posterior a
+0.1.1: `TARN_BIN=../tarn/target/release/tarn scripts/test-native.sh`.
+
 Hasta G6 el bridge C sigue siendo el predeterminado y `session.tarn` no
 cambia. El backend Tarn se prueba por su cuenta con `scripts/test-native.sh`,
 que compila cada `tests/native/*.tarn` y lo ejecuta con
