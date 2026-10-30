@@ -341,7 +341,7 @@ fn Devtools.free(&mut self) {
     self.output = ffi.null()
     self.block = ffi.null()
     self.on = false
-    native.stat_add(native.test_stats(), native.STAT_DEV_CHANNELS, -1)
+    native.stat_add(native.hooks_stats(), native.STAT_DEV_CHANNELS, -1)
 }
 
 // ---- widget tree ----
@@ -810,7 +810,7 @@ pub fn Devtools.start(&mut self, ui &native.Native) i32 {
     }
     self.fd = fd
     self.on = true
-    native.stat_add(native.test_stats(), native.STAT_DEV_CHANNELS, 1)
+    native.stat_add(native.hooks_stats(), native.STAT_DEV_CHANNELS, 1)
     self.allow_text = env_is(&"TARN_UI_DEV_TEXT", &"1")
     self.allow_capture = env_is(&"TARN_UI_DEV_CAPTURE", &"1")
     grants := env_text(&"TARN_UI_DEV_ALLOW").unwrap_or("")

@@ -1,0 +1,49 @@
+// G1 smoke for the Tarn GTK backend: lifecycle, events, counter, background.
+import "gtk/gtk"
+import "testing"
+import "gtk/native"
+
+extern "C" fn gtk_widget_activate(widget *mut gtk.Widget) i32
+
+fn check(value bool, what string) { if !value { panic("lifecycle: " + what) } }
+
+fn open(title string) native.Native {
+    match native.create(&title, &"Hola desde Tarn") {
+        Ok(value) => { return value }
+        Err(code) => { panic("create failed: " + code.to_string()) }
+    }
+}
+
+fn test_lifecycle(t &mut testing.T) {
+    if !native.display_available() {
+        t.skip(&"no display")
+        return
+    }
+    var ui = open("Tarn backend")
+    t.require(native.create(&"Second", &"Second").is_err(), &"second session must be refused")
+    t.require(ui.next() == 1, &"opened")
+    t.require(ui.enable_counter(41) == 0, &"enable_counter")
+    t.require(ui.enable_counter(0) == 1, &"counter enabled twice")
+    unsafe { check(gtk_widget_activate(ui.counter_button()) == 1, "activate") }
+    t.require(ui.next() == 3, &"increment")
+    t.require(ui.set_counter(42) == 0, &"set_counter")
+    native.wake(ui.wake_data())
+    native.wake(ui.wake_data())
+    t.require(ui.next() == 5, &"wake")
+    t.require(ui.set_background(true) == 0, &"background")
+    unsafe { gtk.gtk_window_close(ui.native_window()) }
+    t.require(ui.next() == 4, &"hidden")
+    t.require(ui.is_visible() == 0, &"hidden window")
+    t.require(ui.present() == 0, &"present")
+    t.require(ui.request_close() == 0, &"request_close")
+    t.require(ui.next() == 2, &"closed")
+    t.require(ui.next() == -6, &"closed twice")
+    t.require(ui.set_counter(1) == 6, &"closed session refuses writes")
+    t.require(ui.release() == 0, &"release")
+    // The slot is free again.
+    var again = open("Again")
+    t.require(again.next() == 1, &"opened again")
+    t.require(again.set_heading(&"Cambiado") == 0, &"set_heading")
+    t.require(again.release() == 0, &"release again")
+    print("lifecycle ok")
+}

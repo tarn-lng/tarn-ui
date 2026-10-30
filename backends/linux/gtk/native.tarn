@@ -63,7 +63,7 @@ pub const STAT_DISCONNECTED usize = 7
 pub const STAT_WINDOWS usize = 8
 pub const STAT_WINDOWS_FINALIZED usize = 9
 pub const STAT_DEV_CHANNELS usize = 10
-pub fn test_stats() *mut u8 {
+pub fn hooks_stats() *mut u8 {
     name := literal(&STATS_KEY)
     unsafe { return gtk.g_type_get_qdata(gtk.TYPE_OBJECT, gtk.g_quark_from_string(name.as_ptr())) }
 }
@@ -373,7 +373,7 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
         block := gtk.g_malloc0(BLOCK_SIZE)
         var queue_slot: *mut *mut gtk.Queue = cell(block, QUEUE_SLOT)
         ffi.write(queue_slot, gtk.g_queue_new())
-        stats := test_stats()
+        stats := hooks_stats()
         var stats_slot: *mut *mut u8 = cell(block, STATS_SLOT)
         ffi.write(stats_slot, stats)
         stat_add(stats, STAT_ALLOCATED, 1)
@@ -2390,4 +2390,9 @@ pub fn Native.activate_menu(&mut self, key &string) bool {
         gtk.g_action_activate(item, ffi.null())
     }
     return true
+}
+
+// Whether GTK can open a display, for tests that skip without one.
+pub fn display_available() bool {
+    unsafe { return gtk.gtk_init_check() != 0 }
 }

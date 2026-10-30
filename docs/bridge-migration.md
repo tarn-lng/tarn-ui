@@ -47,16 +47,16 @@ pasado a GTK debe vivir mientras GTK lo use.
 | | Alcance | Prueba de cierre |
 |---|---|---|
 | G1 ✓ | `gtk.tarn`, bloque de banderas, cola de eventos; ciclo de vida: create, next, request_close, release, finish, wake, background, present/hide, is_visible; contador | smoke Tarn del ciclo de vida y contador, sin fugas de sesión |
-| G2 ✓ | páginas, etiquetas, botones, cajas, texto, entradas, `set_*`, foco, accesibilidad | `tests/native/components.tarn`: los mismos casos que `session-smoke`, más finalización de widgets |
-| G3 ✓ | listas y regiones (`list_*`, `tree_*`) | `tests/native/regions.tarn`: identidad, orden, reescritura y eliminación |
-| G4 ✓ | controles, indicadores, contenedores, texto multilínea, barra de título y menú | `tests/native/widgets.tarn`: eventos de usuario, escrituras sin evento, rangos, contenedores, cabecera, menú y sus nodos de región |
+| G2 ✓ | páginas, etiquetas, botones, cajas, texto, entradas, `set_*`, foco, accesibilidad | `gtk/components_test.tarn`: los mismos casos que `session-smoke`, más finalización de widgets |
+| G3 ✓ | listas y regiones (`list_*`, `tree_*`) | `gtk/regions_test.tarn`: identidad, orden, reescritura y eliminación |
+| G4 ✓ | controles, indicadores, contenedores, texto multilínea, barra de título y menú | `gtk/widgets_test.tarn`: eventos de usuario, escrituras sin evento, rangos, contenedores, cabecera, menú y sus nodos de región |
 | G5 ✓ | devtools en Tarn (`gtk/devtools.tarn`, con `json` y `crypto` del stdlib) y `gtk/session.tarn` | suites Python (widgets, navigation, reactive, devtools, tray) sin cambios con `TARN_UI_BACKEND=tarn` |
 | G6 | `session.tarn` usa el backend Tarn por defecto; se borran `bridge.c`, `bridge.h`, `devtools.inc`, scripts de compilación de C | todas las suites + ASan sobre el binario Tarn |
 
 Desde G3 el backend usa constantes, `match` como expresión, comparación de
 punteros con `==`, `ffi.offset`/`ffi.vec_mut`, `unwrap`/`expect` y
-`to_string()` (ADR 0088–0090 del compilador). Necesita un `tarn` posterior a
-0.1.1: `TARN_BIN=../tarn/target/release/tarn scripts/test-native.sh`.
+`to_string()` (ADR 0088–0090 del compilador). Necesita `tarn` 0.2.0 o
+posterior.
 
 G5 añade:
 
@@ -76,8 +76,10 @@ G5 añade:
   app real), el puntero es nulo.
 
 Hasta G6 el bridge C sigue siendo el predeterminado y `session.tarn` no
-cambia. El backend Tarn se prueba por su cuenta con `scripts/test-native.sh`,
-que compila cada `tests/native/*.tarn` y lo ejecuta con
-`G_DEBUG=fatal-criticals`. Las pruebas C del bridge
+cambia. `backends/linux` es un paquete propio (`tarn.toml` con
+`[native] links`), así `tarn test` en ese directorio (o
+`scripts/test-native.sh`) ejecuta `gtk/*_test.tarn` con `testing.T`: los tests
+unitarios del protocolo de devtools (`gtk/protocol.tarn`, sin GTK) y las
+smokes nativas, que se marcan `skipped` sin display. Las pruebas C del bridge
 (`tests/gtk/bridge*`, `test_hooks.h`) se sustituyen por smokes Tarn que
 comprueban lo mismo (handlers desconectados, ventana finalizada).
