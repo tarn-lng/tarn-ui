@@ -13,7 +13,7 @@ fn finalized(data *mut i32, object *mut gtk.Widget) void {
     unsafe { ffi.write(data, ffi.read(data) + 1) }
 }
 
-fn main() {
+fn test_components() {
     var gone: i32 = 0
     var ui = match_open()
     check(ui.next() == 1, "opened")

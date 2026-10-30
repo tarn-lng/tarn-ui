@@ -28,7 +28,7 @@ fn host_of(box *mut gtk.Widget) *mut gtk.Widget {
 fn first(parent *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_first_child(parent) } }
 fn after(widget *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_next_sibling(widget) } }
 
-fn main() {
+fn test_widgets() {
     var ui = match native.create(&"Controles", &"Controles en Tarn") {
         Ok(value) => value
         Err(code) => { panic("create failed: " + code.to_string()) }

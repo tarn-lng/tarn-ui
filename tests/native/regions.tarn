@@ -11,7 +11,7 @@ fn missing(widget *mut gtk.Widget) bool { return ffi.is_null(widget) }
 fn first(parent *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_first_child(parent) } }
 fn after(widget *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_next_sibling(widget) } }
 
-fn main() {
+fn test_regions() {
     var ui = open()
     check(ui.next() == 1, "opened")
     check(ui.add_page(&"home") == 0, "page")

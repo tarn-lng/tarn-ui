@@ -13,7 +13,7 @@ fn open(title string) native.Native {
     }
 }
 
-fn main() {
+fn test_lifecycle() {
     var ui = open("Tarn backend")
     check(native.create(&"Second", &"Second").is_err(), "second session must be refused")
     check(ui.next() == 1, "opened")

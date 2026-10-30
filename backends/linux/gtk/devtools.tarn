@@ -12,6 +12,7 @@ import "encoding"
 import "collections"
 import "gtk/gtk"
 import "gtk/native"
+import "gtk/protocol"
 
 struct GString {}
 extern "C" fn recv(fd i32, buffer *mut u8, length usize, flags i32) isize
@@ -212,18 +213,13 @@ fn Devtools.wire(&mut self, text &string) {
         unsafe { self.writer = g_unix_fd_add(self.fd, IO_OUT | IO_ERR | IO_HUP, ffi.callback(woken), self.block) }
     }
 }
-fn quoted(text &string) string {
-    var w = json.Writer.new()
-    w.string(text)
-    return w.finish()
-}
 // {"session_id", "revision"} plus `extra`, already encoded as `,"k":v...`.
 fn Devtools.result(&self, extra &string) string {
-    return "{\"session_id\":" + quoted(&self.session_id) + ",\"revision\":" + self.revision().to_string() + extra + "}"
+    return "{\"session_id\":" + protocol.quoted(&self.session_id) + ",\"revision\":" + self.revision().to_string() + extra + "}"
 }
 fn Devtools.reply(&mut self, id &string, result &string, error &string) {
     var record = "{\"version\":1,\"request_id\":"
-    if id.is_empty() { record = record + "null" } else { record = record + quoted(id) }
+    if id.is_empty() { record = record + "null" } else { record = record + protocol.quoted(id) }
     if error.is_empty() {
         record = record + ",\"result\":" + result + "}"
     } else {
@@ -233,8 +229,8 @@ fn Devtools.reply(&mut self, id &string, result &string, error &string) {
         if error.eq(&"NATIVE_ERROR") && self.application_error != 0 { stage = "application" }
         var details = "{}"
         if self.application_error != 0 { details = "{\"application_code\":" + self.application_error.to_string() + "}" }
-        record = record + ",\"error\":{\"code\":" + quoted(error) + ",\"message\":" + quoted(error) +
-            ",\"stage\":" + quoted(&stage) + ",\"details\":" + details + "}}"
+        record = record + ",\"error\":{\"code\":" + protocol.quoted(error) + ",\"message\":" + protocol.quoted(error) +
+            ",\"stage\":" + protocol.quoted(&stage) + ",\"details\":" + details + "}}"
     }
     self.wire(&record)
 }
@@ -536,94 +532,6 @@ fn zeroed(size usize) Vec<u8> {
 }
 
 // ---- requests ----
-fn text_of(object &json.Value, key &string) Option<string> {
-    value := try object.get(key)
-    return value.as_text()
-}
-fn is_integer(value &json.Value) bool {
-    return match value {
-        json.Value.Number(text) => !string.contains(text, &".") && !string.contains(text, &"e") && !string.contains(text, &"E") && string.parse_i64(text).is_some()
-        _ => false
-    }
-}
-fn members(object &json.Value) Vec<string> {
-    var keys: Vec<string> = Vec.new()
-    match object {
-        json.Value.Object(items) => {
-            for item in items { keys.push(item.key.clone()) }
-        }
-        _ => {}
-    }
-    return keys
-}
-// Every member is in `allowed`, a comma-separated list of names.
-fn only(object &json.Value, allowed &string) bool {
-    names := string.split(allowed, &",")
-    for key in members(object) {
-        var found = false
-        for name in &names {
-            if name.eq(&key) { found = true }
-        }
-        if !found { return false }
-    }
-    return true
-}
-// No object repeats a member name.
-fn unique_members(value &json.Value) bool {
-    match value {
-        json.Value.Object(items) => {
-            var seen: collections.Set<string> = collections.Set.new()
-            for item in items {
-                if seen.contains(&item.key) { return false }
-                added := seen.insert(item.key.clone())
-                if !unique_members(&item.value) { return false }
-            }
-        }
-        json.Value.List(items) => {
-            for item in items {
-                if !unique_members(item) { return false }
-            }
-        }
-        _ => {}
-    }
-    return true
-}
-// Rejects \u0000 escapes and nesting deeper than 64 before parsing.
-fn prescan(record &[]u8) bool {
-    var depth: u32 = 0
-    var quoted_text = false
-    var escaped = false
-    var i: usize = 0
-    for byte in record {
-        if quoted_text {
-            if escaped {
-                if byte == 117 && i + 4 < record.len() && record[i + 1] == 48 && record[i + 2] == 48 && record[i + 3] == 48 && record[i + 4] == 48 { return false }
-                escaped = false
-            } else if byte == 92 {
-                escaped = true
-            } else if byte == 34 {
-                quoted_text = false
-            }
-        } else if byte == 34 {
-            quoted_text = true
-        } else if byte == 123 || byte == 91 {
-            depth = depth + 1
-            if depth > 64 { return false }
-        } else if byte == 125 || byte == 93 {
-            if depth > 0 { depth = depth - 1 }
-        }
-        i = i + 1
-    }
-    return true
-}
-fn valid_id(id &string) bool {
-    if id.is_empty() || id.len() > 128 { return false }
-    for byte in id.bytes() {
-        alphanumeric := (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
-        if !alphanumeric && byte != 45 && byte != 95 { return false }
-    }
-    return true
-}
 fn chars(text &string) i64 {
     value := literal(text)
     unsafe { return gtk.g_utf8_strlen(value.as_ptr(), -1) }
@@ -638,43 +546,24 @@ fn Devtools.request(&mut self, ui &mut native.Native, record &Vec<u8>) {
 // Answers a request (or starts a pending one); returns an error code or "".
 // `id` receives the request id once it is known valid.
 fn Devtools.handle(&mut self, ui &mut native.Native, record &Vec<u8>, id &mut string) string {
-    invalid := "INVALID_REQUEST"
-    bytes := record.as_slice()
-    for byte in bytes {
-        if byte == 0 { return invalid }
+    invalid := protocol.INVALID
+    request := match protocol.parse_request(record.as_slice()) {
+        Ok(found) => found
+        Err(rejection) => {
+            *id = rejection.id
+            return rejection.code
+        }
     }
-    if !prescan(bytes) { return invalid }
-    root := match json.parse_bytes(bytes) {
-        Ok(value) => value
-        Err(_) => { return invalid }
-    }
-    if !unique_members(&root) { return invalid }
-    match root {
-        json.Value.Object(_) => {}
-        _ => { return invalid }
-    }
-    request_id := text_of(&root, &"request_id").unwrap_or("")
-    if !valid_id(&request_id) { return invalid }
+    request_id := request.id.clone()
     *id = request_id.clone()
-        if !only(&root, &"version,request_id,method,params") || members(&root).len() != 4 { return invalid }
-    version := root.get(&"version").expect("version")
-    if !is_integer(&version) { return invalid }
-    if version.as_i64().unwrap_or(0) != 1 { return "UNSUPPORTED_VERSION" }
-    method := match text_of(&root, &"method") {
-        Some(text) => text
-        None => { return invalid }
-    }
-    params := root.get(&"params").expect("params")
-    match params {
-        json.Value.Object(_) => {}
-        _ => { return invalid }
-    }
+    method := request.method.clone()
+    params := request.params
     if self.request_ids.contains(&request_id) { return invalid }
     if self.request_ids.len() >= REQUEST_LIMIT { return "QUEUE_FULL" }
     added := self.request_ids.insert(request_id.clone())
     if method.eq(&"session.authorize") {
-        if !only(&params, &"session_id") || members(&params).len() != 1 { return invalid }
-        if !text_of(&params, &"session_id").unwrap_or("").eq(&self.session_id) { return "UNAUTHORIZED" }
+        if !protocol.only(&params, &"session_id") || protocol.members(&params).len() != 1 { return invalid }
+        if !protocol.text_of(&params, &"session_id").unwrap_or("").eq(&self.session_id) { return "UNAUTHORIZED" }
         self.authorized = true
         self.reply(&request_id, &self.result(&""), &"")
         return ""
@@ -689,24 +578,24 @@ fn Devtools.handle(&mut self, ui &mut native.Native, record &Vec<u8>, id &mut st
     if !inspect && !click && !fill && !closing && !capture && !diagnostics { return "UNSUPPORTED_OPERATION" }
     if (inspect && !self.inspect) || (click && !self.click) || (fill && !self.fill) || (closing && !self.close) ||
         (capture && (!self.screenshot || !self.allow_capture)) || (diagnostics && !self.diagnostics) { return "UNAUTHORIZED" }
-    count := members(&params).len()
+    count := protocol.members(&params).len()
     if capture {
-        if !only(&params, &"window_id,min_revision") || count < 1 || count > 2 { return invalid }
+        if !protocol.only(&params, &"window_id,min_revision") || count < 1 || count > 2 { return invalid }
     } else if fill {
-        if !only(&params, &"window_id,element_id,text") || count != 3 { return invalid }
+        if !protocol.only(&params, &"window_id,element_id,text") || count != 3 { return invalid }
     } else if click {
-        if !only(&params, &"window_id,element_id") || count != 2 { return invalid }
+        if !protocol.only(&params, &"window_id,element_id") || count != 2 { return invalid }
     } else {
-        if !only(&params, &"window_id") || count != 1 { return invalid }
+        if !protocol.only(&params, &"window_id") || count != 1 { return invalid }
     }
-    window_id := match text_of(&params, &"window_id") {
+    window_id := match protocol.text_of(&params, &"window_id") {
         Some(text) => text
         None => { return invalid }
     }
-    element_id := text_of(&params, &"element_id").unwrap_or("")
-    if (click || fill) && text_of(&params, &"element_id").is_none() { return invalid }
-    fill_text := text_of(&params, &"text").unwrap_or("")
-    if fill && (text_of(&params, &"text").is_none() || chars(&fill_text) > 4096) { return invalid }
+    element_id := protocol.text_of(&params, &"element_id").unwrap_or("")
+    if (click || fill) && protocol.text_of(&params, &"element_id").is_none() { return invalid }
+    fill_text := protocol.text_of(&params, &"text").unwrap_or("")
+    if fill && (protocol.text_of(&params, &"text").is_none() || chars(&fill_text) > 4096) { return invalid }
     if !window_id.eq(&"main") { return "NOT_FOUND" }
     if ui.is_closed() || self.closed { return "WINDOW_CLOSED" }
     window := ui.native_window()
@@ -717,7 +606,7 @@ fn Devtools.handle(&mut self, ui &mut native.Native, record &Vec<u8>, id &mut st
         if capture {
             match params.get(&"min_revision") {
                 Some(minimum) => {
-                    if !is_integer(&minimum) || minimum.as_i64().unwrap_or(-1) < 0 { return invalid }
+                    if !protocol.is_integer(&minimum) || minimum.as_i64().unwrap_or(-1) < 0 { return invalid }
                     if u64(minimum.as_i64().unwrap_or(0)) > self.revision() { return "NOT_READY" }
                 }
                 None => {}
@@ -737,8 +626,8 @@ fn Devtools.handle(&mut self, ui &mut native.Native, record &Vec<u8>, id &mut st
         }
         if diagnostics {
             extra := ",\"stage\":\"native\",\"backend\":\"gtk4\",\"abi\":" + native.abi().to_string() +
-                ",\"queued_events\":" + ui.queued_events().to_string() + ",\"queue_full\":" + bool_text(ui.queue_full()) +
-                ",\"mapped\":" + bool_text(gtk.gtk_widget_get_mapped(window) != 0)
+                ",\"queued_events\":" + ui.queued_events().to_string() + ",\"queue_full\":" + protocol.bool_text(ui.queue_full()) +
+                ",\"mapped\":" + protocol.bool_text(gtk.gtk_widget_get_mapped(window) != 0)
             self.reply(&request_id, &self.result(&extra), &"")
             return ""
         }
@@ -746,7 +635,7 @@ fn Devtools.handle(&mut self, ui &mut native.Native, record &Vec<u8>, id &mut st
             version := gtk.gtk_get_major_version().to_string() + "." + gtk.gtk_get_minor_version().to_string() + "." + gtk.gtk_get_micro_version().to_string()
             var w = json.Writer.new()
             self.widget(ui, &mut w, window, window, &"main", &None, 0)
-            extra := ",\"platform\":\"linux\",\"backend\":\"gtk4\",\"backend_version\":" + quoted(&version) +
+            extra := ",\"platform\":\"linux\",\"backend\":\"gtk4\",\"backend_version\":" + protocol.quoted(&version) +
                 ",\"window_id\":\"main\",\"root\":" + w.finish()
             self.reply(&request_id, &self.result(&extra), &"")
             return ""
@@ -808,10 +697,6 @@ fn Devtools.handle(&mut self, ui &mut native.Native, record &Vec<u8>, id &mut st
     }
     return ""
 }
-fn bool_text(value bool) string {
-    if value { return "true" }
-    return "false"
-}
 // Events queued until set_token(0) answer this request when Tarn completes them.
 fn Devtools.begin_pending(&mut self, ui &mut native.Native, id &string) {
     self.pending_id = id.clone()
@@ -853,8 +738,8 @@ fn Devtools.capture(&mut self, ui &native.Native) {
                             extra := ",\"format\":\"png\",\"width\":" + gdk_texture_get_width(texture).to_string() +
                                 ",\"height\":" + gdk_texture_get_height(texture).to_string() +
                                 ",\"frame_counter\":" + gdk_frame_clock_get_frame_counter(self.capture_clock).to_string() +
-                                ",\"coordinate_space\":\"window-content\",\"sha256\":" + quoted(&encoding.hex(&crypto.sha256(bytes.as_slice()))) +
-                                ",\"data_base64\":" + quoted(&encoding.base64_encode(bytes.as_slice()))
+                                ",\"coordinate_space\":\"window-content\",\"sha256\":" + protocol.quoted(&encoding.hex(&crypto.sha256(bytes.as_slice()))) +
+                                ",\"data_base64\":" + protocol.quoted(&encoding.base64_encode(bytes.as_slice()))
                             id := self.capture_id.clone()
                             self.reply(&id, &self.result(&extra), &"")
                             error = ""
@@ -994,7 +879,7 @@ pub fn Devtools.pump(&mut self, ui &mut native.Native) bool {
         if !ffi.is_null(counter) && (!allocated(counter) || !allocated(ui.counter_button())) { return false }
         page := ui.visible_page()
         if !ffi.is_null(page) && !allocated(page) { return false }
-        self.wire(&("{\"session_id\":" + quoted(&self.session_id) + ",\"revision\":" + self.revision().to_string() +
+        self.wire(&("{\"session_id\":" + protocol.quoted(&self.session_id) + ",\"revision\":" + self.revision().to_string() +
             ",\"version\":1,\"event\":\"ready\"}"))
         self.ready = true
         return true

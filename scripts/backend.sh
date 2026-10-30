@@ -27,7 +27,7 @@ ui_backend() {
         ;;
     tarn)
         mkdir -p "$build/source/gtk" "$build/source/core"
-        cp "$gtk/gtk.tarn" "$gtk/native.tarn" "$build/source/gtk/"
+        cp "$gtk/gtk.tarn" "$gtk/native.tarn" "$gtk/protocol.tarn" "$build/source/gtk/"
         if (( dev )); then cp "$gtk/devtools.tarn" "$build/source/gtk/devtools.tarn"
         else cp "$gtk/devtools_off.tarn" "$build/source/gtk/devtools.tarn"; fi
         cp "$gtk/session.tarn" "$build/source/core/session.tarn"
