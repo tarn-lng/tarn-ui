@@ -9,7 +9,6 @@ flags=()
 [[ $# == 0 || ( $# == 1 && $1 == --dev ) ]] || { echo 'Usage: build-tray.sh [--dev]' >&2; exit 2; }
 if [[ ${1:-} == --dev ]]; then
     build="$root/.build/tray-dev"
-    packages+=(json-glib-1.0)
     flags+=(-DTARN_UI_DEVTOOLS)
 fi
 rm -rf "$build/source"

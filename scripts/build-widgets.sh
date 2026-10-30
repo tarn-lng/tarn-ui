@@ -8,7 +8,6 @@ packages=(gtk4)
 flags=()
 if [[ ${1:-} == --dev ]]; then
     build="$root/.build/widgets-dev"
-    packages+=(json-glib-1.0)
     flags+=(-DTARN_UI_DEVTOOLS)
 fi
 mkdir -p "$build/source/core"

@@ -26,14 +26,8 @@ cp "$root/tests/navigation/views.tarn" "$build/source/views.tarn"
 if ! LIBRARY_PATH="$build" "$compiler" build "$build/source/views.tarn" "${UI_LINKS[@]}" \
     -o "$build/views" --json > "$build/views.compiler.jsonl"; then cat "$build/views.compiler.jsonl" >&2; exit 1; fi
 if rg -q '"severity":"warning"' "$build/views.compiler.jsonl"; then cat "$build/views.compiler.jsonl" >&2; exit 1; fi
-if ui_c_backend; then
-    cc -std=c11 -Wall -Wextra -Werror -g -DTARN_UI_TESTING \
-        "$root/backends/linux/gtk/bridge.c" "$root/tests/navigation/lifecycle.c" \
-        -o "$build/lifecycle" $(pkg-config --cflags --libs gtk4)
-fi
 [[ ${1:-} != --build-only ]] || exit 0
 bash "$root/scripts/build-launcher.sh"
-if ui_c_backend; then timeout 30s "$build/lifecycle" > "$build/lifecycle.log" 2>&1; fi
 status=0
 python3 "$root/tests/navigation/test_navigation.py" > "$build/native.log" 2>&1 || status=$?
 cat "$build/native.log"

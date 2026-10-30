@@ -7,9 +7,7 @@ build="$root/.build/navigation"
 packages=(gtk4)
 flags=()
 if [[ ${1:-} == --dev ]]; then
-    pkg-config --atleast-version=1.10 json-glib-1.0
     build="$root/.build/navigation-dev"
-    packages+=(json-glib-1.0)
     flags+=(-DTARN_UI_DEVTOOLS)
 fi
 mkdir -p "$build/source/core"
@@ -25,9 +23,7 @@ if rg -q '"severity":"warning"' "$build/compiler.jsonl"; then cat "$build/compil
     "$compiler" version
     pkg-config --modversion "${packages[@]}"
     sha256sum "$compiler" "$root/core/session.tarn" "$root/core/components.tarn" "$root/core/navigation.tarn" "$root/core/forms.tarn" \
-        "$root/examples/navigation/main.tarn" "$root/examples/navigation/tasks.tarn" "$root/backends/linux/gtk/bridge.c" "$root/backends/linux/gtk/bridge.h" \
-        "$build/libtarn_ui_gtk.so"
-    if [[ ${1:-} == --dev ]]; then sha256sum "$root/backends/linux/gtk/devtools.inc"; fi
+        "$root/examples/navigation/main.tarn" "$root/examples/navigation/tasks.tarn" "$build"/source/gtk/*.tarn
     printf 'ABI=14\nLD_LIBRARY_PATH=%s\n' "$build"
 } > "$build/provenance.txt"
 printf 'Built %s/navigation\n' "$build"

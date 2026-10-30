@@ -99,32 +99,23 @@ pub fn run(config &Config) Result<json.Value, wire.Error> {
     if output.is_empty() { return Err(wire.fail("BUILD_FAILED", "build", "build directory collision budget exceeded")) }
     try mkdir(&path.join(&output, "source"))
     try mkdir(&path.join(&output, "source/core"))
-    try mkdir(&path.join(&output, "native"))
+    try mkdir(&path.join(&output, "source/gtk"))
     try snapshot(&config.root, &output, "core/session.tarn", "source/core/session.tarn")
     try snapshot(&config.root, &output, "core/reactive.tarn", "source/core/reactive.tarn")
     try snapshot(&config.root, &output, "examples/counter/main.tarn", "source/main.tarn")
     try snapshot(&config.root, &output, "examples/counter/counter.tarn", "source/counter.tarn")
-    try snapshot(&config.root, &output, "backends/linux/gtk/bridge.c", "native/bridge.c")
-    try snapshot(&config.root, &output, "backends/linux/gtk/bridge.h", "native/bridge.h")
-    try snapshot(&config.root, &output, "backends/linux/gtk/devtools.inc", "native/devtools.inc")
-    try stage(process.Command.new("pkg-config").arg("--atleast-version=1.10").arg("json-glib-1.0"), start, "json-glib-version")
-    flags_result := try stage(process.Command.new("pkg-config").arg("--cflags").arg("--libs").arg("gtk4").arg("json-glib-1.0"), start, "pkg-config")
-    flags_text := wire.field_text(&flags_result, "stdout")
-    flags := string.fields(&flags_text)
-    var native = process.Command.new("cc").arg("-std=c11").arg("-Wall").arg("-Wextra").arg("-Werror")
-        .arg("-fPIC").arg("-shared").arg("-DTARN_UI_DEVTOOLS").arg(path.join(&output, "native/bridge.c"))
-        .arg("-o").arg(path.join(&output, "libtarn_ui_gtk.so"))
-    for flag in flags.as_slice() {
-        if string.contains(flag, "'") || string.contains(flag, "\"") || string.contains(flag, "\\") {
-            return Err(wire.fail("BUILD_FAILED", "build", "quoted SDK flags require an explicit supported tokenizer"))
-        }
-        native = native.arg(flag.clone())
-    }
-    try stage(native, start, "cc")
+    // The Tarn GTK backend, with the devtools channel (development builds).
+    try snapshot(&config.root, &output, "backends/linux/gtk/gtk.tarn", "source/gtk/gtk.tarn")
+    try snapshot(&config.root, &output, "backends/linux/gtk/native.tarn", "source/gtk/native.tarn")
+    try snapshot(&config.root, &output, "backends/linux/gtk/protocol.tarn", "source/gtk/protocol.tarn")
+    try snapshot(&config.root, &output, "backends/linux/gtk/devtools.tarn", "source/gtk/devtools.tarn")
     binary := path.join(&output, "counter")
-    compiler_result := try stage(process.Command.new(config.compiler.clone()).arg("build")
-        .arg(path.join(&output, "source/main.tarn")).arg("--link").arg("tarn_ui_gtk")
-        .arg("-o").arg(binary.clone()).arg("--json").env("LIBRARY_PATH", output.clone()), start, "tarn")
+    var compile = process.Command.new(config.compiler.clone()).arg("build").arg(path.join(&output, "source/main.tarn"))
+    // Same libraries as backends/linux/tarn.toml [native] links.
+    for library in string.fields(&"gtk-4 gobject-2.0 gio-2.0 glib-2.0").as_slice() {
+        compile = compile.arg("--link").arg(library.clone())
+    }
+    compiler_result := try stage(compile.arg("-o").arg(binary.clone()).arg("--json"), start, "tarn")
     var result = wire.object()
     wire.put(&mut result, "binary", json.Value.Text(binary))
     wire.put(&mut result, "library_path", json.Value.Text(output))

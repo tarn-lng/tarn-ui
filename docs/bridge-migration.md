@@ -51,7 +51,7 @@ pasado a GTK debe vivir mientras GTK lo use.
 | G3 ✓ | listas y regiones (`list_*`, `tree_*`) | `gtk/regions_test.tarn`: identidad, orden, reescritura y eliminación |
 | G4 ✓ | controles, indicadores, contenedores, texto multilínea, barra de título y menú | `gtk/widgets_test.tarn`: eventos de usuario, escrituras sin evento, rangos, contenedores, cabecera, menú y sus nodos de región |
 | G5 ✓ | devtools en Tarn (`gtk/devtools.tarn`, con `json` y `crypto` del stdlib) y `gtk/session.tarn` | suites Python (widgets, navigation, reactive, devtools, tray) sin cambios con `TARN_UI_BACKEND=tarn` |
-| G6 | `session.tarn` usa el backend Tarn por defecto; se borran `bridge.c`, `bridge.h`, `devtools.inc`, scripts de compilación de C | todas las suites + ASan sobre el binario Tarn |
+| G6 ✓ | `core/session.tarn` es la sesión Tarn; se borran `bridge.c`, `bridge.h`, `devtools.inc`, sus tests en C y `investigate-gtk-leaks.sh`; el lanzador compila el backend Tarn | todas las suites + `test-devtools-memory.sh` (ASan y LSan) sobre el binario Tarn |
 
 Desde G3 el backend usa constantes, `match` como expresión, comparación de
 punteros con `==`, `ffi.offset`/`ffi.vec_mut`, `unwrap`/`expect` y
@@ -75,11 +75,7 @@ G5 añade:
   qdata del tipo GObject; `native.tarn` los encuentra ahí y, sin hooks (una
   app real), el puntero es nulo.
 
-Hasta G6 el bridge C sigue siendo el predeterminado y `session.tarn` no
-cambia. `backends/linux` es un paquete propio (`tarn.toml` con
-`[native] links`), así `tarn test` en ese directorio (o
-`scripts/test-native.sh`) ejecuta `gtk/*_test.tarn` con `testing.T`: los tests
-unitarios del protocolo de devtools (`gtk/protocol.tarn`, sin GTK) y las
-smokes nativas, que se marcan `skipped` sin display. Las pruebas C del bridge
-(`tests/gtk/bridge*`, `test_hooks.h`) se sustituyen por smokes Tarn que
-comprueban lo mismo (handlers desconectados, ventana finalizada).
+Desde G6 no queda código C en el backend: la sesión, el canal de devtools y
+el lanzador usan `backends/linux/gtk/*.tarn`, y json-glib ya no es una
+dependencia. El único C que queda es de prueba: `tests/native/hooks.c` (hooks
+de los fixtures), `tests/gtk/*.c` de fontconfig y `tests/audit/monitors.c`.

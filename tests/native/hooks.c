@@ -74,3 +74,23 @@ void test_dev_prepare(void) {
     if (g_strcmp0(mode, "full-events") == 0)
         for (int i = 0; i < 64; ++i) g_signal_emit_by_name(button, "clicked");
 }
+
+/* Counter smoke (tests/gtk/counter-smoke.tarn). */
+int32_t test_activate(int32_t count) {
+    GtkWidget *button = find(session_window(), "increment");
+    if (!button || count < 0) return 0;
+    /* Invoke the actual native clicked signal, not the backend's handler. */
+    for (int32_t i = 0; i < count; ++i) g_signal_emit_by_name(button, "clicked");
+    return 1;
+}
+int32_t test_activate_native(void) {
+    GtkWidget *button = find(session_window(), "increment");
+    return button ? gtk_widget_activate(button) : 0;
+}
+int32_t test_label_equals(int64_t value) {
+    GtkWidget *label = find(session_window(), "counter");
+    if (!GTK_IS_LABEL(label)) return 0;
+    char text[32];
+    g_snprintf(text, sizeof(text), "%" G_GINT64_FORMAT, value);
+    return g_str_equal(text, gtk_label_get_text(GTK_LABEL(label)));
+}

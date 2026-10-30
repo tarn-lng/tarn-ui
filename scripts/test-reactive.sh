@@ -21,16 +21,8 @@ for name in state app example; do
         cat "$build/$name.compiler.jsonl" >&2; exit 1
     fi
 done
-if ui_c_backend; then
-    cc -std=c11 -Wall -Wextra -Werror -g -DTARN_UI_TESTING \
-        "$root/backends/linux/gtk/bridge.c" "$root/tests/gtk/lifecycle.c" \
-        -o "$build/native-lifecycle" $(pkg-config --cflags --libs gtk4)
-fi
 LD_LIBRARY_PATH="$build" "$build/state" > "$build/state.log" 2>&1
 [[ ${1:-} != --build-only ]] || exit 0
-# Functional lifecycle only; the deferred sanitizer investigation has its own script.
-# The C bridge's own lifecycle test; the Tarn backend has tests/native.
-if ui_c_backend; then timeout 30s "$build/native-lifecycle" "$build/lifecycle.png" > "$build/lifecycle.log" 2>&1; fi
 status=0
 python3 "$root/tests/reactive/test_reactive.py" > "$build/native.log" 2>&1 || status=$?
 cat "$build/native.log"
