@@ -23,13 +23,17 @@ tarn-ui/
 
 Las antiguas carpetas `probes/` y `examples/heading/` se integraron en
 `tests/compiler/` y `examples/counter/`. Los scripts activos son
-`build-counter.sh`, `run-counter.sh`, `test-gtk.sh` e `investigate-gtk-leaks.sh`.
+`build-counter.sh`, `run-counter.sh` y `test-gtk.sh`; todos usan el backend GTK
+en Tarn (`backends/linux`, ver `docs/bridge-migration.md`) mediante
+`scripts/backend.sh`, y sus pruebas propias corren con `tarn test` en ese
+directorio (`test-native.sh`).
 La guía histórica de la ventana sigue en `docs/native-ui.md`.
 El lanzador actual se compila con `build-launcher.sh` y se ejecuta directamente
 como `.build/launcher/tarn-ui`, con protocolo interno o `--mode mcp`. La aceptación
 está en `test-launcher.sh`; las regresiones nativas siguen en `test-devtools.sh`
-y `test-devtools-memory.sh`. Python queda como referencia de pruebas en `tests/`. `devtools.inc` se incluye en el
-puente únicamente al compilar con `TARN_UI_DEVTOOLS`.
+y `test-devtools-memory.sh`. Python queda como referencia de pruebas en `tests/`. El canal de devtools
+(`backends/linux/gtk/devtools.tarn`) solo entra en los builds `--dev`; los demás
+copian `devtools_off.tarn`.
 
 ## Qué llega a GitHub
 

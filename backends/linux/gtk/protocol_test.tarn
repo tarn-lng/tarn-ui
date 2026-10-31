@@ -1,0 +1,108 @@
+// Unit tests for the devtools protocol: tarn test backends/linux
+import "json"
+import "testing"
+import "gtk/protocol"
+
+fn accepted(record string) protocol.Request {
+    return match protocol.parse_request(record.bytes()) {
+        Ok(request) => request
+        Err(rejection) => { panic("refused " + record + ": " + rejection.code) }
+    }
+}
+// Refused with `code`, reporting `id` ("" when the id is unknown).
+fn refused(t &mut testing.T, record string, code string, id string) {
+    match protocol.parse_request(record.bytes()) {
+        Ok(_) => { t.fail(&("accepted " + record)) }
+        Err(rejection) => {
+            t.eq(rejection.code, code)
+            t.eq(rejection.id, id)
+        }
+    }
+}
+
+fn test_valid_request(t &mut testing.T) {
+    request := accepted("{\"version\":1,\"request_id\":\"r-1_a\",\"method\":\"ui.inspect\",\"params\":{\"window_id\":\"main\"}}")
+    t.eq(request.id, "r-1_a")
+    t.eq(request.method, "ui.inspect")
+    t.check(protocol.text_of(&request.params, &"window_id").unwrap_or("").eq(&"main"), &"params")
+}
+fn test_member_order_is_free(t &mut testing.T) {
+    request := accepted("{\"params\":{},\"method\":\"m\",\"request_id\":\"x\",\"version\":1}")
+    t.eq(request.id, "x")
+}
+
+fn test_not_json_or_not_an_object(t &mut testing.T) {
+    refused(t, "", "INVALID_REQUEST", "")
+    refused(t, "{", "INVALID_REQUEST", "")
+    refused(t, "[1]", "INVALID_REQUEST", "")
+    refused(t, "\"text\"", "INVALID_REQUEST", "")
+}
+fn test_nul_bytes_and_escapes(t &mut testing.T) {
+    var record: Vec<u8> = Vec.new()
+    record.extend_from_slice("{\"version\":1,\"request_id\":\"a\",\"method\":\"m\",\"params\":{}}".bytes())
+    record.push(0)
+    match protocol.parse_request(record.as_slice()) {
+        Ok(_) => { panic("NUL byte accepted") }
+        Err(rejection) => { t.eq(rejection.code, "INVALID_REQUEST") }
+    }
+    refused(t, "{\"version\":1,\"request_id\":\"a\",\"method\":\"m\\u0000\",\"params\":{}}", "INVALID_REQUEST", "")
+    // An escaped backslash before u0000 is plain text, not an escape.
+    request := accepted("{\"version\":1,\"request_id\":\"a\",\"method\":\"m\\\\u0000\",\"params\":{}}")
+    t.eq(request.method, "m\\u0000")
+}
+fn test_nesting_limit(t &mut testing.T) {
+    var deep = ""
+    var closing = ""
+    var i = 0
+    // The limit counts every level: the request and params objects are two.
+    for i < 62 {
+        deep = deep + "["
+        closing = closing + "]"
+        i = i + 1
+    }
+    accepted("{\"version\":1,\"request_id\":\"a\",\"method\":\"m\",\"params\":{\"x\":" + deep + closing + "}}")
+    refused(t, "{\"version\":1,\"request_id\":\"a\",\"method\":\"m\",\"params\":{\"x\":[" + deep + closing + "]}}", "INVALID_REQUEST", "")
+    // Brackets inside strings do not count.
+    accepted("{\"version\":1,\"request_id\":\"a\",\"method\":\"" + deep + deep + "\",\"params\":{}}")
+}
+fn test_duplicate_members_at_any_depth(t &mut testing.T) {
+    refused(t, "{\"version\":1,\"version\":1,\"request_id\":\"a\",\"method\":\"m\",\"params\":{}}", "INVALID_REQUEST", "")
+    refused(t, "{\"version\":1,\"request_id\":\"a\",\"method\":\"m\",\"params\":{\"k\":1,\"k\":2}}", "INVALID_REQUEST", "")
+    refused(t, "{\"version\":1,\"request_id\":\"a\",\"method\":\"m\",\"params\":{\"l\":[{\"k\":1,\"k\":2}]}}", "INVALID_REQUEST", "")
+}
+fn test_request_id_rules(t &mut testing.T) {
+    refused(t, "{\"version\":1,\"request_id\":\"\",\"method\":\"m\",\"params\":{}}", "INVALID_REQUEST", "")
+    refused(t, "{\"version\":1,\"request_id\":\"a b\",\"method\":\"m\",\"params\":{}}", "INVALID_REQUEST", "")
+    refused(t, "{\"version\":1,\"request_id\":7,\"method\":\"m\",\"params\":{}}", "INVALID_REQUEST", "")
+    var long = ""
+    var i = 0
+    for i < 128 {
+        long = long + "a"
+        i = i + 1
+    }
+    accepted("{\"version\":1,\"request_id\":\"" + long + "\",\"method\":\"m\",\"params\":{}}")
+    refused(t, "{\"version\":1,\"request_id\":\"" + long + "a\",\"method\":\"m\",\"params\":{}}", "INVALID_REQUEST", "")
+}
+fn test_envelope_fields_report_the_id(t &mut testing.T) {
+    refused(t, "{\"version\":1,\"request_id\":\"a\",\"method\":\"m\"}", "INVALID_REQUEST", "a")
+    refused(t, "{\"version\":1,\"request_id\":\"a\",\"method\":\"m\",\"params\":{},\"extra\":0}", "INVALID_REQUEST", "a")
+    refused(t, "{\"version\":1,\"request_id\":\"a\",\"method\":2,\"params\":{}}", "INVALID_REQUEST", "a")
+    refused(t, "{\"version\":1,\"request_id\":\"a\",\"method\":\"m\",\"params\":[]}", "INVALID_REQUEST", "a")
+}
+fn test_version_must_be_integer_one(t &mut testing.T) {
+    refused(t, "{\"version\":2,\"request_id\":\"a\",\"method\":\"m\",\"params\":{}}", "UNSUPPORTED_VERSION", "a")
+    refused(t, "{\"version\":1.0,\"request_id\":\"a\",\"method\":\"m\",\"params\":{}}", "INVALID_REQUEST", "a")
+    refused(t, "{\"version\":1e0,\"request_id\":\"a\",\"method\":\"m\",\"params\":{}}", "INVALID_REQUEST", "a")
+    refused(t, "{\"version\":\"1\",\"request_id\":\"a\",\"method\":\"m\",\"params\":{}}", "INVALID_REQUEST", "a")
+}
+
+fn test_only_and_members(t &mut testing.T) {
+    value := json.parse(&"{\"window_id\":\"main\",\"text\":\"x\"}").expect("json")
+    t.check(protocol.only(&value, &"window_id,element_id,text"), &"subset allowed")
+    t.check(!protocol.only(&value, &"window_id"), &"extra member refused")
+    t.check(protocol.members(&value).len() == 2, &"member count")
+}
+fn test_quoted_escapes(t &mut testing.T) {
+    t.check(protocol.quoted(&"a\"b\\c\n").eq(&"\"a\\\"b\\\\c\\n\""), &("escaped " + protocol.quoted(&"a\"b\\c\n")))
+    t.check(protocol.bool_text(true).eq(&"true") && protocol.bool_text(false).eq(&"false"), &"bool text")
+}

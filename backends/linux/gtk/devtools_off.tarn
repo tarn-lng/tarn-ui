@@ -1,0 +1,11 @@
+// Release builds: the devtools channel compiled out (copied as gtk/devtools.tarn).
+import "gtk/native"
+
+pub struct Devtools {}
+pub fn new() Devtools { return Devtools {} }
+pub fn Devtools.active(&self) bool { return false }
+pub fn Devtools.start(&mut self, ui &native.Native) i32 { return 0 }
+pub fn Devtools.pump(&mut self, ui &mut native.Native) bool { return false }
+pub fn Devtools.complete(&mut self, token u64, status i32) {}
+pub fn Devtools.hidden(&mut self) {}
+pub fn Devtools.dispose(&mut self, ui &mut native.Native, window_closed bool, application_error i32) {}

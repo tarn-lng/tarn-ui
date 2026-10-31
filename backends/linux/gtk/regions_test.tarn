@@ -1,0 +1,116 @@
+// G3 smoke for the Tarn GTK backend: keyed list and tree regions keep
+// widget identity, reorder, update in place and remove what is absent.
+import "ffi"
+import "gtk/gtk"
+import "testing"
+import "gtk/native"
+
+extern "C" fn gtk_widget_activate(widget *mut gtk.Widget) i32
+
+fn check(value bool, what string) { if !value { panic("regions: " + what) } }
+fn missing(widget *mut gtk.Widget) bool { return ffi.is_null(widget) }
+fn first(parent *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_first_child(parent) } }
+fn after(widget *mut gtk.Widget) *mut gtk.Widget { unsafe { return gtk.gtk_widget_get_next_sibling(widget) } }
+
+fn test_regions(t &mut testing.T) {
+    if !native.display_available() {
+        t.skip(&"no display")
+        return
+    }
+    var ui = open()
+    ignore_real_keyboard(ui.native_window())
+    t.require(ui.next() == 1, &"opened")
+    t.require(ui.add_page(&"home") == 0, &"page")
+    t.require(ui.add_box(&"home", &"items", false, 4) == 0, &"list host")
+    t.require(ui.add_box(&"home", &"form", false, 4) == 0, &"tree host")
+    t.require(ui.add_label(&"home", &"filled", &"x") == 0, &"label")
+    t.require(ui.show_page(&"home") == 0, &"show")
+
+    // Lists.
+    t.require(ui.list_begin(&"filled", 1) == 1, &"a label hosts no list")
+    t.require(ui.list_begin(&"items", 2) == 0, &"list begin")
+    t.require(ui.add_label(&"items", &"stray", &"x") == 1, &"no static widgets while a region is open")
+    t.require(ui.list_item(&"a", &"Uno", 11) == 0, &"item a")
+    t.require(ui.list_item(&"a", &"Uno", 11) == 1, &"duplicate item")
+    t.require(ui.list_item(&"b", &"Dos", 12) == 0, &"item b")
+    t.require(ui.list_item(&"c", &"Tres", 13) == 1, &"over count")
+    t.require(ui.list_end() == 0, &"list end")
+    a := ui.widget(&"a")
+    b := ui.widget(&"b")
+    t.require(first(ui.widget(&"items")) == a, &"order a, b")
+    // Reorder, rename and drop: b keeps its widget, a disappears.
+    t.require(ui.list_begin(&"items", 2) == 0, &"second pass")
+    t.require(ui.list_item(&"b", &"Dos!", 12) == 0, &"b first")
+    t.require(ui.list_item(&"c", &"Tres", 13) == 0, &"c new")
+    t.require(ui.list_end() == 0, &"second end")
+    t.require(ui.widget(&"b") == b, &"b kept its widget")
+    t.require(missing(ui.widget(&"a")), &"a removed")
+    t.require(first(ui.widget(&"items")) == b, &"b now first")
+    t.require(ui.list_begin(&"items", 1) == 0, &"action check")
+    t.require(ui.list_item(&"b", &"Dos", 99) == 1, &"an item keeps its action")
+    t.require(ui.list_item(&"c", &"Tres", 13) == 0, &"c")
+    t.require(ui.list_end() == 0, &"end after refusal")
+    t.require(missing(ui.widget(&"b")), &"b removed")
+    unsafe { check(gtk_widget_activate(ui.widget(&"c")) == 1, "activate c") }
+    t.require(ui.next() == 1013, &"list click")
+
+    // Trees.
+    t.require(ui.tree_begin(&"items", 1) == 1, &"a list root is not a tree")
+    t.require(ui.tree_begin(&"form", 5) == 0, &"tree begin")
+    t.require(ui.tree_node(&"form", &"title", 1, &"Datos", 0, 0) == 0, &"heading")
+    t.require(ui.tree_node(&"form", &"group", 7, &"", 0, 8) == 0, &"row")
+    t.require(ui.tree_node(&"group", &"name", 5, &"Ana", 21, 0) == 0, &"input")
+    t.require(ui.tree_node(&"group", &"save", 4, &"Guardar", 22, 0) == 0, &"primary")
+    t.require(ui.tree_node(&"nowhere", &"x", 0, &"x", 0, 0) == 1, &"unknown parent")
+    t.require(ui.tree_node(&"form", &"note", 0, &"Nota", 0, 0) == 0, &"body")
+    t.require(ui.tree_end() == 0, &"tree end")
+    name := ui.widget(&"name")
+    save := ui.widget(&"save")
+    t.require(ui.tree_begin(&"form", 4) == 0, &"tree again")
+    t.require(ui.tree_node(&"form", &"group", 7, &"", 0, 8) == 0, &"row first now")
+    t.require(ui.tree_node(&"group", &"save", 4, &"Guardar", 22, 0) == 0, &"save before name")
+    t.require(ui.tree_node(&"group", &"name", 5, &"Bea", 21, 0) == 0, &"input rewritten")
+    t.require(ui.tree_node(&"form", &"title", 1, &"Datos!", 0, 0) == 0, &"heading renamed")
+    t.require(ui.tree_end() == 0, &"tree end again")
+    t.require(ui.widget(&"name") == name && ui.widget(&"save") == save, &"identity kept")
+    t.require(missing(ui.widget(&"note")), &"note removed")
+    t.require(first(ui.widget(&"group")) == save, &"save reordered first")
+    t.require(first(ui.widget(&"form")) == ui.widget(&"group"), &"group reordered first")
+    t.require(ui.tree_begin(&"form", 1) == 0, &"kind check")
+    t.require(ui.tree_node(&"form", &"title", 0, &"x", 0, 0) == 1, &"a key keeps its kind")
+    t.require(ui.tree_node(&"form", &"title", 1, &"Solo", 0, 0) == 0, &"title only")
+    t.require(ui.tree_end() == 0, &"collapse")
+    t.require(missing(ui.widget(&"group")) && missing(ui.widget(&"name")) && missing(ui.widget(&"save")), &"nested group removed")
+
+    t.require(ui.request_close() == 0, &"close")
+    // The model rewrite of "name" queued no edit before the close.
+    t.require(ui.next() == 2, &"closed")
+    t.require(ui.release() == 0, &"release")
+    print("regions ok")
+}
+
+fn open() native.Native {
+    match native.create(&"Regiones", &"Regiones en Tarn") {
+        Ok(value) => { return value }
+        Err(code) => { panic("create failed: " + code.to_string()) }
+    }
+}
+
+
+extern "C" fn gtk_event_controller_key_new() *mut gtk.Widget
+extern "C" fn gtk_event_controller_set_propagation_phase(controller *mut gtk.Widget, phase i32) void
+extern "C" fn gtk_widget_add_controller(widget *mut gtk.Widget, controller *mut gtk.Widget) void
+fn swallow_key(controller *mut gtk.Widget, keyval u32, keycode u32, state u32, data *mut u8) i32 { return 1 }
+// Each test window takes the compositor's focus; keys someone types elsewhere
+// would edit the focused entry (selected by focus) and queue real events.
+// A capture-phase controller on the window consumes them first.
+fn ignore_real_keyboard(window *mut gtk.Widget) {
+    unsafe {
+        controller := gtk_event_controller_key_new()
+        // GTK_PHASE_CAPTURE
+        gtk_event_controller_set_propagation_phase(controller, 1)
+        name := ffi.CString.new(&"key-pressed").expect("signal")
+        handler := gtk.g_signal_connect_data(controller, name.as_ptr(), ffi.callback(swallow_key), ffi.null(), ffi.null(), 0)
+        gtk_widget_add_controller(window, controller)
+    }
+}

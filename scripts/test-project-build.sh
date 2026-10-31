@@ -2,7 +2,7 @@
 # Test/build orchestration; the fixed recipe itself executes entirely in Tarn.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-compiler="${TARN_BIN:-$root/../tarn/target/debug/tarn}"
+compiler="${TARN_BIN:-$(command -v tarn)}"
 evidence="$root/.build/build-tests"
 mkdir -p "$evidence/source"
 cp "$root/tests/launcher/project-build.tarn" "$evidence/source/main.tarn"
@@ -18,7 +18,7 @@ printf '%s\n' "$fixture" > "$evidence/invalid-root.txt"
 mkdir -p "$fixture/core" "$fixture/examples/counter" "$fixture/backends/linux/gtk"
 cp "$root/core/session.tarn" "$root/core/reactive.tarn" "$fixture/core/"
 cp "$root/examples/counter/counter.tarn" "$fixture/examples/counter/"
-cp "$root/backends/linux/gtk/bridge.c" "$root/backends/linux/gtk/bridge.h" "$root/backends/linux/gtk/devtools.inc" "$fixture/backends/linux/gtk/"
+cp "$root"/backends/linux/gtk/{gtk,native,protocol,devtools}.tarn "$fixture/backends/linux/gtk/"
 printf 'fn main() { missing_function() }\n' > "$fixture/examples/counter/main.tarn"
 set +e
 "$evidence/probe" "$fixture" "$compiler" > "$evidence/failure.stdout" 2> "$evidence/failure.json"
