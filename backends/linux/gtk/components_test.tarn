@@ -20,6 +20,7 @@ fn test_components(t &mut testing.T) {
     }
     var gone: i32 = 0
     var ui = match_open()
+    ignore_real_keyboard(ui.native_window())
     t.require(ui.next() == 1, &"opened")
     t.require(ui.add_page(&"home") == 0, &"page")
     t.require(ui.add_page(&"home") == 1, &"duplicate key")
@@ -97,3 +98,22 @@ fn match_open() native.Native {
 
 fn text_of(ui &native.Native) string { return ui.event_text().expect("no event text") }
 fn cstring(text &string) ffi.CString { return ffi.CString.new(text).expect("NUL") }
+
+
+extern "C" fn gtk_event_controller_key_new() *mut gtk.Widget
+extern "C" fn gtk_event_controller_set_propagation_phase(controller *mut gtk.Widget, phase i32) void
+extern "C" fn gtk_widget_add_controller(widget *mut gtk.Widget, controller *mut gtk.Widget) void
+fn swallow_key(controller *mut gtk.Widget, keyval u32, keycode u32, state u32, data *mut u8) i32 { return 1 }
+// Each test window takes the compositor's focus; keys someone types elsewhere
+// would edit the focused entry (selected by focus) and queue real events.
+// A capture-phase controller on the window consumes them first.
+fn ignore_real_keyboard(window *mut gtk.Widget) {
+    unsafe {
+        controller := gtk_event_controller_key_new()
+        // GTK_PHASE_CAPTURE
+        gtk_event_controller_set_propagation_phase(controller, 1)
+        name := ffi.CString.new(&"key-pressed").expect("signal")
+        handler := gtk.g_signal_connect_data(controller, name.as_ptr(), ffi.callback(swallow_key), ffi.null(), ffi.null(), 0)
+        gtk_widget_add_controller(window, controller)
+    }
+}
