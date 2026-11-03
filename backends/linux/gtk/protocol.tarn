@@ -1,0 +1,153 @@
+// The devtools wire protocol's pure parts: request envelope validation and
+// JSON helpers. No GTK, so `tarn test` can run protocol_test.tarn alone.
+import "json"
+import "string"
+import "collections"
+
+pub const INVALID string = "INVALID_REQUEST"
+
+// A request whose envelope is valid; `params` is a JSON object.
+pub struct Request {
+    pub id string
+    pub method string
+    pub params json.Value
+}
+// Why a record was refused; `id` is empty until the request id is known valid.
+pub struct Rejection {
+    pub id string
+    pub code string
+}
+fn reject(id &string, code &string) Rejection { return Rejection { id: id.clone(), code: code.clone() } }
+
+// Validates one line: UTF-8 JSON without NUL, \u0000 or nesting past 64,
+// no duplicate members, exactly version/request_id/method/params with
+// version 1 and a [A-Za-z0-9_-]{1,128} request id.
+pub fn parse_request(record &[]u8) Result<Request, Rejection> {
+    for byte in record {
+        if byte == 0 { return Err(reject(&"", &INVALID)) }
+    }
+    if !prescan(record) { return Err(reject(&"", &INVALID)) }
+    root := match json.parse_bytes(record) {
+        Ok(value) => value
+        Err(_) => { return Err(reject(&"", &INVALID)) }
+    }
+    if !unique_members(&root) { return Err(reject(&"", &INVALID)) }
+    match root {
+        json.Value.Object(_) => {}
+        _ => { return Err(reject(&"", &INVALID)) }
+    }
+    id := text_of(&root, &"request_id").unwrap_or("")
+    if !valid_id(&id) { return Err(reject(&"", &INVALID)) }
+    if !only(&root, &"version,request_id,method,params") || members(&root).len() != 4 { return Err(reject(&id, &INVALID)) }
+    version := root.get(&"version").expect("version")
+    if !is_integer(&version) { return Err(reject(&id, &INVALID)) }
+    if version.as_i64().unwrap_or(0) != 1 { return Err(reject(&id, &"UNSUPPORTED_VERSION")) }
+    method := match text_of(&root, &"method") {
+        Some(text) => text
+        None => { return Err(reject(&id, &INVALID)) }
+    }
+    params := root.get(&"params").expect("params")
+    match params {
+        json.Value.Object(_) => {}
+        _ => { return Err(reject(&id, &INVALID)) }
+    }
+    return Ok(Request { id: id, method: method, params: params })
+}
+
+pub fn text_of(object &json.Value, key &string) Option<string> {
+    value := try object.get(key)
+    return value.as_text()
+}
+pub fn is_integer(value &json.Value) bool {
+    return match value {
+        json.Value.Number(text) => !string.contains(text, &".") && !string.contains(text, &"e") && !string.contains(text, &"E") && string.parse_i64(text).is_some()
+        _ => false
+    }
+}
+pub fn members(object &json.Value) Vec<string> {
+    var keys: Vec<string> = Vec.new()
+    match object {
+        json.Value.Object(items) => {
+            for item in items { keys.push(item.key.clone()) }
+        }
+        _ => {}
+    }
+    return keys
+}
+// Every member is in `allowed`, a comma-separated list of names.
+pub fn only(object &json.Value, allowed &string) bool {
+    names := string.split(allowed, &",")
+    for key in members(object) {
+        var found = false
+        for name in &names {
+            if name.eq(&key) { found = true }
+        }
+        if !found { return false }
+    }
+    return true
+}
+// No object repeats a member name.
+pub fn unique_members(value &json.Value) bool {
+    match value {
+        json.Value.Object(items) => {
+            var seen: collections.Set<string> = collections.Set.new()
+            for item in items {
+                if seen.contains(&item.key) { return false }
+                added := seen.insert(item.key.clone())
+                if !unique_members(&item.value) { return false }
+            }
+        }
+        json.Value.List(items) => {
+            for item in items {
+                if !unique_members(item) { return false }
+            }
+        }
+        _ => {}
+    }
+    return true
+}
+// Rejects \u0000 escapes and nesting deeper than 64 before parsing.
+pub fn prescan(record &[]u8) bool {
+    var depth: u32 = 0
+    var quoted_text = false
+    var escaped = false
+    var i: usize = 0
+    for byte in record {
+        if quoted_text {
+            if escaped {
+                if byte == 117 && i + 4 < record.len() && record[i + 1] == 48 && record[i + 2] == 48 && record[i + 3] == 48 && record[i + 4] == 48 { return false }
+                escaped = false
+            } else if byte == 92 {
+                escaped = true
+            } else if byte == 34 {
+                quoted_text = false
+            }
+        } else if byte == 34 {
+            quoted_text = true
+        } else if byte == 123 || byte == 91 {
+            depth = depth + 1
+            if depth > 64 { return false }
+        } else if byte == 125 || byte == 93 {
+            if depth > 0 { depth = depth - 1 }
+        }
+        i = i + 1
+    }
+    return true
+}
+pub fn valid_id(id &string) bool {
+    if id.is_empty() || id.len() > 128 { return false }
+    for byte in id.bytes() {
+        alphanumeric := (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        if !alphanumeric && byte != 45 && byte != 95 { return false }
+    }
+    return true
+}
+pub fn quoted(text &string) string {
+    var w = json.Writer.new()
+    w.string(text)
+    return w.finish()
+}
+pub fn bool_text(value bool) string {
+    if value { return "true" }
+    return "false"
+}
