@@ -3,11 +3,11 @@
 //
 // One non-variadic objc_msgSend declaration serves every message the backend
 // sends: integer/pointer arguments take the integer registers in order
-// (a..d, then e..g), doubles take the float registers (x, y, z). A callee
+// (a..d, then e..h), doubles take the float registers (x..w). A callee
 // ignores trailing arguments it does not declare. This holds on x86_64
-// System V and arm64 AAPCS64 because objc_msgSend is not variadic. Structs
-// larger than 16 bytes (NSRect, NSEdgeInsets) are never passed by value:
-// layout uses Auto Layout anchors and sizes (NSSize fits x, y).
+// System V and arm64 AAPCS64 because objc_msgSend is not variadic. Layout
+// uses Auto Layout anchors and sizes (NSSize fits x, y); the one NSRect
+// argument (send_rect) is passed both ways at once, see there.
 import "ffi"
 
 pub extern "C" fn dlopen(path *u8, mode i32) *mut u8
@@ -26,7 +26,7 @@ pub extern "C" fn objc_getAssociatedObject(object *mut u8, key *mut u8) *mut u8
 pub extern "C" fn objc_autoreleasePoolPush() *mut u8
 pub extern "C" fn objc_autoreleasePoolPop(pool *mut u8)
 pub extern "C" fn objc_msgSend(object *mut u8, selector *mut u8, a *mut u8, b *mut u8, c *mut u8, d *mut u8,
-    x f64, y f64, z f64, e *mut u8, f *mut u8, g *mut u8) *mut u8
+    x f64, y f64, z f64, w f64, e *mut u8, f *mut u8, g *mut u8, h *mut u8) *mut u8
 pub extern "C" fn CFRunLoopGetMain() *mut u8
 pub extern "C" fn CFRunLoopAddSource(loop *mut u8, source *mut u8, mode *mut u8)
 pub extern "C" fn CFFileDescriptorCreate(allocator *mut u8, fd i32, close_on_invalidate bool, callout *u8, context *mut u8) *mut u8
@@ -38,7 +38,6 @@ pub extern "C" fn CFRelease(object *mut u8)
 // OBJC_ASSOCIATION_RETAIN_NONATOMIC
 pub const RETAIN usize = 1
 pub const EVENT_APPLICATION_DEFINED usize = 15
-pub const LAYOUT_WIDTH usize = 7
 pub const LAYOUT_LEADING usize = 5
 // NSDefaultRunLoopMode's value. Common modes must be the exported constant
 // itself: CFRunLoopAddSource matches it by identity (see common_modes).
@@ -75,27 +74,27 @@ pub fn sel(name &string) *mut u8 {
 }
 
 pub fn send(object *mut u8, selector &string) *mut u8 {
-    unsafe { return objc_msgSend(object, sel(selector), nil(), nil(), nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+    unsafe { return objc_msgSend(object, sel(selector), nil(), nil(), nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
 }
 pub fn send1(object *mut u8, selector &string, a *mut u8) *mut u8 {
-    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
 }
 pub fn send2(object *mut u8, selector &string, a *mut u8, b *mut u8) *mut u8 {
-    unsafe { return objc_msgSend(object, sel(selector), a, b, nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+    unsafe { return objc_msgSend(object, sel(selector), a, b, nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
 }
 pub fn send3(object *mut u8, selector &string, a *mut u8, b *mut u8, c *mut u8) *mut u8 {
-    unsafe { return objc_msgSend(object, sel(selector), a, b, c, nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+    unsafe { return objc_msgSend(object, sel(selector), a, b, c, nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
 }
 pub fn send4(object *mut u8, selector &string, a *mut u8, b *mut u8, c *mut u8, d *mut u8) *mut u8 {
-    unsafe { return objc_msgSend(object, sel(selector), a, b, c, d, 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+    unsafe { return objc_msgSend(object, sel(selector), a, b, c, d, 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
 }
 // Messages whose only arguments are doubles (sizes, font sizes).
 pub fn send_f(object *mut u8, selector &string, x f64, y f64) *mut u8 {
-    unsafe { return objc_msgSend(object, sel(selector), nil(), nil(), nil(), nil(), x, y, 0.0, nil(), nil(), nil()) }
+    unsafe { return objc_msgSend(object, sel(selector), nil(), nil(), nil(), nil(), x, y, 0.0, 0.0, nil(), nil(), nil(), nil()) }
 }
 // One object then one double: constraintEqualToAnchor:constant:.
 pub fn send1_f(object *mut u8, selector &string, a *mut u8, x f64) *mut u8 {
-    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), x, 0.0, 0.0, nil(), nil(), nil()) }
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), x, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
 }
 // Statement forms for messages whose result the caller does not need.
 pub fn tell(object *mut u8, selector &string) { result := send(object, selector) }
@@ -106,7 +105,7 @@ pub fn tell2(object *mut u8, selector &string, a *mut u8, b *mut u8) { result :=
 pub fn post_wake_event(app *mut u8) {
     unsafe {
         event := objc_msgSend(class(&"NSEvent"), sel(&"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
-            word(EVENT_APPLICATION_DEFINED), nil(), nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil())
+            word(EVENT_APPLICATION_DEFINED), nil(), nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil())
         if !is_nil(event) { tell2(app, &"postEvent:atStart:", event, nil()) }
     }
 }
@@ -165,7 +164,7 @@ pub fn hot() Hot {
     }
 }
 pub fn call(object *mut u8, selector *mut u8, a *mut u8) *mut u8 {
-    unsafe { return objc_msgSend(object, selector, a, nil(), nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+    unsafe { return objc_msgSend(object, selector, a, nil(), nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
 }
 pub fn Hot.nsstring(&self, text &string) *mut u8 {
     utf8 := match ffi.CString.new(text) {
@@ -180,4 +179,27 @@ pub fn Hot.equals(&self, object *mut u8, text &string) bool {
     bytes := call(object, self.utf8, nil())
     if is_nil(bytes) { return false }
     unsafe { return ffi.string_from_c(ffi.to_const(bytes)).unwrap_or("").eq(text) }
+}
+
+// The bit pattern of `value`, for a double passed in an integer slot.
+pub fn bits(value f64) *mut u8 {
+    var cell: Vec<u64> = Vec.new()
+    cell.push(0)
+    unsafe {
+        var slot: *mut f64 = ffi.from_address(ffi.address(ffi.to_const(ffi.vec_mut(&mut cell))))
+        ffi.write(slot, value)
+    }
+    return word(usize(cell.at(0)))
+}
+// A message taking one object then an NSRect. x86_64 passes the 32-byte
+// struct in memory (the stack slots e..h, after the six integer registers);
+// arm64 passes it as a homogeneous float aggregate (x..w). Both are filled,
+// and each ABI ignores the other's copy.
+pub fn send_rect(object *mut u8, selector &string, a *mut u8, x f64, y f64, width f64, height f64) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), x, y, width, height, bits(x), bits(y), bits(width), bits(height)) }
+}
+// Rect first, then one object (cacheDisplayInRect:toBitmapImageRep:): on
+// x86_64 the object takes the first integer register, the rect the stack.
+pub fn send_rect_then(object *mut u8, selector &string, x f64, y f64, width f64, height f64, a *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), x, y, width, height, bits(x), bits(y), bits(width), bits(height)) }
 }

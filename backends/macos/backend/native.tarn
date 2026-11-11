@@ -43,6 +43,13 @@ copy struct Part {
     view *mut u8
     kind u32
     horizontal bool
+    // REGION_LIST or REGION_TREE on a region root; tree nodes keep kind + 1.
+    region u32
+    tree_kind u32
+    action u32
+}
+fn new_part(view *mut u8, kind u32, horizontal bool) Part {
+    return Part { view: view, kind: kind, horizontal: horizontal, region: 0, tree_kind: 0, action: 0 }
 }
 
 pub struct Native {
@@ -63,6 +70,17 @@ pub struct Native {
     dispatched_token u64
     finished bool
     hot objc.Hot
+    // Content size last requested with setContentSize:.
+    width f64
+    height f64
+    // The open list or tree reconciliation, if any.
+    region *mut u8
+    tree_mode bool
+    expected u32
+    seen collections.Set<string>
+    // Per parent view address: the arranged index of the next placed node.
+    next_index collections.Map<usize, usize>
+    focus_removed bool
     // Run loop sources by watch id (kind, NSTimer or CFFileDescriptor address).
     watches collections.Map<u32, Watch>
     next_watch u32
@@ -236,13 +254,20 @@ fn stack(vertical bool, spacing f64) *mut u8 {
     view := objc.send1(objc.class(&"NSStackView"), &"stackViewWithViews:", objc.send(objc.class(&"NSArray"), &"array"))
     if vertical {
         objc.tell1(view, &"setOrientation:", objc.word(1))
-        // Children fill the column's width.
-        objc.tell1(view, &"setAlignment:", objc.word(objc.LAYOUT_WIDTH))
+        // Leading edge; append() stretches non-button children to the width.
+        objc.tell1(view, &"setAlignment:", objc.word(objc.LAYOUT_LEADING))
     }
     result := objc.send_f(view, &"setSpacing:", spacing, 0.0)
     return view
 }
-fn append(parent *mut u8, child *mut u8) { objc.tell1(parent, &"addArrangedSubview:", child) }
+// In a column, text, fields and boxes take the full width (labels wrap at
+// it); buttons keep their natural size, as on macOS.
+fn append(parent *mut u8, child *mut u8) {
+    objc.tell1(parent, &"addArrangedSubview:", child)
+    vertical := objc.number(objc.send(parent, &"orientation")) == 1
+    is_button := objc.truth(objc.send1(child, &"isKindOfClass:", objc.class(&"NSButton")))
+    if vertical && !is_button { pin(child, &"widthAnchor", parent, &"constraintEqualToAnchor:constant:", 0.0) }
+}
 fn pin(view *mut u8, edge &string, other *mut u8, relation &string, constant f64) {
     constraint := objc.send1_f(objc.send(view, edge), relation, objc.send(other, edge), constant)
     objc.tell1(constraint, &"setActive:", objc.flag(true))
@@ -358,7 +383,8 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
         window: window, block: block, target: target, pool: pool, root: root, heading: heading_view,
         counter: objc.nil(), button: objc.nil(), pages: objc.nil(), page_views: Vec.new(),
         parts: collections.Map.new(), pages_presented: false, text: objc.nil(), delivered_closed: false,
-        dispatched_token: 0, finished: false, hot: objc.hot(), watches: collections.Map.new(), next_watch: 0,
+        dispatched_token: 0, finished: false, hot: objc.hot(), width: 480.0, height: 240.0, region: objc.nil(), tree_mode: false, expected: 0,
+        seen: collections.Set.new(), next_index: collections.Map.new(), focus_removed: false, watches: collections.Map.new(), next_watch: 0,
     })
 }
 
@@ -564,6 +590,8 @@ fn Native.parent(&self, key &string) Option<Part> {
         None => { return None }
     }
     if part.kind != PAGE && part.kind != BOX { return None }
+    // Regions own their children; static widgets stay outside them.
+    if part.region != 0 || part.tree_kind != 0 { return None }
     return Some(part)
 }
 fn Native.lookup(&self, key &string) Result<Part, i32> {
@@ -572,7 +600,7 @@ fn Native.lookup(&self, key &string) Result<Part, i32> {
     return collections.get_copy(&self.parts, key).ok_or(1)
 }
 fn Native.insert(&mut self, key &string, view *mut u8, kind u32, horizontal bool) {
-    previous := self.parts.insert(key.clone(), Part { view: view, kind: kind, horizontal: horizontal })
+    previous := self.parts.insert(key.clone(), new_part(view, kind, horizontal))
 }
 
 pub fn Native.add_page(&mut self, key &string) i32 {
@@ -582,7 +610,8 @@ pub fn Native.add_page(&mut self, key &string) i32 {
     if objc.is_nil(self.pages) {
         self.pages = stack(true, 0.0)
         append(self.root, self.pages)
-        result := objc.send_f(self.window, &"setContentSize:", 480.0, 560.0)
+        self.height = 560.0
+        result := objc.send_f(self.window, &"setContentSize:", self.width, self.height)
     }
     page := stack(true, 12.0)
     objc.tell1(page, &"setHidden:", objc.flag(true))
@@ -843,18 +872,336 @@ pub fn Native.set_align_start(&mut self, key &string) i32 {
     return 0
 }
 
+// ---- Dynamic regions ----
+// A list region owns only direct keyed buttons; a tree region owns a mixed
+// preorder of nodes: body=0, heading=1, value=2, button=3, primary=4,
+// input=5, column=6, row=7. Stable keys keep their views, kind, parent and
+// action; begin(count), nodes in the desired order, end removes the rest.
+const REGION_LIST u32 = 1
+const REGION_TREE u32 = 2
+const NODE_BUTTON u32 = 3
+const NODE_PRIMARY u32 = 4
+const NODE_INPUT u32 = 5
+const NODE_COLUMN u32 = 6
+const NODE_ROW u32 = 7
+const MAX_STAGED usize = MAX_PARTS * 2
+const MAX_TREE_DEPTH u32 = 12
+
+fn superview(view *mut u8) *mut u8 { return objc.send(view, &"superview") }
+fn within(view *mut u8, ancestor *mut u8) bool {
+    var climb = superview(view)
+    for !objc.is_nil(climb) {
+        if climb == ancestor { return true }
+        climb = superview(climb)
+    }
+    return false
+}
+fn arranged(parent *mut u8) *mut u8 { return objc.send(parent, &"arrangedSubviews") }
+fn arranged_count(parent *mut u8) usize { return objc.number(objc.send(arranged(parent), &"count")) }
+fn arranged_at(parent *mut u8, index usize) *mut u8 { return objc.send1(arranged(parent), &"objectAtIndex:", objc.word(index)) }
+
+fn Native.keys_within(&self, root *mut u8, inclusive bool) Vec<string> {
+    var keys: Vec<string> = Vec.new()
+    var cursor: usize = 0
+    for true {
+        slot := match self.parts.next_slot(&mut cursor) {
+            Some(found) => found
+            None => { break }
+        }
+        entry := self.parts.entry_at(slot)
+        view := entry.value.view
+        if within(view, root) || (inclusive && view == root) { keys.push(entry.key.clone()) }
+    }
+    return keys
+}
+fn Native.key_of(&self, view *mut u8) Option<string> {
+    var cursor: usize = 0
+    for true {
+        slot := match self.parts.next_slot(&mut cursor) {
+            Some(found) => found
+            None => { break }
+        }
+        entry := self.parts.entry_at(slot)
+        if entry.value.view == view { return Some(entry.key.clone()) }
+    }
+    return None
+}
+fn Native.set_region(&mut self, key &string, region u32) {
+    match collections.get_copy(&self.parts, key) {
+        Some(found) => {
+            var updated = found
+            updated.region = region
+            previous := self.parts.insert(key.clone(), updated)
+        }
+        None => {}
+    }
+}
+fn Native.open(&mut self, root *mut u8, count u32, tree bool) {
+    self.region = root
+    self.expected = count
+    self.tree_mode = tree
+    self.focus_removed = false
+    self.seen = collections.Set.new()
+    self.next_index = collections.Map.new()
+}
+// Drops `child` and every keyed view inside it.
+fn Native.remove_subtree(&mut self, parent *mut u8, child *mut u8) {
+    responder := objc.send(self.window, &"firstResponder")
+    // The first responder may be the window itself, which has no superview.
+    if !objc.is_nil(responder) && responds(responder, &"superview") && (responder == child || within(responder, child)) { self.focus_removed = true }
+    for key in self.keys_within(child, true) {
+        removed := self.parts.remove(&key)
+    }
+    objc.tell1(parent, &"removeArrangedSubview:", child)
+    objc.tell(child, &"removeFromSuperview")
+}
+fn Native.close_region(&mut self) {
+    if self.focus_removed {
+        objc.tell(self.window, &"recalculateKeyViewLoop")
+        objc.tell1(self.window, &"selectNextKeyView:", objc.nil())
+    }
+    self.region = objc.nil()
+    self.tree_mode = false
+    self.seen = collections.Set.new()
+    self.next_index = collections.Map.new()
+}
+// Moves `view` to the next arranged position of `parent` and marks it seen.
+fn Native.place(&mut self, parent *mut u8, key &string, view *mut u8) {
+    index := collections.get_copy(&self.next_index, &objc.number(parent)).unwrap_or(0)
+    if index >= arranged_count(parent) || arranged_at(parent, index) != view {
+        objc.tell(view, &"retain")
+        objc.tell1(parent, &"removeArrangedSubview:", view)
+        objc.tell2(parent, &"insertArrangedSubview:atIndex:", view, objc.word(index))
+        release(view)
+    }
+    previous := self.next_index.insert(objc.number(parent), index + 1)
+    added := self.seen.insert(key.clone())
+}
+
+pub fn Native.list_begin(&mut self, parent &string, count u32) i32 {
+    host := match self.lookup(parent) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if !objc.is_nil(self.region) || (host.kind != PAGE && host.kind != BOX) || host.region == REGION_TREE || host.tree_kind != 0 || count > 256 { return 1 }
+    old := arranged_count(host.view)
+    if host.region != REGION_LIST && old != 0 { return 1 }
+    if self.parts.len() - old + usize(count) > MAX_PARTS { return 1 }
+    self.set_region(parent, REGION_LIST)
+    self.open(host.view, count, false)
+    return 0
+}
+
+pub fn Native.list_item(&mut self, key &string, text &string, action u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if objc.is_nil(self.region) || self.tree_mode || !valid_key(key) || !valid_action(action) || self.seen.contains(key) { return 1 }
+    if u32(self.seen.len()) >= self.expected { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var view: *mut u8 = objc.nil()
+    match collections.get_copy(&self.parts, key) {
+        Some(found) => {
+            if superview(found.view) != self.region || found.kind != BUTTON || found.action != action { return 1 }
+            shown := self.set_text(key, text)
+            view = found.view
+        }
+        None => {
+            if self.parts.len() >= MAX_STAGED { return 1 }
+            view = button(self.hot.nsstring(text), self.target, 1000 + i32(action))
+            append(self.region, view)
+            var created = new_part(view, BUTTON, false)
+            created.action = action
+            previous := self.parts.insert(key.clone(), created)
+        }
+    }
+    self.place(self.region, key, view)
+    return 0
+}
+
+pub fn Native.list_end(&mut self) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if objc.is_nil(self.region) || self.tree_mode || u32(self.seen.len()) != self.expected { return 1 }
+    self.prune(self.region, false)
+    self.close_region()
+    return 0
+}
+
+pub fn Native.tree_begin(&mut self, key &string, count u32) i32 {
+    host := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if !objc.is_nil(self.region) || (host.kind != PAGE && host.kind != BOX) || count > 256 || host.region == REGION_LIST { return 1 }
+    if host.region != REGION_TREE && arranged_count(host.view) != 0 { return 1 }
+    if host.tree_kind != 0 { return 1 }
+    old := self.keys_within(host.view, false).len()
+    if self.parts.len() - old + usize(count) > MAX_PARTS { return 1 }
+    self.set_region(key, REGION_TREE)
+    self.open(host.view, count, true)
+    return 0
+}
+
+fn Native.new_node(&mut self, kind u32, text &string, action u32, spacing u32) Part {
+    if kind == NODE_BUTTON || kind == NODE_PRIMARY {
+        view := button(self.hot.nsstring(text), self.target, 1000 + i32(action))
+        if kind == NODE_PRIMARY { objc.tell1(view, &"setKeyEquivalent:", objc.nsstring(&"\r")) }
+        var created = new_part(view, BUTTON, false)
+        created.action = action
+        return created
+    }
+    if kind >= NODE_COLUMN { return new_part(stack(kind == NODE_COLUMN, f64(spacing)), BOX, kind == NODE_ROW) }
+    if kind == NODE_INPUT {
+        field := objc.send1(objc.class(&"NSTextField"), &"textFieldWithString:", self.hot.nsstring(text))
+        objc.tell1(field, &"setTag:", objc.word(usize(1000 + action)))
+        // Assigned after the initial text so creation queues no edit.
+        objc.tell1(field, &"setDelegate:", self.target)
+        var created = new_part(field, ENTRY, false)
+        created.action = action
+        return created
+    }
+    return new_part(label(self.hot.nsstring(text), kind), LABEL, false)
+}
+
+pub fn Native.tree_node(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, spacing u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || objc.is_nil(self.region) || !valid_key(key) || kind > NODE_ROW || spacing > 64 { return 1 }
+    if self.seen.contains(key) || u32(self.seen.len()) >= self.expected { return 1 }
+    takes_action := kind >= NODE_BUTTON && kind <= NODE_INPUT
+    if takes_action && !valid_action(action) { return 1 }
+    if !takes_action && action != 0 { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if kind == NODE_INPUT && chars(text) > MAX_INPUT { return 1 }
+    host := match collections.get_copy(&self.parts, parent_key) {
+        Some(found) => found
+        None => { return 1 }
+    }
+    if host.kind != PAGE && host.kind != BOX { return 1 }
+    depth := self.region_depth(&host, parent_key)
+    if depth > MAX_TREE_DEPTH || (kind >= NODE_COLUMN && depth >= MAX_TREE_DEPTH) { return 1 }
+    var node = new_part(objc.nil(), 0, false)
+    match collections.get_copy(&self.parts, key) {
+        Some(found) => {
+            if superview(found.view) != host.view || found.tree_kind != kind + 1 || found.action != action { return 1 }
+            node = found
+            if kind >= NODE_COLUMN {
+                result := objc.send_f(node.view, &"setSpacing:", f64(spacing), 0.0)
+            } else if kind == NODE_INPUT {
+                written := self.set_input(key, text)
+                if written != 0 { return written }
+            } else {
+                shown := self.set_text(key, text)
+            }
+        }
+        None => {
+            if self.parts.len() >= MAX_STAGED { return 1 }
+            node = self.new_node(kind, text, action, spacing)
+            node.tree_kind = kind + 1
+            append(host.view, node.view)
+            previous := self.parts.insert(key.clone(), node)
+        }
+    }
+    self.place(host.view, key, node.view)
+    return 0
+}
+
+// Levels from `parent` up to the region root, or MAX_TREE_DEPTH + 1 when the
+// parent is not the root or an already placed node inside it.
+fn Native.region_depth(&self, parent &Part, parent_key &string) u32 {
+    if parent.view != self.region && (!self.seen.contains(parent_key) || !within(parent.view, self.region)) { return MAX_TREE_DEPTH + 1 }
+    var depth: u32 = 0
+    var climb = parent.view
+    for climb != self.region {
+        depth = depth + 1
+        if depth > MAX_TREE_DEPTH { return depth }
+        climb = superview(climb)
+    }
+    return depth
+}
+
+// Removes unseen children of `parent`; with `nested`, kept boxes in turn.
+fn Native.prune(&mut self, parent *mut u8, nested bool) {
+    var index = arranged_count(parent)
+    for index > 0 {
+        index = index - 1
+        child := arranged_at(parent, index)
+        match self.key_of(child) {
+            Some(key) => {
+                if !self.seen.contains(&key) {
+                    self.remove_subtree(parent, child)
+                } else if nested {
+                    match collections.get_copy(&self.parts, &key) {
+                        Some(found) => {
+                            if found.kind == BOX { self.prune(found.view, true) }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+pub fn Native.tree_end(&mut self) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || objc.is_nil(self.region) || u32(self.seen.len()) != self.expected { return 1 }
+    self.prune(self.region, true)
+    self.close_region()
+    return 0
+}
+
+// ---- Snapshot ----
+// Renders the window content (no frame or shadow) to a PNG at `path`, from
+// AppKit's own drawing: no screen-recording permission involved. For tests
+// and visual review.
+pub fn Native.snapshot_png(&mut self, path &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    file := match c(path) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    view := objc.send(self.window, &"contentView")
+    objc.tell(view, &"layoutSubtreeIfNeeded")
+    rep := objc.send_rect(view, &"bitmapImageRepForCachingDisplayInRect:", objc.nil(), 0.0, 0.0, self.width, self.height)
+    if objc.is_nil(rep) { return 5 }
+    // cacheDisplayInRect: draws the views only: fill the window background
+    // first, resolved in the view's appearance (light or dark).
+    graphics := objc.class(&"NSGraphicsContext")
+    context := objc.send1(graphics, &"graphicsContextWithBitmapImageRep:", rep)
+    if objc.is_nil(context) { return 5 }
+    objc.tell(graphics, &"saveGraphicsState")
+    objc.tell1(graphics, &"setCurrentContext:", context)
+    appearance := objc.class(&"NSAppearance")
+    previous := objc.send(appearance, &"currentAppearance")
+    objc.tell1(appearance, &"setCurrentAppearance:", objc.send(view, &"effectiveAppearance"))
+    objc.tell(objc.send(objc.class(&"NSColor"), &"windowBackgroundColor"), &"setFill")
+    filled := objc.send_rect(objc.class(&"NSBezierPath"), &"fillRect:", objc.nil(), 0.0, 0.0, self.width, self.height)
+    objc.tell1(appearance, &"setCurrentAppearance:", previous)
+    objc.tell(graphics, &"restoreGraphicsState")
+    result := objc.send_rect_then(view, &"cacheDisplayInRect:toBitmapImageRep:", 0.0, 0.0, self.width, self.height, rep)
+    // NSBitmapImageFileTypePNG = 4
+    data := objc.send2(rep, &"representationUsingType:properties:", objc.word(4), objc.send(objc.class(&"NSDictionary"), &"dictionary"))
+    if objc.is_nil(data) { return 5 }
+    if !objc.truth(objc.send2(data, &"writeToFile:atomically:", objc.nsstring(path), objc.flag(true))) { return 5 }
+    return 0
+}
+
 // ---- Not yet on AppKit (status 11) ----
 fn Native.unsupported(&self) i32 {
     status := self.writable()
     if status != 0 { return status }
     return 11
 }
-pub fn Native.list_begin(&mut self, parent &string, count u32) i32 { return self.unsupported() }
-pub fn Native.list_item(&mut self, key &string, text &string, action u32) i32 { return self.unsupported() }
-pub fn Native.list_end(&mut self) i32 { return self.unsupported() }
-pub fn Native.tree_begin(&mut self, key &string, count u32) i32 { return self.unsupported() }
-pub fn Native.tree_node(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, spacing u32) i32 { return self.unsupported() }
-pub fn Native.tree_end(&mut self) i32 { return self.unsupported() }
 pub fn Native.add_control(&mut self, parent &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 { return self.unsupported() }
 pub fn Native.add_container(&mut self, parent &string, key &string, kind u32, title &string, action u32, value i64) i32 { return self.unsupported() }
 pub fn Native.add_text_area(&mut self, parent &string, key &string, text &string, action u32, lines u32) i32 { return self.unsupported() }
@@ -874,7 +1221,7 @@ pub fn Native.watch_interval(&mut self, milliseconds u32) u32 {
     if self.check() != 0 { return 0 }
     var timer: *mut u8 = objc.nil()
     unsafe { timer = objc.objc_msgSend(objc.class(&"NSTimer"), objc.sel(&"timerWithTimeInterval:target:selector:userInfo:repeats:"),
-        self.target, objc.sel(&"tick:"), objc.nil(), objc.flag(true), f64(milliseconds) / 1000.0, 0.0, 0.0, objc.nil(), objc.nil(), objc.nil()) }
+        self.target, objc.sel(&"tick:"), objc.nil(), objc.flag(true), f64(milliseconds) / 1000.0, 0.0, 0.0, 0.0, objc.nil(), objc.nil(), objc.nil(), objc.nil()) }
     if objc.is_nil(timer) { return 0 }
     loop := objc.send(objc.class(&"NSRunLoop"), &"mainRunLoop")
     objc.tell2(loop, &"addTimer:forMode:", timer, objc.common_modes())
