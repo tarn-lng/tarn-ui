@@ -14,7 +14,7 @@ python3 "$root/tests/audit/phase5.py" > "$evidence/layout.stdout.json" 2> "$evid
     date -u +%Y-%m-%dT%H:%M:%SZ
     pkg-config --modversion gtk4
     sha256sum "$root/core/session.tarn" "$root/core/components.tarn" "$root/core/reactive.tarn" \
-        "$root/core/navigation.tarn" "$root/core/forms.tarn" "$root"/backends/linux/gtk/*.tarn \
+        "$root/core/navigation.tarn" "$root/core/forms.tarn" "$root"/backends/linux/backend/*.tarn \
         "$root/examples/navigation/main.tarn" "$root/examples/navigation/tasks.tarn" \
         "$root/tests/navigation/test_navigation.py" \
         "$root/tests/audit/phase5.py" "$root/tests/audit/monitors.c" "$root/scripts/audit-phase5.sh"

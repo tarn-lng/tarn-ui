@@ -1,5 +1,5 @@
 // Release builds: the devtools channel compiled out (copied as gtk/devtools.tarn).
-import "gtk/native"
+import "backend/native"
 
 pub struct Devtools {}
 pub fn new() Devtools { return Devtools {} }

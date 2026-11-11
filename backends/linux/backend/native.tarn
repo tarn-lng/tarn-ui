@@ -5,7 +5,7 @@
 import "ffi"
 import "collections"
 import "string"
-import "gtk/gtk"
+import "backend/gtk"
 
 // Signal handlers cannot reach Tarn values, so what they write lives in a
 // GLib block: i32 flags and counters in slots 0..11, the event queue pointer
@@ -2578,4 +2578,31 @@ pub fn Native.set_align_start(&mut self, key &string) i32 {
     if part.kind != LABEL { return 1 }
     unsafe { gtk.gtk_label_set_xalign(part.widget, 0.0) }
     return 0
+}
+
+// ---- Event-loop sources (the session's watch_fd / watch_interval) ----
+// GLib calls these on the main thread while iterate() blocks; they only set
+// the session's coalesced wake flag. 0 means the source was not created.
+extern "C" fn g_unix_fd_add_full(priority i32, fd i32, condition u32, function *u8, data *mut u8, notify *mut u8) u32
+extern "C" fn g_timeout_add_full(priority i32, interval u32, callback *u8, data *mut u8, destroy *mut u8) u32
+extern "C" fn g_source_remove(id u32) i32
+fn descriptor_ready(fd i32, condition u32, data *mut u8) i32 {
+    wake(data)
+    return 1
+}
+fn interval_ready(data *mut u8) i32 {
+    wake(data)
+    return 1
+}
+pub fn Native.watch_fd(&mut self, fd i32) u32 {
+    if self.check() != 0 || fd < 0 { return 0 }
+    // G_IO_IN | G_IO_ERR | G_IO_HUP
+    unsafe { return g_unix_fd_add_full(0, fd, u32(1 | 8 | 16), ffi.callback(descriptor_ready), self.block, ffi.null()) }
+}
+pub fn Native.watch_interval(&mut self, milliseconds u32) u32 {
+    if self.check() != 0 { return 0 }
+    unsafe { return g_timeout_add_full(0, milliseconds, ffi.callback(interval_ready), self.block, ffi.null()) }
+}
+pub fn Native.unwatch(&mut self, id u32) {
+    unsafe { removed := g_source_remove(id) }
 }

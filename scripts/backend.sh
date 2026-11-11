@@ -1,4 +1,5 @@
-# Sourced by the build scripts: places the Tarn GTK backend beside a copied
+# Sourced by the build scripts: places the platform backend (GTK on Linux,
+# AppKit on macOS) beside a copied
 # core/session.tarn. Usage: ui_backend BUILD_DIR [-DTARN_UI_DEVTOOLS]
 # [-DTARN_UI_TESTING]; then link with "${UI_LINKS[@]}". DEVTOOLS selects
 # gtk/devtools.tarn (else the empty devtools_off.tarn); TESTING builds the
@@ -6,7 +7,23 @@
 ui_backend() {
     local build=$1
     shift
-    local gtk="$root/backends/linux/gtk"
+    if [[ $(uname -s) == Darwin ]]; then
+        # AppKit backend: no devtools channel or test hooks yet.
+        local appkit="$root/backends/macos/backend"
+        mkdir -p "$build/source/backend" "$build/source/core"
+        cp "$appkit/objc.tarn" "$appkit/native.tarn" "$build/source/backend/"
+        cp "$appkit/devtools_off.tarn" "$build/source/backend/devtools.tarn"
+        cp "$root/core/session.tarn" "$build/source/core/session.tarn"
+        # Tarn links with `cc -l<name>`: expose CoreFoundation's SDK stub as a
+        # library in the build directory (callers set LIBRARY_PATH to it).
+        ln -sf "$(xcrun --show-sdk-path)/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation.tbd" \
+            "$build/libCoreFoundation.tbd"
+        # Same libraries as backends/macos/tarn.toml [native] links.
+        UI_LINKS=(--link objc --link CoreFoundation)
+        UI_PLAIN_LINKS=("${UI_LINKS[@]}")
+        return 0
+    fi
+    local gtk="$root/backends/linux/backend"
     local dev=0 testing=0 flag
     for flag in "$@"; do
         case "$flag" in
@@ -15,10 +32,10 @@ ui_backend() {
         *) echo "ui_backend: unknown flag $flag" >&2; return 2 ;;
         esac
     done
-    mkdir -p "$build/source/gtk" "$build/source/core"
-    cp "$gtk/gtk.tarn" "$gtk/native.tarn" "$gtk/protocol.tarn" "$build/source/gtk/"
-    if (( dev )); then cp "$gtk/devtools.tarn" "$build/source/gtk/devtools.tarn"
-    else cp "$gtk/devtools_off.tarn" "$build/source/gtk/devtools.tarn"; fi
+    mkdir -p "$build/source/backend" "$build/source/core"
+    cp "$gtk/gtk.tarn" "$gtk/native.tarn" "$gtk/protocol.tarn" "$build/source/backend/"
+    if (( dev )); then cp "$gtk/devtools.tarn" "$build/source/backend/devtools.tarn"
+    else cp "$gtk/devtools_off.tarn" "$build/source/backend/devtools.tarn"; fi
     cp "$root/core/session.tarn" "$build/source/core/session.tarn"
     # Same libraries as backends/linux/tarn.toml [native] links.
     UI_LINKS=(--link gtk-4 --link gobject-2.0 --link gio-2.0 --link glib-2.0)

@@ -1,9 +1,9 @@
 // G3 smoke for the Tarn GTK backend: keyed list and tree regions keep
 // widget identity, reorder, update in place and remove what is absent.
 import "ffi"
-import "gtk/gtk"
+import "backend/gtk"
 import "testing"
-import "gtk/native"
+import "backend/native"
 
 extern "C" fn gtk_widget_activate(widget *mut gtk.Widget) i32
 

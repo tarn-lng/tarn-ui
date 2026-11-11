@@ -1,0 +1,926 @@
+// AppKit backend: the same native.Native contract as backends/linux/backend
+// (ABI 14, same status codes), written in Tarn over the Objective-C runtime.
+// Status: 0 ok, 1 invalid input, 2 off main thread, 3 session active,
+// 4 no display, 5 allocation failed, 6 closed, 8 queue full, 11 not
+// supported by this backend yet (lists, trees, form controls, containers,
+// text areas, header bar and menu).
+import "ffi"
+import "collections"
+import "backend/objc"
+
+// Session block (calloc): i32 flags, then the event ring.
+const OPENED usize = 0
+const CLOSED usize = 1
+const HIDDEN usize = 2
+const WOKEN usize = 3
+const FULL usize = 4
+const BACKGROUND usize = 5
+const COUNT_SLOT usize = 32
+const HEAD_SLOT usize = 36
+const APP_SLOT usize = 40
+const RECORDS usize = 48
+const QUEUE_CAPACITY u32 = 64
+const RECORD_SIZE usize = 16
+const BLOCK_SIZE usize = RECORDS + 64 * RECORD_SIZE
+
+const PAGE u32 = 0
+const BOX u32 = 1
+const LABEL u32 = 2
+const BUTTON u32 = 3
+const ENTRY u32 = 4
+
+const MAX_ACTION u32 = 1024
+const MAX_PARTS usize = 256
+const MAX_INPUT i64 = 256
+const TARGET_CLASS string = "TarnUITarget"
+
+copy struct Watch {
+    kind u32
+    source usize
+}
+
+copy struct Part {
+    view *mut u8
+    kind u32
+    horizontal bool
+}
+
+pub struct Native {
+    window *mut u8
+    block *mut u8
+    target *mut u8
+    pool *mut u8
+    root *mut u8
+    heading *mut u8
+    counter *mut u8
+    button *mut u8
+    pages *mut u8
+    page_views Vec<usize>
+    parts collections.Map<string, Part>
+    pages_presented bool
+    text *mut u8
+    delivered_closed bool
+    dispatched_token u64
+    finished bool
+    // Run loop sources by watch id (kind, NSTimer or CFFileDescriptor address).
+    watches collections.Map<u32, Watch>
+    next_watch u32
+}
+
+fn cell<T>(base *mut u8, offset usize) *mut T {
+    return ffi.from_address(ffi.address(ffi.to_const(base)) + offset)
+}
+fn flag(block *mut u8, slot usize) i32 {
+    var flags: *mut i32 = cell(block, 0)
+    unsafe { return ffi.read(ffi.offset(ffi.to_const(flags), slot)) }
+}
+fn set_flag(block *mut u8, slot usize, value i32) {
+    var flags: *mut i32 = cell(block, 0)
+    unsafe { ffi.write(ffi.offset_mut(flags, slot), value) }
+}
+fn read_u32(block *mut u8, slot usize) u32 {
+    var value: *mut u32 = cell(block, slot)
+    unsafe { return ffi.read(ffi.to_const(value)) }
+}
+fn write_u32(block *mut u8, slot usize, value u32) {
+    var target: *mut u32 = cell(block, slot)
+    unsafe { ffi.write(target, value) }
+}
+fn app_of(block *mut u8) *mut u8 {
+    var slot: *mut *mut u8 = cell(block, APP_SLOT)
+    unsafe { return ffi.read(ffi.to_const(slot)) }
+}
+fn record(block *mut u8, index u32) *mut u8 { return cell(block, RECORDS + usize(index) * RECORD_SIZE) }
+
+// Takes ownership of `text` (malloc'ed, may be null).
+fn enqueue(block *mut u8, code i32, text *mut u8) {
+    count := read_u32(block, COUNT_SLOT)
+    if flag(block, CLOSED) != 0 || flag(block, FULL) != 0 || count == QUEUE_CAPACITY {
+        if count == QUEUE_CAPACITY { set_flag(block, FULL, 1) }
+        unsafe { objc.free(text) }
+        return
+    }
+    entry := record(block, (read_u32(block, HEAD_SLOT) + count) % QUEUE_CAPACITY)
+    var code_cell: *mut i64 = cell(entry, 0)
+    var text_cell: *mut *mut u8 = cell(entry, 8)
+    unsafe {
+        ffi.write(code_cell, i64(code))
+        ffi.write(text_cell, text)
+    }
+    write_u32(block, COUNT_SLOT, count + 1)
+}
+// Pops the oldest record: its code, and its text into `text` (owned).
+fn dequeue(block *mut u8, text &mut usize) i32 {
+    count := read_u32(block, COUNT_SLOT)
+    if count == 0 { return 0 }
+    head := read_u32(block, HEAD_SLOT)
+    entry := record(block, head)
+    var code_cell: *mut i64 = cell(entry, 0)
+    var text_cell: *mut *mut u8 = cell(entry, 8)
+    var code: i64 = 0
+    unsafe {
+        code = ffi.read(ffi.to_const(code_cell))
+        *text = ffi.address(ffi.to_const(ffi.read(ffi.to_const(text_cell))))
+    }
+    write_u32(block, HEAD_SLOT, (head + 1) % QUEUE_CAPACITY)
+    write_u32(block, COUNT_SLOT, count - 1)
+    return i32(code)
+}
+fn drain(block *mut u8) {
+    var text: usize = 0
+    for dequeue(block, &mut text) != 0 {
+        unsafe { objc.free(ffi.from_address(text)) }
+    }
+}
+fn mark_closed(block *mut u8) {
+    set_flag(block, CLOSED, 1)
+    set_flag(block, OPENED, 0)
+    drain(block)
+}
+
+// ---- Objective-C callbacks (IMPs: self, _cmd, argument) ----
+fn block_key() *mut u8 { return objc.sel(&"tarnBlock") }
+fn submit_key() *mut u8 { return objc.sel(&"tarnSubmit") }
+fn block_of(target *mut u8) *mut u8 {
+    unsafe { return objc.send(objc.objc_getAssociatedObject(target, block_key()), &"pointerValue") }
+}
+fn tag_of(view *mut u8) i32 { return i32(objc.number(objc.send(view, &"tag"))) }
+
+fn on_act(target *mut u8, command *mut u8, sender *mut u8) {
+    enqueue(block_of(target), tag_of(sender), objc.nil())
+}
+fn on_text_changed(target *mut u8, command *mut u8, notification *mut u8) {
+    field := objc.send(notification, &"object")
+    enqueue(block_of(target), tag_of(field), objc.owned_text(objc.send(field, &"stringValue")))
+}
+fn on_submit(target *mut u8, command *mut u8, field *mut u8) {
+    var action: usize = 0
+    unsafe { action = objc.number(objc.send(objc.objc_getAssociatedObject(field, submit_key()), &"unsignedIntegerValue")) }
+    if action == 0 { return }
+    enqueue(block_of(target), 1000 + i32(action), objc.owned_text(objc.send(field, &"stringValue")))
+}
+fn on_should_close(target *mut u8, command *mut u8, window *mut u8) bool {
+    block := block_of(target)
+    if flag(block, BACKGROUND) != 0 {
+        // Background mode: the window hides; the session and its events stay.
+        objc.tell1(window, &"orderOut:", objc.nil())
+        set_flag(block, HIDDEN, 1)
+        return false
+    }
+    // Queue closure only; poll() hides the window and finish() closes it.
+    mark_closed(block)
+    return false
+}
+fn on_tick(target *mut u8, command *mut u8, timer *mut u8) {
+    block := block_of(target)
+    wake(block)
+    objc.post_wake_event(app_of(block))
+}
+fn on_descriptor(descriptor *mut u8, types usize, block *mut u8) {
+    wake(block)
+    unsafe { objc.CFFileDescriptorEnableCallBacks(descriptor, 1) }
+    objc.post_wake_event(app_of(block))
+}
+
+fn add_method(class *mut u8, name &string, imp *u8, types &string) {
+    encoding := ffi.CString.new(types).expect("literal with NUL")
+    unsafe { added := objc.class_addMethod(class, objc.sel(name), imp, encoding.as_ptr()) }
+}
+// The target/delegate class, registered once per process.
+fn target_class() *mut u8 {
+    existing := objc.class(&TARGET_CLASS)
+    if !objc.is_nil(existing) { return existing }
+    name := ffi.CString.new(&TARGET_CLASS).expect("literal with NUL")
+    unsafe {
+        class := objc.objc_allocateClassPair(objc.class(&"NSObject"), name.as_ptr(), 0)
+        if objc.is_nil(class) { return class }
+        add_method(class, &"act:", ffi.callback(on_act), &"v@:@")
+        add_method(class, &"submit:", ffi.callback(on_submit), &"v@:@")
+        add_method(class, &"tick:", ffi.callback(on_tick), &"v@:@")
+        add_method(class, &"controlTextDidChange:", ffi.callback(on_text_changed), &"v@:@")
+        add_method(class, &"windowShouldClose:", ffi.callback(on_should_close), &"c@:@")
+        objc.objc_registerClassPair(class)
+        return class
+    }
+}
+
+// ---- Helpers ----
+fn c(text &string) Result<ffi.CString, i32> { return ffi.CString.new(text).ok_or(1) }
+fn chars(text &string) i64 {
+    var count: i64 = 0
+    for byte in text.bytes() {
+        if byte < 128 || byte >= 192 { count = count + 1 }
+    }
+    return count
+}
+fn valid_action(action u32) bool { return action != 0 && action <= MAX_ACTION }
+fn reserved(key &string) bool {
+    return key.eq(&"main") || key.eq(&"heading") || key.eq(&"content") || key.eq(&"pages") || key.eq(&"scroll")
+}
+fn valid_key(key &string) bool {
+    if key.is_empty() || key.len() > 128 || reserved(key) { return false }
+    for byte in key.bytes() {
+        alphanumeric := (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        if !alphanumeric && byte != 45 && byte != 95 { return false }
+    }
+    return true
+}
+fn responds(object *mut u8, selector &string) bool {
+    return objc.truth(objc.send1(object, &"respondsToSelector:", objc.sel(selector)))
+}
+fn release(object *mut u8) {
+    if !objc.is_nil(object) { objc.tell(object, &"release") }
+}
+fn stack(vertical bool, spacing f64) *mut u8 {
+    view := objc.send1(objc.class(&"NSStackView"), &"stackViewWithViews:", objc.send(objc.class(&"NSArray"), &"array"))
+    if vertical {
+        objc.tell1(view, &"setOrientation:", objc.word(1))
+        // Children fill the column's width.
+        objc.tell1(view, &"setAlignment:", objc.word(objc.LAYOUT_WIDTH))
+    }
+    result := objc.send_f(view, &"setSpacing:", spacing, 0.0)
+    return view
+}
+fn append(parent *mut u8, child *mut u8) { objc.tell1(parent, &"addArrangedSubview:", child) }
+fn pin(view *mut u8, edge &string, other *mut u8, relation &string, constant f64) {
+    constraint := objc.send1_f(objc.send(view, edge), relation, objc.send(other, edge), constant)
+    objc.tell1(constraint, &"setActive:", objc.flag(true))
+}
+// Labels: 0 body, 1 heading, 2 prominent value.
+fn label(text *mut u8, style u32) *mut u8 {
+    view := objc.send1(objc.class(&"NSTextField"), &"wrappingLabelWithString:", text)
+    if style == 1 || style == 2 {
+        var size = 17.0
+        if style == 2 { size = 26.0 }
+        font := objc.send_f(objc.class(&"NSFont"), &"boldSystemFontOfSize:", size, 0.0)
+        objc.tell1(view, &"setFont:", font)
+        objc.tell1(view, &"setAccessibilityRole:", objc.nsstring(&"AXHeading"))
+    }
+    return view
+}
+fn button(title *mut u8, target *mut u8, tag i32) *mut u8 {
+    view := objc.send3(objc.class(&"NSButton"), &"buttonWithTitle:target:action:", title, target, objc.sel(&"act:"))
+    objc.tell1(view, &"setTag:", objc.word(usize(tag)))
+    return view
+}
+
+pub fn abi() u32 { return 14 }
+
+// Native handles for tests; AppKit owns the views.
+pub fn Native.native_window(&self) *mut u8 { return self.window }
+pub fn Native.counter_button(&self) *mut u8 { return self.button }
+pub fn Native.widget(&self, key &string) *mut u8 {
+    return match collections.get_copy(&self.parts, key) {
+        Some(part) => part.view
+        None => objc.nil()
+    }
+}
+// A window server session is reachable (false over plain SSH or in CI
+// runners without a login session).
+pub fn display_available() bool { return objc.main_thread() && objc.load_appkit() }
+
+fn app() *mut u8 { return objc.send(objc.class(&"NSApplication"), &"sharedApplication") }
+fn session_key() *mut u8 { return objc.sel(&"tarnSession") }
+fn session_active() bool {
+    unsafe { return !objc.is_nil(objc.objc_getAssociatedObject(app(), session_key())) }
+}
+
+// macOS names the app from its bundle; ids are validated like GTK's.
+pub fn set_app_id(id &string) i32 {
+    if !objc.main_thread() { return 2 }
+    if id.is_empty() || id.len() > 255 { return 1 }
+    for b in id.bytes() {
+        ok := (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 46 || b == 95 || b == 45
+        if !ok { return 1 }
+    }
+    if !objc.load_appkit() { return 4 }
+    if session_active() { return 3 }
+    return 0
+}
+
+pub fn create(title &string, heading &string) Result<Native, i32> {
+    if !objc.main_thread() { return Err(2) }
+    title_text := try c(title)
+    heading_text := try c(heading)
+    if !objc.load_appkit() { return Err(4) }
+    var pool: *mut u8 = objc.nil()
+    unsafe { pool = objc.objc_autoreleasePoolPush() }
+    application := app()
+    if objc.is_nil(application) { return Err(4) }
+    if session_active() { return Err(3) }
+    class := target_class()
+    if objc.is_nil(class) { return Err(5) }
+    var block: *mut u8 = objc.nil()
+    unsafe { block = objc.calloc(1, BLOCK_SIZE) }
+    if objc.is_nil(block) { return Err(5) }
+    var app_slot: *mut *mut u8 = cell(block, APP_SLOT)
+    unsafe { ffi.write(app_slot, application) }
+    // NSApplicationActivationPolicyRegular: a Dock icon and a menu bar.
+    objc.tell1(application, &"setActivationPolicy:", objc.nil())
+    objc.tell(application, &"finishLaunching")
+
+    target := objc.send(objc.send(class, &"alloc"), &"init")
+    pointer := objc.send1(objc.class(&"NSValue"), &"valueWithPointer:", block)
+    unsafe { objc.objc_setAssociatedObject(target, block_key(), pointer, objc.RETAIN) }
+
+    heading_view := label(objc.nsstring(heading), 2)
+    root := stack(true, 12.0)
+    append(root, heading_view)
+    content := objc.send(objc.send(objc.class(&"NSView"), &"alloc"), &"init")
+    objc.tell1(root, &"setTranslatesAutoresizingMaskIntoConstraints:", objc.flag(false))
+    objc.tell1(content, &"addSubview:", root)
+    pin(root, &"leadingAnchor", content, &"constraintEqualToAnchor:constant:", 24.0)
+    pin(content, &"trailingAnchor", root, &"constraintEqualToAnchor:constant:", 24.0)
+    pin(root, &"topAnchor", content, &"constraintEqualToAnchor:constant:", 24.0)
+    pin(content, &"bottomAnchor", root, &"constraintGreaterThanOrEqualToAnchor:constant:", 24.0)
+    controller := objc.send(objc.send(objc.class(&"NSViewController"), &"alloc"), &"init")
+    objc.tell1(controller, &"setView:", content)
+    window := objc.send1(objc.class(&"NSWindow"), &"windowWithContentViewController:", controller)
+    release(content)
+    release(controller)
+    if objc.is_nil(window) {
+        release(target)
+        unsafe { objc.free(block) }
+        return Err(5)
+    }
+    objc.tell(window, &"retain")
+    objc.tell1(window, &"setReleasedWhenClosed:", objc.flag(false))
+    objc.tell1(window, &"setTitle:", objc.nsstring(title))
+    result := objc.send_f(window, &"setContentSize:", 480.0, 240.0)
+    objc.tell1(window, &"setDelegate:", target)
+    objc.tell(window, &"center")
+    objc.tell1(window, &"makeKeyAndOrderFront:", objc.nil())
+    objc.tell1(application, &"activateIgnoringOtherApps:", objc.flag(true))
+    unsafe { objc.objc_setAssociatedObject(application, session_key(), window, objc.RETAIN) }
+    set_flag(block, OPENED, 1)
+    return Ok(Native {
+        window: window, block: block, target: target, pool: pool, root: root, heading: heading_view,
+        counter: objc.nil(), button: objc.nil(), pages: objc.nil(), page_views: Vec.new(),
+        parts: collections.Map.new(), pages_presented: false, text: objc.nil(), delivered_closed: false,
+        dispatched_token: 0, finished: false, watches: collections.Map.new(), next_watch: 0,
+    })
+}
+
+fn Native.check(&self) i32 {
+    if !objc.main_thread() { return 2 }
+    if self.finished { return 1 }
+    return 0
+}
+fn Native.closed(&self) bool { return self.finished || flag(self.block, CLOSED) != 0 }
+fn Native.writable(&self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    if flag(self.block, FULL) != 0 { return 8 }
+    return 0
+}
+
+pub fn Native.next(&mut self) i32 {
+    for true {
+        event := self.poll()
+        if event != 0 { return event }
+        self.iterate()
+    }
+    return -1
+}
+
+// The next pending event or status without blocking; 0 when none is pending.
+pub fn Native.poll(&mut self) i32 {
+    status := self.check()
+    if status != 0 { return 0 - status }
+    if self.closed() {
+        if self.delivered_closed { return -6 }
+        objc.tell1(self.window, &"orderOut:", objc.nil())
+        self.delivered_closed = true
+        return 2
+    }
+    if flag(self.block, FULL) != 0 { return -8 }
+    if flag(self.block, HIDDEN) != 0 {
+        set_flag(self.block, HIDDEN, 0)
+        return 4
+    }
+    if flag(self.block, WOKEN) != 0 {
+        set_flag(self.block, WOKEN, 0)
+        return 5
+    }
+    if flag(self.block, OPENED) != 0 {
+        set_flag(self.block, OPENED, 0)
+        return 1
+    }
+    var text: usize = 0
+    code := dequeue(self.block, &mut text)
+    if code != 0 {
+        unsafe { objc.free(self.text) }
+        self.text = ffi.from_address(text)
+        return code
+    }
+    return 0
+}
+
+// Dispatches one AppKit event, blocking until one arrives. Objects
+// autoreleased since the previous iteration are released here.
+pub fn Native.iterate(&mut self) {
+    application := app_of(self.block)
+    unsafe {
+        objc.objc_autoreleasePoolPop(self.pool)
+        self.pool = objc.objc_autoreleasePoolPush()
+    }
+    future := objc.send(objc.class(&"NSDate"), &"distantFuture")
+    event := objc.send4(application, &"nextEventMatchingMask:untilDate:inMode:dequeue:",
+        objc.word(18446744073709551615), future, objc.nsstring(&objc.DEFAULT_MODE), objc.flag(true))
+    if objc.is_nil(event) { return }
+    if objc.number(objc.send(event, &"type")) != objc.EVENT_APPLICATION_DEFINED {
+        objc.tell1(application, &"sendEvent:", event)
+    }
+    objc.tell(application, &"updateWindows")
+}
+
+pub fn Native.event_text(&self) Option<string> {
+    if self.check() != 0 || self.closed() { return None }
+    if objc.is_nil(self.text) { return Some("") }
+    unsafe { return ffi.string_from_c(ffi.to_const(self.text)) }
+}
+
+pub fn Native.request_close(&mut self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    // An explicit close ends the session even in background mode.
+    set_flag(self.block, BACKGROUND, 0)
+    mark_closed(self.block)
+    return 0
+}
+
+// Coalesced: any number of wakes before next() become one Wake event.
+pub fn wake(data *mut u8) { set_flag(data, WOKEN, 1) }
+pub fn Native.wake_data(&self) *mut u8 { return self.block }
+
+pub fn Native.set_background(&mut self, enabled bool) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    var value: i32 = 0
+    if enabled { value = 1 }
+    set_flag(self.block, BACKGROUND, value)
+    return 0
+}
+pub fn Native.present(&mut self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    set_flag(self.block, HIDDEN, 0)
+    objc.tell1(self.window, &"makeKeyAndOrderFront:", objc.nil())
+    objc.tell1(app_of(self.block), &"activateIgnoringOtherApps:", objc.flag(true))
+    return 0
+}
+pub fn Native.hide(&mut self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    objc.tell1(self.window, &"orderOut:", objc.nil())
+    return 0
+}
+pub fn Native.is_visible(&self) i32 {
+    status := self.check()
+    if status != 0 { return 0 - status }
+    if objc.truth(objc.send(self.window, &"isVisible")) { return 1 }
+    return 0
+}
+
+pub fn Native.enable_counter(&mut self, value i64) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    if !objc.is_nil(self.counter) || !objc.is_nil(self.pages) { return 1 }
+    self.counter = label(objc.nsstring(&""), 0)
+    append(self.root, self.counter)
+    self.button = button(objc.nsstring(&"Incrementar"), self.target, 3)
+    append(self.root, self.button)
+    return self.set_counter(value)
+}
+pub fn Native.set_counter(&mut self, value i64) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    if flag(self.block, FULL) != 0 { return 8 }
+    if objc.is_nil(self.counter) { return 1 }
+    objc.tell1(self.counter, &"setStringValue:", objc.nsstring(&value.to_string()))
+    return 0
+}
+pub fn Native.set_heading(&mut self, text &string) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    objc.tell1(self.heading, &"setStringValue:", objc.nsstring(text))
+    return 0
+}
+
+pub fn Native.release(self) i32 {
+    var native = self
+    return native.finish()
+}
+// Idempotent: later calls report 6.
+pub fn Native.finish(&mut self) i32 {
+    if !objc.main_thread() { return 2 }
+    if self.finished { return 6 }
+    self.finished = true
+    unsafe { objc.free(self.text) }
+    self.text = objc.nil()
+    mark_closed(self.block)
+    var id: u32 = 1
+    for id <= self.next_watch {
+        self.unwatch(id)
+        id = id + 1
+    }
+    objc.tell1(self.window, &"setDelegate:", objc.nil())
+    objc.tell1(self.window, &"orderOut:", objc.nil())
+    objc.tell(self.window, &"close")
+    unsafe { objc.objc_setAssociatedObject(app_of(self.block), session_key(), objc.nil(), objc.RETAIN) }
+    release(self.window)
+    release(self.target)
+    unsafe {
+        objc.free(self.block)
+        objc.objc_autoreleasePoolPop(self.pool)
+    }
+    return 0
+}
+
+// ---- Keyed pages and leaf components ----
+fn Native.admit(&self, key &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !valid_key(key) || !objc.is_nil(self.counter) || self.pages_presented { return 1 }
+    if self.parts.contains(key) || self.parts.len() >= MAX_PARTS { return 1 }
+    return 0
+}
+fn Native.parent(&self, key &string) Option<Part> {
+    part := match collections.get_copy(&self.parts, key) {
+        Some(found) => found
+        None => { return None }
+    }
+    if part.kind != PAGE && part.kind != BOX { return None }
+    return Some(part)
+}
+fn Native.lookup(&self, key &string) Result<Part, i32> {
+    status := self.writable()
+    if status != 0 { return Err(status) }
+    return collections.get_copy(&self.parts, key).ok_or(1)
+}
+fn Native.insert(&mut self, key &string, view *mut u8, kind u32, horizontal bool) {
+    previous := self.parts.insert(key.clone(), Part { view: view, kind: kind, horizontal: horizontal })
+}
+
+pub fn Native.add_page(&mut self, key &string) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if self.page_views.len() >= 32 { return 1 }
+    if objc.is_nil(self.pages) {
+        self.pages = stack(true, 0.0)
+        append(self.root, self.pages)
+        result := objc.send_f(self.window, &"setContentSize:", 480.0, 560.0)
+    }
+    page := stack(true, 12.0)
+    objc.tell1(page, &"setHidden:", objc.flag(true))
+    append(self.pages, page)
+    self.page_views.push(objc.number(page))
+    self.insert(key, page, PAGE, false)
+    return 0
+}
+
+pub fn Native.add_box(&mut self, parent &string, key &string, horizontal bool, spacing u32) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if spacing > 64 { return 1 }
+    host := match self.parent(parent) {
+        Some(found) => found
+        None => { return 1 }
+    }
+    view := stack(!horizontal, f64(spacing))
+    append(host.view, view)
+    self.insert(key, view, BOX, horizontal)
+    return 0
+}
+
+fn Native.add_leaf(&mut self, parent &string, key &string, text &string, action u32, style u32) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if style > 2 || (action != 0 && style != 0) { return 1 }
+    host := match self.parent(parent) {
+        Some(found) => found
+        None => { return 1 }
+    }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var view: *mut u8 = objc.nil()
+    var kind = LABEL
+    if action != 0 {
+        view = button(objc.nsstring(text), self.target, 1000 + i32(action))
+        kind = BUTTON
+    } else {
+        view = label(objc.nsstring(text), style)
+    }
+    append(host.view, view)
+    self.insert(key, view, kind, false)
+    return 0
+}
+pub fn Native.add_label(&mut self, page &string, key &string, text &string) i32 { return self.add_leaf(page, key, text, 0, 0) }
+pub fn Native.add_text(&mut self, parent &string, key &string, text &string, style u32) i32 { return self.add_leaf(parent, key, text, 0, style) }
+pub fn Native.add_button(&mut self, page &string, key &string, text &string, action u32) i32 {
+    if !objc.main_thread() { return 2 }
+    if !valid_action(action) { return 1 }
+    return self.add_leaf(page, key, text, action, 0)
+}
+
+pub fn Native.add_entry(&mut self, parent &string, key &string, text &string, action u32) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if !valid_action(action) { return 1 }
+    host := match self.parent(parent) {
+        Some(found) => found
+        None => { return 1 }
+    }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if chars(text) > MAX_INPUT { return 1 }
+    field := objc.send1(objc.class(&"NSTextField"), &"textFieldWithString:", objc.nsstring(text))
+    objc.tell1(field, &"setTag:", objc.word(usize(1000 + action)))
+    objc.tell1(field, &"setDelegate:", self.target)
+    append(host.view, field)
+    self.insert(key, field, ENTRY, false)
+    return 0
+}
+
+pub fn Native.set_text(&mut self, key &string, text &string) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if part.kind == LABEL {
+        if !objc.text_of(objc.send(part.view, &"stringValue")).eq(text) { objc.tell1(part.view, &"setStringValue:", objc.nsstring(text)) }
+        return 0
+    }
+    if part.kind == BUTTON {
+        if !objc.text_of(objc.send(part.view, &"title")).eq(text) { objc.tell1(part.view, &"setTitle:", objc.nsstring(text)) }
+        return 0
+    }
+    return 1
+}
+
+// The primary button answers Return and takes the accent colour.
+pub fn Native.set_primary(&mut self, key &string, primary bool) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != BUTTON { return 1 }
+    if primary { objc.tell1(part.view, &"setKeyEquivalent:", objc.nsstring(&"\r")) } else { objc.tell1(part.view, &"setKeyEquivalent:", objc.nsstring(&"")) }
+    return 0
+}
+
+pub fn Native.set_enabled(&mut self, key &string, enabled bool) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if !responds(part.view, &"setEnabled:") { return 1 }
+    objc.tell1(part.view, &"setEnabled:", objc.flag(enabled))
+    return 0
+}
+
+pub fn Native.set_accessible(&mut self, key &string, label_text &string, description &string) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if label_text.is_empty() { return 1 }
+    first := match c(label_text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    second := match c(description) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    objc.tell1(part.view, &"setAccessibilityLabel:", objc.nsstring(label_text))
+    objc.tell1(part.view, &"setAccessibilityHelp:", objc.nsstring(description))
+    return 0
+}
+
+pub fn Native.focus(&mut self, key &string) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if objc.is_nil(self.pages) { return 1 }
+    if objc.truth(objc.send(part.view, &"isHiddenOrHasHiddenAncestor")) { return 1 }
+    if objc.truth(objc.send1(self.window, &"makeFirstResponder:", part.view)) { return 0 }
+    return 1
+}
+
+pub fn Native.show_page(&mut self, key &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if objc.is_nil(self.pages) { return 1 }
+    part := match collections.get_copy(&self.parts, key) {
+        Some(found) => found
+        None => { return 1 }
+    }
+    if part.kind != PAGE { return 1 }
+    for address in &self.page_views {
+        objc.tell1(ffi.from_address(address), &"setHidden:", objc.flag(address != objc.number(part.view)))
+    }
+    objc.tell(self.window, &"recalculateKeyViewLoop")
+    self.pages_presented = true
+    return 0
+}
+
+// Model write without a changed event; entries hold at most 256 characters.
+pub fn Native.set_input(&mut self, key &string, text &string) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != ENTRY { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if chars(text) > MAX_INPUT { return 1 }
+    if objc.text_of(objc.send(part.view, &"stringValue")).eq(text) { return 0 }
+    // Programmatic writes do not send controlTextDidChange:.
+    objc.tell1(part.view, &"setStringValue:", objc.nsstring(text))
+    return 0
+}
+
+pub fn Native.complete_event(&mut self, status i32) i32 {
+    self.dispatched_token = 0
+    return self.check()
+}
+pub fn Native.is_closed(&self) bool { return self.closed() }
+pub fn Native.dispatched_token(&self) u64 { return self.dispatched_token }
+pub fn Native.pages_presented(&self) bool { return self.pages_presented }
+
+// ---- Text field and label options ----
+pub fn Native.set_submit(&mut self, key &string, action u32) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != ENTRY || !valid_action(action) { return 1 }
+    number := objc.send1(objc.class(&"NSNumber"), &"numberWithUnsignedInteger:", objc.word(usize(action)))
+    unsafe { objc.objc_setAssociatedObject(part.view, submit_key(), number, objc.RETAIN) }
+    objc.tell1(part.view, &"setTarget:", self.target)
+    objc.tell1(part.view, &"setAction:", objc.sel(&"submit:"))
+    return 0
+}
+pub fn Native.set_placeholder(&mut self, key &string, text &string) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != ENTRY { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    objc.tell1(part.view, &"setPlaceholderString:", objc.nsstring(text))
+    return 0
+}
+// CSS classes have no AppKit counterpart: validated and accepted, no effect.
+pub fn Native.set_class(&mut self, key &string, class &string, on bool) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if class.is_empty() || class.len() > 64 { return 1 }
+    for b in class.bytes() {
+        if !((b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45) { return 1 }
+    }
+    return 0
+}
+pub fn Native.set_selectable(&mut self, key &string, on bool) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != LABEL { return 1 }
+    objc.tell1(part.view, &"setSelectable:", objc.flag(on))
+    return 0
+}
+// Pages do not scroll yet on AppKit: accepted, no effect.
+pub fn Native.set_follow_end(&mut self, on bool) i32 { return self.writable() }
+pub fn Native.scroll_to_end(&mut self) i32 { return self.writable() }
+pub fn Native.set_escape_action(&mut self, action u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    return 11
+}
+pub fn Native.set_align_start(&mut self, key &string) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != LABEL { return 1 }
+    // NSTextAlignmentLeft
+    objc.tell1(part.view, &"setAlignment:", objc.nil())
+    return 0
+}
+
+// ---- Not yet on AppKit (status 11) ----
+fn Native.unsupported(&self) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    return 11
+}
+pub fn Native.list_begin(&mut self, parent &string, count u32) i32 { return self.unsupported() }
+pub fn Native.list_item(&mut self, key &string, text &string, action u32) i32 { return self.unsupported() }
+pub fn Native.list_end(&mut self) i32 { return self.unsupported() }
+pub fn Native.tree_begin(&mut self, key &string, count u32) i32 { return self.unsupported() }
+pub fn Native.tree_node(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, spacing u32) i32 { return self.unsupported() }
+pub fn Native.tree_end(&mut self) i32 { return self.unsupported() }
+pub fn Native.add_control(&mut self, parent &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 { return self.unsupported() }
+pub fn Native.add_container(&mut self, parent &string, key &string, kind u32, title &string, action u32, value i64) i32 { return self.unsupported() }
+pub fn Native.add_text_area(&mut self, parent &string, key &string, text &string, action u32, lines u32) i32 { return self.unsupported() }
+pub fn Native.set_header(&mut self, subtitle &string) i32 { return self.unsupported() }
+pub fn Native.add_header_button(&mut self, key &string, text &string, icon &string, action u32, end bool) i32 { return self.unsupported() }
+pub fn Native.add_menu_item(&mut self, key &string, text &string, action u32) i32 { return self.unsupported() }
+pub fn Native.tree_control(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 { return self.unsupported() }
+pub fn Native.tree_container(&mut self, parent_key &string, key &string, kind u32, title &string, action u32, value i64) i32 { return self.unsupported() }
+pub fn Native.tree_text_area(&mut self, parent_key &string, key &string, text &string, action u32, lines u32) i32 { return self.unsupported() }
+
+// ---- Run loop sources (the session's watch_fd / watch_interval) ----
+const WATCH_TIMER u32 = 1
+const WATCH_DESCRIPTOR u32 = 2
+
+// 0 when the source could not be created.
+pub fn Native.watch_interval(&mut self, milliseconds u32) u32 {
+    if self.check() != 0 { return 0 }
+    var timer: *mut u8 = objc.nil()
+    unsafe { timer = objc.objc_msgSend(objc.class(&"NSTimer"), objc.sel(&"timerWithTimeInterval:target:selector:userInfo:repeats:"),
+        self.target, objc.sel(&"tick:"), objc.nil(), objc.flag(true), f64(milliseconds) / 1000.0, 0.0, 0.0, objc.nil(), objc.nil(), objc.nil()) }
+    if objc.is_nil(timer) { return 0 }
+    loop := objc.send(objc.class(&"NSRunLoop"), &"mainRunLoop")
+    objc.tell2(loop, &"addTimer:forMode:", timer, objc.common_modes())
+    objc.tell(timer, &"retain")
+    return self.remember(WATCH_TIMER, objc.number(timer))
+}
+
+// CFFileDescriptorContext: version, info, retain, release, copyDescription.
+pub fn Native.watch_fd(&mut self, fd i32) u32 {
+    if self.check() != 0 || fd < 0 { return 0 }
+    unsafe {
+        context := objc.calloc(1, 40)
+        if objc.is_nil(context) { return 0 }
+        var info: *mut *mut u8 = cell(context, 8)
+        ffi.write(info, self.block)
+        descriptor := objc.CFFileDescriptorCreate(objc.nil(), fd, false, ffi.callback(on_descriptor), context)
+        // CF copies the context; ours is no longer needed.
+        objc.free(context)
+        if objc.is_nil(descriptor) { return 0 }
+        // kCFFileDescriptorReadCallBack
+        objc.CFFileDescriptorEnableCallBacks(descriptor, 1)
+        source := objc.CFFileDescriptorCreateRunLoopSource(objc.nil(), descriptor, 0)
+        if objc.is_nil(source) {
+            objc.CFRelease(descriptor)
+            return 0
+        }
+        objc.CFRunLoopAddSource(objc.CFRunLoopGetMain(), source, objc.common_modes())
+        objc.CFRelease(source)
+        return self.remember(WATCH_DESCRIPTOR, objc.number(descriptor))
+    }
+}
+
+fn Native.remember(&mut self, kind u32, source usize) u32 {
+    self.next_watch = self.next_watch + 1
+    previous := self.watches.insert(self.next_watch, Watch { kind: kind, source: source })
+    return self.next_watch
+}
+
+pub fn Native.unwatch(&mut self, id u32) {
+    watch := match self.watches.remove(&id) {
+        Some(found) => found
+        None => { return }
+    }
+    var pointer: *mut u8 = ffi.from_address(watch.source)
+    if watch.kind == WATCH_TIMER {
+        objc.tell(pointer, &"invalidate")
+        release(pointer)
+    } else {
+        unsafe {
+            objc.CFFileDescriptorInvalidate(pointer)
+            objc.CFRelease(pointer)
+        }
+    }
+}

@@ -1,9 +1,10 @@
-// Tarn UI session on the GTK backend (backends/linux/gtk/native.tarn). Build
-// scripts copy the backend beside it as gtk/*.tarn (scripts/backend.sh).
+// Tarn UI session over a platform backend: build scripts copy
+// backends/linux/backend (GTK) or backends/macos/backend (AppKit) beside it
+// as backend/*.tarn. Both expose the same native.Native contract (ABI 14).
 import "ffi"
 import "string"
-import "gtk/native"
-import "gtk/devtools"
+import "backend/native"
+import "backend/devtools"
 
 /// A failed UI operation. `code` is the backend status (gtk/native.tarn); `context`
 /// names the operation and key, e.g. `add_label "details-text"`.
@@ -21,9 +22,10 @@ pub fn Error.reason(&self) string {
     if self.code == 4 { return "no display available" }
     if self.code == 5 { return "native allocation or creation failed" }
     if self.code == 6 { return "the window is closed" }
-    if self.code == 7 { return "the GTK backend has a different ABI version; rebuild the backend and the app together" }
+    if self.code == 7 { return "the UI backend has a different ABI version; rebuild the backend and the app together" }
     if self.code == 8 { return "the event queue is full" }
     if self.code == 10 { return "limit reached" }
+    if self.code == 11 { return "not supported by this platform backend yet" }
     return "application error " + string.from_i64(i64(self.code))
 }
 
@@ -48,8 +50,6 @@ pub struct Session { native native.Native
     dev devtools.Devtools
     watches Vec<u32> }
 
-extern "C" fn g_unix_fd_add_full(priority i32, fd i32, condition u32, function *u8, data *mut u8, notify *mut u8) u32
-extern "C" fn g_source_remove(id u32) i32
 
 /// Enter in text field `key` reports Action.Activate(action) with its text.
 pub fn Session.set_submit(&mut self, key string, action u32) Result<void, Error> { return checked_at(self.native.set_submit(&key, action), &"set_submit", &key) }
@@ -233,22 +233,13 @@ pub fn Session.is_visible(&self) Result<bool, Error> {
     return Ok(status == 1)
 }
 
-// GLib calls this on the main thread while next_action iterates the loop. It
-// only sets the session's coalesced wake flag; the app reads the descriptor.
-fn descriptor_ready(fd i32, condition u32, data *mut u8) i32 {
-    native.wake(data)
-    return 1
-}
-
 /// Queues Action.Wake whenever `fd` is readable, has hung up or failed. The
 /// app then reads it without blocking (for D-Bus: Connection.dispatch). The
 /// watch ends with unwatch_fd or when run returns; `fd` must stay open until
 /// then.
 pub fn Session.watch_fd(&mut self, fd i32) Result<u32, Error> {
     if fd < 0 { return Err(fail(1, "watch_fd: negative descriptor")) }
-    // G_IO_IN | G_IO_ERR | G_IO_HUP
-    var id: u32 = 0
-    unsafe { id = g_unix_fd_add_full(0, fd, u32(1 | 8 | 16), ffi.callback(descriptor_ready), self.native.wake_data(), ffi.null()) }
+    id := self.native.watch_fd(fd)
     if id == 0 { return Err(fail(5, "watch_fd")) }
     self.watches.push(id)
     return Ok(id)
@@ -259,7 +250,7 @@ pub fn Session.unwatch_fd(&mut self, id u32) Result<void, Error> {
     for index < self.watches.len() {
         if self.watches.get(index) == id {
             self.watches.swap_remove(index)
-            unsafe { removed := g_source_remove(id) }
+            self.native.unwatch(id)
             return Ok(())
         }
         index = index + 1
@@ -269,7 +260,7 @@ pub fn Session.unwatch_fd(&mut self, id u32) Result<void, Error> {
 
 fn Session.unwatch_all(&mut self) {
     for id in &self.watches {
-        unsafe { removed := g_source_remove(id) }
+        self.native.unwatch(id)
     }
     self.watches = Vec.new()
 }
@@ -303,15 +294,9 @@ pub fn Session.tree_text_area(&mut self, parent string, key string, text string,
 }
 
 // Despierta periódicamente sin bloquear el bucle; usa unwatch_fd para retirarlo.
-extern "C" fn g_timeout_add_full(priority i32, interval u32, callback *u8, data *mut u8, destroy *mut u8) u32
-fn interval_ready(data *mut u8) i32 {
-    native.wake(data)
-    return 1
-}
 pub fn Session.watch_interval(&mut self, milliseconds u32) Result<u32, Error> {
     if milliseconds < 20 || milliseconds > 60000 { return Err(fail(1, "watch_interval")) }
-    var id: u32 = 0
-    unsafe { id = g_timeout_add_full(0, milliseconds, ffi.callback(interval_ready), self.native.wake_data(), ffi.null()) }
+    id := self.native.watch_interval(milliseconds)
     if id == 0 { return Err(fail(5, "watch_interval")) }
     self.watches.push(id)
     return Ok(id)

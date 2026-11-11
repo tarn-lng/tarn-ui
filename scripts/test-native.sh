@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the Tarn GTK backend's tests (backends/linux/gtk/*_test.tarn): the
+# Runs the Tarn GTK backend's tests (backends/linux/backend/*_test.tarn): the
 # devtools protocol unit tests and the native smokes, one process each. GTK
 # tests skip without a display. Links come from backends/linux/tarn.toml.
 set -euo pipefail

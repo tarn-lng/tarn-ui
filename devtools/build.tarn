@@ -99,16 +99,16 @@ pub fn run(config &Config) Result<json.Value, wire.Error> {
     if output.is_empty() { return Err(wire.fail("BUILD_FAILED", "build", "build directory collision budget exceeded")) }
     try mkdir(&path.join(&output, "source"))
     try mkdir(&path.join(&output, "source/core"))
-    try mkdir(&path.join(&output, "source/gtk"))
+    try mkdir(&path.join(&output, "source/backend"))
     try snapshot(&config.root, &output, "core/session.tarn", "source/core/session.tarn")
     try snapshot(&config.root, &output, "core/reactive.tarn", "source/core/reactive.tarn")
     try snapshot(&config.root, &output, "examples/counter/main.tarn", "source/main.tarn")
     try snapshot(&config.root, &output, "examples/counter/counter.tarn", "source/counter.tarn")
     // The Tarn GTK backend, with the devtools channel (development builds).
-    try snapshot(&config.root, &output, "backends/linux/gtk/gtk.tarn", "source/gtk/gtk.tarn")
-    try snapshot(&config.root, &output, "backends/linux/gtk/native.tarn", "source/gtk/native.tarn")
-    try snapshot(&config.root, &output, "backends/linux/gtk/protocol.tarn", "source/gtk/protocol.tarn")
-    try snapshot(&config.root, &output, "backends/linux/gtk/devtools.tarn", "source/gtk/devtools.tarn")
+    try snapshot(&config.root, &output, "backends/linux/backend/gtk.tarn", "source/backend/gtk.tarn")
+    try snapshot(&config.root, &output, "backends/linux/backend/native.tarn", "source/backend/native.tarn")
+    try snapshot(&config.root, &output, "backends/linux/backend/protocol.tarn", "source/backend/protocol.tarn")
+    try snapshot(&config.root, &output, "backends/linux/backend/devtools.tarn", "source/backend/devtools.tarn")
     binary := path.join(&output, "counter")
     var compile = process.Command.new(config.compiler.clone()).arg("build").arg(path.join(&output, "source/main.tarn"))
     // Same libraries as backends/linux/tarn.toml [native] links.

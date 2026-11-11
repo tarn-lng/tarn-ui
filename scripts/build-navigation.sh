@@ -23,7 +23,7 @@ if rg -q '"severity":"warning"' "$build/compiler.jsonl"; then cat "$build/compil
     "$compiler" version
     pkg-config --modversion "${packages[@]}"
     sha256sum "$compiler" "$root/core/session.tarn" "$root/core/components.tarn" "$root/core/navigation.tarn" "$root/core/forms.tarn" \
-        "$root/examples/navigation/main.tarn" "$root/examples/navigation/tasks.tarn" "$build"/source/gtk/*.tarn
+        "$root/examples/navigation/main.tarn" "$root/examples/navigation/tasks.tarn" "$build"/source/backend/*.tarn
     printf 'ABI=14\nLD_LIBRARY_PATH=%s\n' "$build"
 } > "$build/provenance.txt"
 printf 'Built %s/navigation\n' "$build"

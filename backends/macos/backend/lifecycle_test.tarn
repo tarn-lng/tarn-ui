@@ -1,0 +1,112 @@
+// Smoke for the AppKit backend: lifecycle, events, counter, background,
+// keyed components and run loop sources. Clicks use performClick:, which
+// runs the real target/action path without Accessibility permission.
+import "testing"
+import "backend/native"
+import "backend/objc"
+import "ffi"
+
+extern "C" fn pipe(fds *mut i32) i32
+extern "C" fn write(fd i32, data *u8, count usize) isize
+extern "C" fn close(fd i32) i32
+
+fn open(title string) native.Native {
+    match native.create(&title, &"Hola desde Tarn") {
+        Ok(value) => { return value }
+        Err(code) => { panic("create failed: " + code.to_string()) }
+    }
+}
+fn click(view *mut u8) { objc.tell1(view, &"performClick:", objc.nil()) }
+
+fn test_lifecycle(t &mut testing.T) {
+    if !native.display_available() {
+        t.skip(&"no window server")
+        return
+    }
+    var ui = open("Tarn backend")
+    t.require(native.create(&"Second", &"Second").is_err(), &"second session must be refused")
+    t.require(ui.next() == 1, &"opened")
+    t.require(ui.enable_counter(41) == 0, &"enable_counter")
+    t.require(ui.enable_counter(0) == 1, &"counter enabled twice")
+    click(ui.counter_button())
+    t.require(ui.next() == 3, &"increment")
+    t.require(ui.set_counter(42) == 0, &"set_counter")
+    native.wake(ui.wake_data())
+    native.wake(ui.wake_data())
+    t.require(ui.next() == 5, &"wake")
+    t.require(ui.set_background(true) == 0, &"background")
+    objc.tell1(ui.native_window(), &"performClose:", objc.nil())
+    t.require(ui.next() == 4, &"hidden")
+    t.require(ui.is_visible() == 0, &"hidden window")
+    t.require(ui.present() == 0, &"present")
+    t.require(ui.is_visible() == 1, &"presented window")
+    t.require(ui.request_close() == 0, &"request_close")
+    t.require(ui.next() == 2, &"closed")
+    t.require(ui.next() == -6, &"closed twice")
+    t.require(ui.set_counter(1) == 6, &"closed session refuses writes")
+    t.require(ui.release() == 0, &"release")
+    var again = open("Again")
+    t.require(again.next() == 1, &"opened again")
+    t.require(again.set_heading(&"Cambiado") == 0, &"set_heading")
+    t.require(again.release() == 0, &"release again")
+}
+
+fn test_components(t &mut testing.T) {
+    if !native.display_available() {
+        t.skip(&"no window server")
+        return
+    }
+    var ui = open("Components")
+    t.require(ui.next() == 1, &"opened")
+    t.require(ui.add_page(&"home") == 0, &"add_page")
+    t.require(ui.add_page(&"home") == 1, &"duplicate key")
+    t.require(ui.add_box(&"home", &"row", true, 8) == 0, &"add_box")
+    t.require(ui.add_text(&"home", &"title", &"Título", 1) == 0, &"add_text")
+    t.require(ui.add_label(&"row", &"status", &"listo") == 0, &"add_label")
+    t.require(ui.add_button(&"row", &"save", &"Guardar", 7) == 0, &"add_button")
+    t.require(ui.add_button(&"row", &"bad", &"X", 0) == 1, &"action 0 refused")
+    t.require(ui.add_entry(&"home", &"name", &"Ana", 9) == 0, &"add_entry")
+    t.require(ui.set_submit(&"name", 10) == 0, &"set_submit")
+    t.require(ui.set_placeholder(&"name", &"Nombre") == 0, &"set_placeholder")
+    t.require(ui.set_primary(&"save", true) == 0, &"set_primary")
+    t.require(ui.set_primary(&"status", true) == 1, &"primary needs a button")
+    t.require(ui.set_accessible(&"save", &"Guardar", &"Guarda el formulario") == 0, &"set_accessible")
+    t.require(ui.add_control(&"home", &"s", 0, &"x", 3, 0, 0, 1) == 11, &"controls not yet supported")
+    t.require(ui.show_page(&"home") == 0, &"show_page")
+    t.require(ui.add_label(&"home", &"late", &"x") == 1, &"no keys after presentation")
+    t.require(ui.focus(&"name") == 0, &"focus")
+
+    click(ui.widget(&"save"))
+    t.require(ui.next() == 1007, &"button action")
+    t.require(ui.complete_event(0) == 0, &"complete_event")
+    t.require(ui.set_text(&"status", &"guardado") == 0, &"set_text")
+    t.require(objc.text_of(objc.send(ui.widget(&"status"), &"stringValue")).eq(&"guardado"), &"label text")
+    t.require(ui.set_enabled(&"save", false) == 0, &"set_enabled")
+    t.require(ui.set_input(&"name", &"Bea") == 0, &"set_input")
+    // Return in the field sends its action: submit with the field's text.
+    field := ui.widget(&"name")
+    sent := objc.send2(field, &"sendAction:to:", objc.send(field, &"action"), objc.send(field, &"target"))
+    t.require(ui.next() == 1010, &"submit action")
+    t.require(ui.event_text().unwrap_or("?").eq(&"Bea"), &"submit text")
+
+    // Timers and descriptors wake a blocked next().
+    id := ui.watch_interval(20)
+    t.require(id != 0, &"watch_interval")
+    t.require(ui.next() == 5, &"timer wake")
+    ui.unwatch(id)
+    var fds: Vec<i32> = Vec.new()
+    fds.push(-1)
+    fds.push(-1)
+    unsafe { t.require(pipe(ffi.vec_mut(&mut fds)) == 0, &"pipe") }
+    reader := ui.watch_fd(fds.at(0))
+    t.require(reader != 0, &"watch_fd")
+    byte := ffi.CString.new(&"x").expect("literal")
+    unsafe { written := write(fds.at(1), byte.as_ptr(), 1) }
+    t.require(ui.next() == 5, &"descriptor wake")
+    ui.unwatch(reader)
+    unsafe {
+        a := close(fds.at(0))
+        b := close(fds.at(1))
+    }
+    t.require(ui.release() == 0, &"release")
+}

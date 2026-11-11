@@ -1,9 +1,9 @@
 // G2 smoke for the Tarn GTK backend: pages, components, entries, focus,
 // accessibility, and that release finalizes every widget it created.
 import "ffi"
-import "gtk/gtk"
+import "backend/gtk"
 import "testing"
-import "gtk/native"
+import "backend/native"
 
 extern "C" fn gtk_widget_activate(widget *mut gtk.Widget) i32
 extern "C" fn gtk_editable_set_text(editable *mut gtk.Widget, text *u8) void

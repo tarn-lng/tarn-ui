@@ -1,9 +1,9 @@
 // G4 smoke for the Tarn GTK backend: controls, indicators, containers,
 // multiline text, header bar and menu, statically and inside a tree region.
 import "ffi"
-import "gtk/gtk"
+import "backend/gtk"
 import "testing"
-import "gtk/native"
+import "backend/native"
 
 extern "C" fn gtk_widget_activate(widget *mut gtk.Widget) i32
 extern "C" fn gtk_widget_activate_action_variant(widget *mut gtk.Widget, name *u8, parameter *u8) i32

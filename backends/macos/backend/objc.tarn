@@ -1,0 +1,148 @@
+// Objective-C runtime, AppKit and CoreFoundation declarations used by the
+// AppKit backend. No UI logic. Link with: --link objc (AppKit is dlopen'ed).
+//
+// One non-variadic objc_msgSend declaration serves every message the backend
+// sends: integer/pointer arguments take the integer registers in order
+// (a..d, then e..g), doubles take the float registers (x, y, z). A callee
+// ignores trailing arguments it does not declare. This holds on x86_64
+// System V and arm64 AAPCS64 because objc_msgSend is not variadic. Structs
+// larger than 16 bytes (NSRect, NSEdgeInsets) are never passed by value:
+// layout uses Auto Layout anchors and sizes (NSSize fits x, y).
+import "ffi"
+
+pub extern "C" fn dlopen(path *u8, mode i32) *mut u8
+pub extern "C" fn dlsym(handle *mut u8, name *u8) *mut u8
+pub extern "C" fn pthread_main_np() i32
+pub extern "C" fn calloc(count usize, size usize) *mut u8
+pub extern "C" fn free(pointer *mut u8)
+pub extern "C" fn strdup(text *u8) *mut u8
+pub extern "C" fn objc_getClass(name *u8) *mut u8
+pub extern "C" fn sel_registerName(name *u8) *mut u8
+pub extern "C" fn objc_allocateClassPair(superclass *mut u8, name *u8, extra usize) *mut u8
+pub extern "C" fn objc_registerClassPair(cls *mut u8)
+pub extern "C" fn class_addMethod(cls *mut u8, selector *mut u8, imp *u8, types *u8) bool
+pub extern "C" fn objc_setAssociatedObject(object *mut u8, key *mut u8, value *mut u8, policy usize)
+pub extern "C" fn objc_getAssociatedObject(object *mut u8, key *mut u8) *mut u8
+pub extern "C" fn objc_autoreleasePoolPush() *mut u8
+pub extern "C" fn objc_autoreleasePoolPop(pool *mut u8)
+pub extern "C" fn objc_msgSend(object *mut u8, selector *mut u8, a *mut u8, b *mut u8, c *mut u8, d *mut u8,
+    x f64, y f64, z f64, e *mut u8, f *mut u8, g *mut u8) *mut u8
+pub extern "C" fn CFRunLoopGetMain() *mut u8
+pub extern "C" fn CFRunLoopAddSource(loop *mut u8, source *mut u8, mode *mut u8)
+pub extern "C" fn CFFileDescriptorCreate(allocator *mut u8, fd i32, close_on_invalidate bool, callout *u8, context *mut u8) *mut u8
+pub extern "C" fn CFFileDescriptorEnableCallBacks(descriptor *mut u8, types usize)
+pub extern "C" fn CFFileDescriptorCreateRunLoopSource(allocator *mut u8, descriptor *mut u8, order isize) *mut u8
+pub extern "C" fn CFFileDescriptorInvalidate(descriptor *mut u8)
+pub extern "C" fn CFRelease(object *mut u8)
+
+// OBJC_ASSOCIATION_RETAIN_NONATOMIC
+pub const RETAIN usize = 1
+pub const EVENT_APPLICATION_DEFINED usize = 15
+pub const LAYOUT_WIDTH usize = 7
+pub const LAYOUT_LEADING usize = 5
+// NSDefaultRunLoopMode's value. Common modes must be the exported constant
+// itself: CFRunLoopAddSource matches it by identity (see common_modes).
+pub const DEFAULT_MODE string = "kCFRunLoopDefaultMode"
+
+pub fn nil() *mut u8 { return ffi.null() }
+pub fn word(value usize) *mut u8 { return ffi.from_address(value) }
+pub fn flag(value bool) *mut u8 {
+    if value { return word(1) }
+    return nil()
+}
+pub fn number(object *mut u8) usize { return ffi.address(ffi.to_const(object)) }
+// A BOOL result lives in the low byte of the return register.
+pub fn truth(object *mut u8) bool { return number(object) % 256 != 0 }
+pub fn is_nil(object *mut u8) bool { return ffi.is_null(ffi.to_const(object)) }
+
+fn literal(text &string) ffi.CString { return ffi.CString.new(text).expect("literal with NUL") }
+
+pub fn load_appkit() bool {
+    path := literal(&"/System/Library/Frameworks/AppKit.framework/AppKit")
+    // RTLD_LAZY | RTLD_GLOBAL
+    unsafe { return !is_nil(dlopen(path.as_ptr(), 1 | 8)) }
+}
+pub fn main_thread() bool {
+    unsafe { return pthread_main_np() == 1 }
+}
+pub fn class(name &string) *mut u8 {
+    text := literal(name)
+    unsafe { return objc_getClass(text.as_ptr()) }
+}
+pub fn sel(name &string) *mut u8 {
+    text := literal(name)
+    unsafe { return sel_registerName(text.as_ptr()) }
+}
+
+pub fn send(object *mut u8, selector &string) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), nil(), nil(), nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+}
+pub fn send1(object *mut u8, selector &string, a *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+}
+pub fn send2(object *mut u8, selector &string, a *mut u8, b *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, b, nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+}
+pub fn send3(object *mut u8, selector &string, a *mut u8, b *mut u8, c *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, b, c, nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+}
+pub fn send4(object *mut u8, selector &string, a *mut u8, b *mut u8, c *mut u8, d *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, b, c, d, 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+}
+// Messages whose only arguments are doubles (sizes, font sizes).
+pub fn send_f(object *mut u8, selector &string, x f64, y f64) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), nil(), nil(), nil(), nil(), x, y, 0.0, nil(), nil(), nil()) }
+}
+// One object then one double: constraintEqualToAnchor:constant:.
+pub fn send1_f(object *mut u8, selector &string, a *mut u8, x f64) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), x, 0.0, 0.0, nil(), nil(), nil()) }
+}
+// Statement forms for messages whose result the caller does not need.
+pub fn tell(object *mut u8, selector &string) { result := send(object, selector) }
+pub fn tell1(object *mut u8, selector &string, a *mut u8) { result := send1(object, selector, a) }
+pub fn tell2(object *mut u8, selector &string, a *mut u8, b *mut u8) { result := send2(object, selector, a, b) }
+
+// An empty NSApplicationDefined event: makes a blocked nextEvent return.
+pub fn post_wake_event(app *mut u8) {
+    unsafe {
+        event := objc_msgSend(class(&"NSEvent"), sel(&"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
+            word(EVENT_APPLICATION_DEFINED), nil(), nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil())
+        if !is_nil(event) { tell2(app, &"postEvent:atStart:", event, nil()) }
+    }
+}
+
+// Autoreleased NSString copy of `text`; nil when it contains NUL.
+pub fn nsstring(text &string) *mut u8 {
+    utf8 := match ffi.CString.new(text) {
+        Some(value) => value
+        None => { return nil() }
+    }
+    unsafe { return send1(class(&"NSString"), &"stringWithUTF8String:", word(ffi.address(utf8.as_ptr()))) }
+}
+// UTF-8 contents of an NSString ("" for nil).
+pub fn text_of(object *mut u8) string {
+    if is_nil(object) { return "" }
+    utf8 := send(object, &"UTF8String")
+    if is_nil(utf8) { return "" }
+    unsafe { return ffi.string_from_c(ffi.to_const(utf8)).unwrap_or("") }
+}
+// malloc'ed C copy of an NSString, for the event queue.
+pub fn owned_text(object *mut u8) *mut u8 {
+    if is_nil(object) { return nil() }
+    utf8 := send(object, &"UTF8String")
+    if is_nil(utf8) { return nil() }
+    unsafe { return strdup(ffi.to_const(utf8)) }
+}
+
+// kCFRunLoopCommonModes: sources in it also run during window resizing,
+// menu tracking and modal panels.
+pub fn common_modes() *mut u8 {
+    name := literal(&"kCFRunLoopCommonModes")
+    unsafe {
+        // RTLD_DEFAULT
+        slot := dlsym(word(18446744073709551614), name.as_ptr())
+        if is_nil(slot) { return nsstring(&DEFAULT_MODE) }
+        var cell: *mut *mut u8 = ffi.from_address(number(slot))
+        return ffi.read(ffi.to_const(cell))
+    }
+}

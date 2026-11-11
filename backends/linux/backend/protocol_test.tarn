@@ -1,7 +1,7 @@
 // Unit tests for the devtools protocol: tarn test backends/linux
 import "json"
 import "testing"
-import "gtk/protocol"
+import "backend/protocol"
 
 fn accepted(record string) protocol.Request {
     return match protocol.parse_request(record.bytes()) {

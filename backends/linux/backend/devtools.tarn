@@ -10,9 +10,9 @@ import "string"
 import "crypto"
 import "encoding"
 import "collections"
-import "gtk/gtk"
-import "gtk/native"
-import "gtk/protocol"
+import "backend/gtk"
+import "backend/native"
+import "backend/protocol"
 
 struct GString {}
 extern "C" fn recv(fd i32, buffer *mut u8, length usize, flags i32) isize

@@ -24,7 +24,7 @@ LIBRARY_PATH="$build" "$compiler" build "$build/source/main.tarn" \
 {
     "$compiler" --version
     pkg-config --modversion "${packages[@]}"
-    sha256sum "$build"/source/gtk/*.tarn "$root/core/session.tarn" "$root/core/reactive.tarn" "$compiler"
+    sha256sum "$build"/source/backend/*.tarn "$root/core/session.tarn" "$root/core/reactive.tarn" "$compiler"
     sha256sum "$root/examples/counter/counter.tarn" "$root/examples/counter/main.tarn"
     printf 'ABI=14\n'
 } > "$build/provenance.txt"

@@ -15,10 +15,10 @@ fi
 "$evidence/probe" "$root" "$compiler" > "$evidence/success.json" 2> "$evidence/success.stderr"
 fixture=$(mktemp -d "$evidence/invalid.XXXXXXXX")
 printf '%s\n' "$fixture" > "$evidence/invalid-root.txt"
-mkdir -p "$fixture/core" "$fixture/examples/counter" "$fixture/backends/linux/gtk"
+mkdir -p "$fixture/core" "$fixture/examples/counter" "$fixture/backends/linux/backend"
 cp "$root/core/session.tarn" "$root/core/reactive.tarn" "$fixture/core/"
 cp "$root/examples/counter/counter.tarn" "$fixture/examples/counter/"
-cp "$root"/backends/linux/gtk/{gtk,native,protocol,devtools}.tarn "$fixture/backends/linux/gtk/"
+cp "$root"/backends/linux/backend/{gtk,native,protocol,devtools}.tarn "$fixture/backends/linux/backend/"
 printf 'fn main() { missing_function() }\n' > "$fixture/examples/counter/main.tarn"
 set +e
 "$evidence/probe" "$fixture" "$compiler" > "$evidence/failure.stdout" 2> "$evidence/failure.json"

@@ -1,0 +1,10 @@
+# The macOS AppKit backend as its own package, so its modules import each
+# other as backend/... like the GTK one. AppKit itself is loaded with dlopen;
+# only the Objective-C runtime is linked.
+[package]
+name = "tarn_ui_appkit"
+version = "0.1.0"
+entry = "backend/native.tarn"
+
+[native]
+links = ["objc", "CoreFoundation"]
