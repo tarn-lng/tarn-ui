@@ -146,3 +146,38 @@ pub fn common_modes() *mut u8 {
         return ffi.read(ffi.to_const(cell))
     }
 }
+
+// Classes and selectors of the per-update paths, resolved once per session.
+pub copy struct Hot {
+    pub string_class *mut u8
+    pub with_utf8 *mut u8
+    pub utf8 *mut u8
+    pub set_string_value *mut u8
+    pub string_value *mut u8
+    pub set_title *mut u8
+    pub title *mut u8
+}
+pub fn hot() Hot {
+    return Hot {
+        string_class: class(&"NSString"), with_utf8: sel(&"stringWithUTF8String:"), utf8: sel(&"UTF8String"),
+        set_string_value: sel(&"setStringValue:"), string_value: sel(&"stringValue"),
+        set_title: sel(&"setTitle:"), title: sel(&"title"),
+    }
+}
+pub fn call(object *mut u8, selector *mut u8, a *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, selector, a, nil(), nil(), nil(), 0.0, 0.0, 0.0, nil(), nil(), nil()) }
+}
+pub fn Hot.nsstring(&self, text &string) *mut u8 {
+    utf8 := match ffi.CString.new(text) {
+        Some(value) => value
+        None => { return nil() }
+    }
+    return call(self.string_class, self.with_utf8, word(ffi.address(utf8.as_ptr())))
+}
+// True when NSString `object` already holds `text`.
+pub fn Hot.equals(&self, object *mut u8, text &string) bool {
+    if is_nil(object) { return text.is_empty() }
+    bytes := call(object, self.utf8, nil())
+    if is_nil(bytes) { return false }
+    unsafe { return ffi.string_from_c(ffi.to_const(bytes)).unwrap_or("").eq(text) }
+}

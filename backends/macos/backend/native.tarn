@@ -62,6 +62,7 @@ pub struct Native {
     delivered_closed bool
     dispatched_token u64
     finished bool
+    hot objc.Hot
     // Run loop sources by watch id (kind, NSTimer or CFFileDescriptor address).
     watches collections.Map<u32, Watch>
     next_watch u32
@@ -357,7 +358,7 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
         window: window, block: block, target: target, pool: pool, root: root, heading: heading_view,
         counter: objc.nil(), button: objc.nil(), pages: objc.nil(), page_views: Vec.new(),
         parts: collections.Map.new(), pages_presented: false, text: objc.nil(), delivered_closed: false,
-        dispatched_token: 0, finished: false, watches: collections.Map.new(), next_watch: 0,
+        dispatched_token: 0, finished: false, hot: objc.hot(), watches: collections.Map.new(), next_watch: 0,
     })
 }
 
@@ -504,7 +505,7 @@ pub fn Native.set_counter(&mut self, value i64) i32 {
     if self.closed() { return 6 }
     if flag(self.block, FULL) != 0 { return 8 }
     if objc.is_nil(self.counter) { return 1 }
-    objc.tell1(self.counter, &"setStringValue:", objc.nsstring(&value.to_string()))
+    result := objc.call(self.counter, self.hot.set_string_value, self.hot.nsstring(&value.to_string()))
     return 0
 }
 pub fn Native.set_heading(&mut self, text &string) i32 {
@@ -515,7 +516,7 @@ pub fn Native.set_heading(&mut self, text &string) i32 {
         Ok(converted) => converted
         Err(failure) => { return failure }
     }
-    objc.tell1(self.heading, &"setStringValue:", objc.nsstring(text))
+    result := objc.call(self.heading, self.hot.set_string_value, self.hot.nsstring(text))
     return 0
 }
 
@@ -668,11 +669,15 @@ pub fn Native.set_text(&mut self, key &string, text &string) i32 {
         Err(failure) => { return failure }
     }
     if part.kind == LABEL {
-        if !objc.text_of(objc.send(part.view, &"stringValue")).eq(text) { objc.tell1(part.view, &"setStringValue:", objc.nsstring(text)) }
+        if !self.hot.equals(objc.call(part.view, self.hot.string_value, objc.nil()), text) {
+            result := objc.call(part.view, self.hot.set_string_value, self.hot.nsstring(text))
+        }
         return 0
     }
     if part.kind == BUTTON {
-        if !objc.text_of(objc.send(part.view, &"title")).eq(text) { objc.tell1(part.view, &"setTitle:", objc.nsstring(text)) }
+        if !self.hot.equals(objc.call(part.view, self.hot.title, objc.nil()), text) {
+            result := objc.call(part.view, self.hot.set_title, self.hot.nsstring(text))
+        }
         return 0
     }
     return 1
