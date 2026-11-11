@@ -1,5 +1,9 @@
 # Tarn UI
 
+Reutilizable como paquete `tarn_ui`: `bash scripts/package.sh` lo publica en un
+registro local y [examples/consumer](examples/consumer/README.md) lo usa como
+dependencia con `tarn add` y `tarn build` ([detalles](package/README.md)).
+
 La fase 5 tiene [estado reactivo y vistas derivadas](docs/reactivity.md) y
 [componentes reutilizables con navegación](docs/components-navigation.md).
 Las pantallas comparten estado y conservan sus controles GTK al volver.
@@ -48,3 +52,20 @@ con claves y navegación básica. Los árboles dinámicos y backends móviles si
 contratos de seguridad. `evidence/` contiene informes históricos; sus registros
 y capturas locales están excluidos de Git. El manifiesto de fuentes usa
 `tarn_ui`; el puente nativo se compila mediante el script explícito del proyecto.
+
+
+## Observación de ventanas (0.4.2)
+
+`core/accessibility.observe(pid, title)` recoge un árbol AT-SPI acotado de una
+ventana inequívoca; omite contraseñas y conserva roles, texto, rectángulos y
+estados. No activa ventanas ni cambia preferencias. Requiere `--link atspi`.
+
+`core/window_capture.capture(handle)` captura una ventana KWin ScreenShot2 sin
+foco, sombra ni decoración. `Frame.save(path, elements, marked)` guarda PNG
+con o sin marcas. Requiere `--link gio-2.0 --link gobject-2.0 --link glib-2.0
+--link cairo`. Las coordenadas AT-SPI son lógicas y relativas a la ventana;
+la imagen usa su escala declarada. Los números solo identifican esa observación.
+El consumidor decide permisos, almacenamiento y cómo tratar datos externos.
+
+El contenedor de páginas mantiene sus márgenes en una caja interior para que
+GtkStackPage no los sume dos veces al informar coordenadas por AT-SPI.

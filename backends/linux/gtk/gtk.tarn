@@ -241,6 +241,8 @@ pub extern "C" fn g_value_unset(value *mut u8) void
 
 pub extern "C" fn g_malloc0(size usize) *mut u8
 pub extern "C" fn g_free(memory *mut u8) void
+// GLib copies the name. Wayland app_id and the X11 WM_CLASS come from it.
+pub extern "C" fn g_set_prgname(name *u8) void
 pub extern "C" fn g_strdup(text *u8) *mut u8
 pub extern "C" fn g_utf8_strlen(text *u8, length isize) i64
 pub extern "C" fn g_utf8_validate(text *u8, length isize, end *mut u8) i32
@@ -255,3 +257,13 @@ pub extern "C" fn g_list_model_get_item(model *mut Widget, index u32) *mut Widge
 pub extern "C" fn g_main_context_iteration(context *mut u8, may_block i32) i32
 pub extern "C" fn getpid() i32
 pub extern "C" fn gettid() i32
+
+// Assistant-style apps: submit on Enter, hints, styling, selection, follow the
+// end of a growing page and window-level Escape.
+pub extern "C" fn gtk_entry_set_placeholder_text(entry *mut Widget, text *u8) void
+pub extern "C" fn gtk_label_set_selectable(label *mut Widget, selectable i32) void
+pub extern "C" fn gtk_adjustment_get_value(adjustment *mut Widget) f64
+pub extern "C" fn gtk_adjustment_get_upper(adjustment *mut Widget) f64
+pub extern "C" fn gtk_adjustment_get_page_size(adjustment *mut Widget) f64
+pub extern "C" fn gtk_event_controller_key_new() *mut Widget
+pub extern "C" fn gtk_widget_add_controller(widget *mut Widget, controller *mut Widget) void

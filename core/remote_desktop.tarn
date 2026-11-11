@@ -1,0 +1,262 @@
+// Entrada genérica mediante RemoteDesktop. Sin capturas ni permisos persistentes.
+// El propietario llama poll periódicamente y al despertar fd; close es obligatorio.
+import "src/connection"
+import "src/message"
+import "src/value"
+import "src/error"
+import "time"
+import "fs"
+import "string"
+
+fn service() string { return "org.freedesktop.portal.Desktop" }
+fn root() string { return "/org/freedesktop/portal/desktop" }
+fn iface() string { return "org.freedesktop.portal.RemoteDesktop" }
+fn failure(text &string) error.Error { return error.new("tarn.ui.RemoteDesktop", text) }
+fn request(member &string, body Vec<value.Value>) message.Message { return message.call(&service(), &root(), &iface(), member, body) }
+
+pub struct Control {
+    bus connection.Connection
+    owner string
+    session string
+    pending string
+    phase string
+    serial u32
+    replied bool
+    response Option<value.Dict>
+    clock time.Instant
+    deadline u64
+    devices u32
+    requested u32
+    parent string
+    prefix string
+    counter u32
+    wait_ms u64
+    closed bool
+}
+
+pub fn Control.fd(&self) i32 { return self.bus.raw_fd() }
+pub fn Control.state(&self) string { return self.phase.clone() }
+pub fn Control.ready(&self) bool { return !self.closed && self.phase.eq(&"ready") }
+// Ajusta el plazo de la petición actual y las siguientes; útil en interfaces
+// con tiempos distintos y en pruebas de cancelación. Nunca desactiva el límite.
+pub fn Control.limit_wait(&mut self, milliseconds u64) Result<void, error.Error> {
+    if milliseconds < 100 || milliseconds > 180000 { return Err(failure("Plazo de permiso fuera de límites")) }
+    self.wait_ms = milliseconds
+    self.deadline = self.now() + milliseconds
+    return Ok(())
+}
+fn Control.now(&self) u64 { return self.clock.elapsed().unwrap_or(time.Duration.milliseconds(60000)).as_millis() }
+
+// Abre una conexión propia; nunca utiliza la de la bandeja ni un nombre elegible
+// por el llamante. parent es el identificador de ventana exportado, o vacío.
+pub fn connect(devices u32, parent &string) Result<Control, error.Error> {
+    if devices == 0 || (devices & 3) != devices { return Err(failure("Solicita teclado, puntero o ambos")) }
+    nonce := try fs.read_text(&"/proc/sys/kernel/random/uuid").map_err(fn(_) error.Error { return failure("No se pudo generar el identificador de petición") })
+    prefix := "tarn_input_" + string.replace_all(&string.trim(&nonce), &"-", &"_")
+    var bus = try connection.open(&try connection.session_path())
+    owner := match bus.name_owner(&service()) { Ok(o) => o
+        Err(e) => { bus.close()
+            return Err(e) } }
+    var sender = ""
+    for b in bus.unique_name().bytes() {
+        if b == 46 { sender = sender + "_" } else if b != 58 {
+            var one: Vec<u8> = Vec.new()
+            one.push(b)
+            sender = sender + string.from_utf8(one.as_slice()).unwrap_or("")
+        }
+    }
+    clock := match time.Instant.now() { Ok(c) => c
+        Err(_) => { bus.close()
+            return Err(failure("No se pudo iniciar el reloj")) } }
+    var out = Control{bus: bus, owner: owner, session: root() + "/session/" + sender + "/" + prefix,
+        pending: "", phase: "create", serial: 0, replied: false, response: None, clock: clock,
+        deadline: 0, devices: 0, requested: devices, parent: parent.clone(), prefix: prefix, counter: 0, wait_ms: 120000, closed: false}
+    return match out.begin(&sender) { Ok(_) => Ok(out)
+        Err(e) => { out.close()
+            return Err(e) } }
+}
+
+fn Control.begin(&mut self, sender &string) Result<void, error.Error> {
+    // Suscripción previa al método: conserva Response aunque llegue antes del handle.
+    try self.bus.add_match(&("type='signal',sender='" + self.owner + "',interface='org.freedesktop.portal.Request'"))
+    try self.bus.add_match(&("type='signal',sender='" + self.owner + "',interface='org.freedesktop.portal.Session'"))
+    try self.bus.add_match(&"type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.freedesktop.portal.Desktop'")
+    var options = value.dict_sv()
+    options.put_sv(&"session_handle_token", value.text(&self.prefix))
+    return self.ask(&"CreateSession", Vec.new(), options, sender)
+}
+
+fn Control.ask(&mut self, member &string, body_in Vec<value.Value>, options_in value.Dict, sender &string) Result<void, error.Error> {
+    var body = body_in
+    var options = options_in
+    self.counter = self.counter + 1
+    token := self.prefix + "_" + string.from_u64(u64(self.counter))
+    self.pending = root() + "/request/" + sender + "/" + token
+    options.put_sv(&"handle_token", value.text(&token))
+    body.push(options.done())
+    self.replied = false
+    self.response = None
+    self.deadline = self.now() + self.wait_ms
+    self.serial = try self.bus.send_call(request(member, body), 3000)
+    return Ok(())
+}
+
+fn dict_value(map &value.Dict, key &string) Option<value.Value> {
+    for entry in &map.entries {
+        match &entry.key { value.Value.Text(name) => {
+            if name.eq(key) {
+                match &entry.value { value.Value.Variant(v) => {
+                    if v.inner.len() == 1 { return Some(v.inner.get(0).clone()) }
+                }
+                    _ => {} }
+            }
+        }
+            _ => {} }
+    }
+    return None
+}
+
+fn Control.advance(&mut self) Result<void, error.Error> {
+    if !self.replied || self.response.is_none() { return Ok(()) }
+    result := self.response.take().unwrap()
+    self.pending = ""
+    // Ruta única del emisor, obtenida de la sesión esperada.
+    marker := root() + "/session/"
+    tail := string.slice(&self.session, marker.len(), self.session.len()).unwrap_or("")
+    sender := string.split(&tail, &"/").get(0).clone()
+    if self.phase.eq(&"create") {
+        var actual = ""
+        match dict_value(&result, &"session_handle") {
+            Some(value.Value.Text(s)) => { actual = s }
+            Some(value.Value.Path(s)) => { actual = s }
+            _ => {}
+        }
+        if !actual.eq(&self.session) { return Err(failure("El portal devolvió una sesión inesperada")) }
+        self.phase = "select"
+        var body: Vec<value.Value> = Vec.new()
+        body.push(value.path(&self.session))
+        var options = value.dict_sv()
+        options.put_sv(&"types", value.Value.U32(self.requested))
+        return self.ask(&"SelectDevices", body, options, &sender)
+    }
+    if self.phase.eq(&"select") {
+        self.phase = "permission"
+        var body: Vec<value.Value> = Vec.new()
+        body.push(value.path(&self.session))
+        body.push(value.text(&self.parent))
+        return self.ask(&"Start", body, value.dict_sv(), &sender)
+    }
+    if self.phase.eq(&"permission") {
+        match dict_value(&result, &"devices") { Some(value.Value.U32(n)) => { self.devices = n }
+            _ => { return Err(failure("El portal no indicó los dispositivos concedidos")) } }
+        if (self.devices & self.requested) != self.requested { return Err(failure("El escritorio no concedió todos los dispositivos solicitados")) }
+        self.phase = "ready"
+        self.serial = 0
+        return Ok(())
+    }
+    return Err(failure("Respuesta fuera del ciclo de sesión"))
+}
+
+fn Control.poll_inner(&mut self) Result<void, error.Error> {
+    if self.closed { return Err(failure("La sesión está cerrada")) }
+    if !self.ready() && self.now() >= self.deadline { return Err(failure("Tiempo agotado esperando el permiso del escritorio")) }
+    for incoming in try self.bus.dispatch(64) {
+        if incoming.reply_serial == self.serial && self.serial != 0 {
+            if incoming.kind == message.error_reply() { return Err(connection.remote_error(&incoming)) }
+            if incoming.body.len() != 1 { return Err(failure("Respuesta de petición no válida")) }
+            match incoming.body.get(0) { value.Value.Path(path) => {
+                if !path.eq(&self.pending) { return Err(failure("El portal devolvió una petición inesperada")) }
+            }
+                _ => { return Err(failure("El portal no devolvió una ruta de petición")) } }
+            self.replied = true
+        } else if incoming.kind == message.signal() {
+            if incoming.sender.eq(&"org.freedesktop.DBus") && incoming.interface_name.eq(&"org.freedesktop.DBus") && incoming.member.eq(&"NameOwnerChanged") {
+                return Err(failure("El servicio del portal cambió; la sesión dejó de ser válida"))
+            }
+            if !incoming.sender.eq(&self.owner) { continue }
+            if incoming.path.eq(&self.session) && incoming.interface_name.eq(&"org.freedesktop.portal.Session") && incoming.member.eq(&"Closed") {
+                return Err(failure("El escritorio revocó o cerró el control de entrada"))
+            }
+            if incoming.path.eq(&self.pending) && incoming.interface_name.eq(&"org.freedesktop.portal.Request") && incoming.member.eq(&"Response") {
+                if incoming.body.len() != 2 || self.response.is_some() { return Err(failure("Respuesta de permiso no válida o repetida")) }
+                match incoming.body.get(0) { value.Value.U32(code) => {
+                    if code == 1 { return Err(failure("El usuario canceló el permiso del escritorio")) }
+                    if code != 0 { return Err(failure("El escritorio rechazó la petición de control")) }
+                }
+                    _ => { return Err(failure("Código de respuesta no válido")) } }
+                match incoming.body.get(1) { value.Value.Dict(map) => { self.response = Some(map.clone()) }
+                    _ => { return Err(failure("Resultado de permiso no válido")) } }
+            }
+        }
+    }
+    try self.bus.flush(20)
+    return self.advance()
+}
+
+// No espera al diálogo. Debe llamarse también por temporizador para caducidad.
+pub fn Control.poll(&mut self) Result<void, error.Error> {
+    return match self.poll_inner() { Ok(_) => Ok(())
+        Err(e) => { self.close()
+            return Err(e) } }
+}
+
+fn Control.notify(&mut self, member &string, suffix Vec<value.Value>, device u32) Result<void, error.Error> {
+    try self.poll()
+    if !self.ready() || (self.devices & device) == 0 { return Err(failure("Dispositivo sin permiso activo")) }
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.path(&self.session))
+    body.push(value.dict_sv().done())
+    for item in suffix { body.push(item) }
+    try self.bus.call(request(member, body), 500)
+    return Ok(())
+}
+
+pub fn Control.motion(&mut self, dx f64, dy f64) Result<void, error.Error> {
+    if !(dx >= -32768.0 && dx <= 32768.0 && dy >= -32768.0 && dy <= 32768.0) { return Err(failure("Movimiento fuera de límites")) }
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.Value.Double(dx))
+    body.push(value.Value.Double(dy))
+    return self.notify(&"NotifyPointerMotion", body, 2)
+}
+
+fn Control.edge(&mut self, member &string, code i32, state u32, device u32) Result<void, error.Error> {
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.Value.I32(code))
+    body.push(value.Value.U32(state))
+    return self.notify(member, body, device)
+}
+
+// Pares indivisibles para el llamante: también se intenta soltar tras error al
+// presionar. Si falla cualquier extremo se cierra la sesión; no se reintenta.
+fn Control.tap(&mut self, member &string, code i32, device u32) Result<void, error.Error> {
+    pressed := self.edge(member, code, 1, device)
+    released := self.edge(member, code, 0, device)
+    match pressed { Err(e) => { self.close()
+            return Err(e) }
+        Ok(_) => {} }
+    match released { Err(e) => { self.close()
+            return Err(e) }
+        Ok(_) => {} }
+    return Ok(())
+}
+pub fn Control.click(&mut self, button i32) Result<void, error.Error> {
+    if button < 272 || button > 274 { return Err(failure("Botón de ratón no admitido")) }
+    return self.tap(&"NotifyPointerButton", button, 2)
+}
+pub fn Control.keysym(&mut self, symbol i32) Result<void, error.Error> {
+    if symbol <= 0 || symbol > 0x110ffff { return Err(failure("Símbolo de teclado no válido")) }
+    return self.tap(&"NotifyKeyboardKeysym", symbol, 1)
+}
+
+pub fn Control.close(&mut self) {
+    if self.closed { return }
+    if !self.pending.is_empty() {
+        match self.bus.call(message.call(&self.owner, &self.pending, &"org.freedesktop.portal.Request", &"Close", Vec.new()), 300) { Ok(_) => {}
+            Err(_) => {} }
+    }
+    match self.bus.call(message.call(&self.owner, &self.session, &"org.freedesktop.portal.Session", &"Close", Vec.new()), 300) { Ok(_) => {}
+        Err(_) => {} }
+    self.bus.close()
+    self.closed = true
+    self.phase = "closed"
+}

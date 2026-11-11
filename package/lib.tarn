@@ -1,0 +1,6 @@
+// tarn_ui: native desktop UI for Tarn (GTK4 backend, ABI 14).
+// Import modules as "tarn_ui/core/session", "tarn_ui/core/reactive",
+// "tarn_ui/core/components", "tarn_ui/core/navigation", "tarn_ui/core/forms".
+// The application's tarn.toml must grant the GTK links itself (see README).
+
+pub fn abi() i64 { return 14 }

@@ -1,0 +1,268 @@
+// Captura KWin de una ventana identificada, sin activarla ni capturar la pantalla.
+// Transporte Gio con paso de descriptor; imagen y marcas mediante Cairo.
+import "ffi"
+import "string"
+import "time"
+import "core/accessibility"
+
+extern "C" fn g_bus_get_sync(kind i32, cancel *mut u8, error *mut *mut u8) *mut u8
+extern "C" fn g_dbus_connection_call_with_unix_fd_list_sync(bus *mut u8, service *u8, path *u8, iface *u8, method *u8, parameters *mut u8, reply_type *u8, flags i32, timeout i32, fds *mut u8, out_fds *mut *mut u8, cancel *mut u8, error *mut *mut u8) *mut u8
+extern "C" fn g_unix_fd_list_new() *mut u8
+extern "C" fn g_unix_fd_list_append(list *mut u8, fd i32, error *mut *mut u8) i32
+extern "C" fn g_variant_new_string(text *u8) *mut u8
+extern "C" fn g_variant_new_boolean(value i32) *mut u8
+extern "C" fn g_variant_new_variant(value *mut u8) *mut u8
+extern "C" fn g_variant_new_dict_entry(key *mut u8, value *mut u8) *mut u8
+extern "C" fn g_variant_new_array(kind *u8, children *mut *mut u8, count usize) *mut u8
+extern "C" fn g_variant_new_tuple(children *mut *mut u8, count usize) *mut u8
+extern "C" fn g_variant_new_handle(handle i32) *mut u8
+extern "C" fn g_variant_get_child_value(value *mut u8, index usize) *mut u8
+extern "C" fn g_variant_lookup_value(value *mut u8, name *u8, kind *u8) *mut u8
+extern "C" fn g_variant_get_uint32(value *mut u8) u32
+extern "C" fn g_variant_get_double(value *mut u8) f64
+extern "C" fn g_variant_unref(value *mut u8) void
+extern "C" fn g_object_unref(value *mut u8) void
+extern "C" fn g_error_free(value *mut u8) void
+extern "C" fn pipe2(fds *mut i32, flags i32) i32
+extern "C" fn close(fd i32) i32
+extern "C" fn read(fd i32, buffer *mut u8, size usize) isize
+extern "C" fn poll(fds *mut i32, count usize, timeout i32) i32
+extern "C" fn cairo_image_surface_create_for_data(data *mut u8, format i32, width i32, height i32, stride i32) *mut u8
+extern "C" fn cairo_surface_status(surface *mut u8) i32
+extern "C" fn cairo_surface_destroy(surface *mut u8) void
+extern "C" fn cairo_surface_write_to_png(surface *mut u8, path *u8) i32
+extern "C" fn cairo_create(surface *mut u8) *mut u8
+extern "C" fn cairo_status(context *mut u8) i32
+extern "C" fn cairo_destroy(context *mut u8) void
+extern "C" fn cairo_set_source_rgb(context *mut u8, r f64, g f64, b f64) void
+extern "C" fn cairo_rectangle(context *mut u8, x f64, y f64, width f64, height f64) void
+extern "C" fn cairo_fill(context *mut u8) void
+extern "C" fn cairo_stroke(context *mut u8) void
+extern "C" fn cairo_set_line_width(context *mut u8, width f64) void
+extern "C" fn cairo_set_font_size(context *mut u8, size f64) void
+extern "C" fn cairo_move_to(context *mut u8, x f64, y f64) void
+extern "C" fn cairo_show_text(context *mut u8, text *u8) void
+
+pub struct Frame { pub width u32
+    pub height u32
+    pub stride u32
+    pub scale f64
+    format i32
+    pixels Vec<u8> }
+
+fn c(text &string) ffi.CString { return ffi.CString.new(text).unwrap_or(ffi.CString.new(&"").unwrap()) }
+fn error_text(raw *mut u8) string {
+    if ffi.is_null(raw) { return "KWin no devolvió una captura" }
+    unsafe {
+        var message: *mut *u8 = ffi.from_address(ffi.address(raw) + 8)
+        value := ffi.read(message)
+        text := ffi.string_from_c(value).unwrap_or("Error de D-Bus")
+        g_error_free(raw)
+        return text
+    }
+}
+fn option(key &string, enabled bool) *mut u8 {
+    name := c(key)
+    var value = 0
+    if enabled { value = 1 }
+    unsafe { return g_variant_new_dict_entry(g_variant_new_string(name.as_ptr()), g_variant_new_variant(g_variant_new_boolean(value))) }
+}
+fn uint(dict *mut u8, key &string) u32 {
+    name := c(key)
+    kind := c(&"u")
+    unsafe {
+        value := g_variant_lookup_value(dict, name.as_ptr(), kind.as_ptr())
+        if ffi.is_null(value) { return 0 }
+        out := g_variant_get_uint32(value)
+        g_variant_unref(value)
+        return out
+    }
+}
+fn scale_of(dict *mut u8) f64 {
+    name := c(&"scale")
+    kind := c(&"d")
+    unsafe {
+        value := g_variant_lookup_value(dict, name.as_ptr(), kind.as_ptr())
+        if ffi.is_null(value) { return 1.0 }
+        out := g_variant_get_double(value)
+        g_variant_unref(value)
+        return out
+    }
+}
+fn receive(fd i32, size usize) Result<Vec<u8>, string> {
+    start := match time.Instant.now() { Ok(t) => t
+        Err(_) => { return Err("No se pudo iniciar el reloj de captura") } }
+    var pixels: Vec<u8> = Vec.with_capacity(size)
+    var i: usize = 0
+    for i < size { pixels.push(0)
+        i = i + 1 }
+    var offset: usize = 0
+    for offset < size {
+        now := match time.Instant.now() { Ok(t) => t
+            Err(_) => { return Err("No se pudo consultar el reloj de captura") } }
+        if now.since(start).unwrap_or(time.Duration.seconds(5)).as_millis() >= 2500 { return Err("Tiempo agotado al recibir los píxeles de la ventana") }
+        // struct pollfd: fd (i32), events (i16), revents (i16), Linux LE.
+        var ready = [2]i32{fd, 1}
+        unsafe {
+            if poll(ffi.slice_mut(&mut ready), 1, 50) < 0 { return Err("Falló la espera de la captura") }
+            n := read(fd, ffi.offset_mut(ffi.vec_mut(&mut pixels), offset), size - offset)
+            if n == 0 { return Err("KWin cerró una captura incompleta") }
+            if n > 0 { offset = offset + usize(n) }
+        }
+    }
+    return Ok(pixels)
+}
+
+// Sin sombra ni decoración: las coordenadas AT-SPI de ventana corresponden
+// al contenido. No se usa CaptureActiveWindow, CaptureArea ni CaptureWorkspace.
+pub fn capture(handle &string) Result<Frame, string> {
+    if handle.is_empty() || ffi.CString.new(handle).is_none() { return Err("Identificador de ventana no válido") }
+    service := c(&"org.kde.KWin.ScreenShot2")
+    path := c(&"/org/kde/KWin/ScreenShot2")
+    iface := c(&"org.kde.KWin.ScreenShot2")
+    method := c(&"CaptureWindow")
+    id := c(handle)
+    reply_type := c(&"(a{sv})")
+    unsafe {
+        var failure: *mut u8 = ffi.null()
+        bus := g_bus_get_sync(2, ffi.null(), ffi.of_mut(&mut failure))
+        if ffi.is_null(bus) { return Err(error_text(failure)) }
+        var pipes = [2]i32{-1, -1}
+        if pipe2(ffi.slice_mut(&mut pipes), 526336) != 0 {
+            g_object_unref(bus)
+            return Err("No se pudo abrir el canal privado de captura")
+        }
+        fds := g_unix_fd_list_new()
+        index := g_unix_fd_list_append(fds, pipes[1], ffi.of_mut(&mut failure))
+        close(pipes[1])
+        if index < 0 {
+            close(pipes[0])
+            g_object_unref(fds)
+            g_object_unref(bus)
+            return Err(error_text(failure))
+        }
+        var options = [4]*mut u8{option(&"include-shadow", false), option(&"include-decoration", false),
+            option(&"include-cursor", false), option(&"native-resolution", false)}
+        var args = [3]*mut u8{g_variant_new_string(id.as_ptr()), g_variant_new_array(ffi.null(), ffi.slice_mut(&mut options), 4), g_variant_new_handle(index)}
+        reply := g_dbus_connection_call_with_unix_fd_list_sync(bus, service.as_ptr(), path.as_ptr(), iface.as_ptr(), method.as_ptr(),
+            g_variant_new_tuple(ffi.slice_mut(&mut args), 3), reply_type.as_ptr(), 0, 2000, fds, ffi.null(), ffi.null(), ffi.of_mut(&mut failure))
+        g_object_unref(fds)
+        g_object_unref(bus)
+        if ffi.is_null(reply) {
+            close(pipes[0])
+            return Err(error_text(failure))
+        }
+        dict := g_variant_get_child_value(reply, 0)
+        width := uint(dict, &"width")
+        height := uint(dict, &"height")
+        stride := uint(dict, &"stride")
+        format := uint(dict, &"format")
+        scale := scale_of(dict)
+        g_variant_unref(dict)
+        g_variant_unref(reply)
+        if width == 0 || height == 0 || width > 16384 || height > 16384 || stride < width * 4 || stride > 65536 || u64(stride) * u64(height) > 67108864 || !(scale > 0.0 && scale <= 8.0) {
+            close(pipes[0])
+            return Err("Metadatos de captura no válidos o imagen demasiado grande")
+        }
+        if format != 4 && format != 5 && format != 6 && format != 16 && format != 17 && format != 18 {
+            close(pipes[0])
+            return Err("Formato QImage no compatible: " + string.from_u64(u64(format)))
+        }
+        var pixels = receive(pipes[0], usize(stride) * usize(height))
+        close(pipes[0])
+        var cairo_format = 0
+        if format == 4 || format == 16 { cairo_format = 1 }
+        match &mut pixels {
+            Ok(bytes) => { normalize_pixels(bytes, width, height, stride, format) }
+            Err(_) => {}
+        }
+        return match pixels { Ok(bytes) => Ok(Frame{width: width, height: height, stride: stride, scale: scale, format: cairo_format, pixels: bytes})
+            Err(e) => Err(e) }
+    }
+}
+
+// Cairo ARGB32 usa BGRA premultiplicado en Linux little endian. Qt también
+// entrega RGBA; se intercambian canales y se premultiplica cuando corresponde.
+fn normalize_pixels(bytes &mut Vec<u8>, width u32, height u32, stride u32, format u32) {
+    var y: usize = 0
+    for y < usize(height) {
+        var x: usize = 0
+        for x < usize(width) {
+            p := y * usize(stride) + x * 4
+            var r = bytes.at(p + 2)
+            var g = bytes.at(p + 1)
+            var b = bytes.at(p)
+            var a = bytes.at(p + 3)
+            if format >= 16 { r = bytes.at(p)
+                b = bytes.at(p + 2) }
+            if format == 4 || format == 16 { a = 255 }
+            if format == 5 || format == 17 {
+                r = u8((u32(r) * u32(a) + 127) / 255)
+                g = u8((u32(g) * u32(a) + 127) / 255)
+                b = u8((u32(b) * u32(a) + 127) / 255)
+            }
+            *bytes.get_mut(p) = b
+            *bytes.get_mut(p + 1) = g
+            *bytes.get_mut(p + 2) = r
+            *bytes.get_mut(p + 3) = a
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Recorta cada marca al contenido y convierte coordenadas lógicas a píxeles.
+pub fn Frame.save(&mut self, path &string, elements &Vec<accessibility.Element>, marked bool) Result<void, string> {
+    filename := match ffi.CString.new(path) { Some(s) => s
+        None => { return Err("Ruta de imagen no válida") } }
+    unsafe {
+        surface := cairo_image_surface_create_for_data(ffi.vec_mut(&mut self.pixels), self.format, i32(self.width), i32(self.height), i32(self.stride))
+        if cairo_surface_status(surface) != 0 {
+            cairo_surface_destroy(surface)
+            return Err("No se pudo preparar la imagen")
+        }
+        var status = 0
+        if marked {
+            context := cairo_create(surface)
+            cairo_set_line_width(context, 1.5)
+            cairo_set_font_size(context, 12.0)
+            for element in elements {
+                r := element.rect
+                x := f64(r.x) * self.scale
+                y := f64(r.y) * self.scale
+                width := f64(r.width) * self.scale
+                height := f64(r.height) * self.scale
+                if x >= 0.0 && y >= 0.0 && x + width <= f64(self.width) + 1.0 && y + height <= f64(self.height) + 1.0 && ((element.actionable && element.focusable) || element.editable) {
+                    cairo_set_source_rgb(context, 0.95, 0.22, 0.12)
+                    cairo_rectangle(context, x, y, width, height)
+                    cairo_stroke(context)
+                    // La etiqueta va fuera del recuadro para no tapar su texto:
+                    // encima de la esquina; si no cabe, a la derecha; si
+                    // tampoco, dentro a la derecha.
+                    digits := string.from_u64(u64(element.id))
+                    badge_w := 7.5 * f64(digits.len()) + 6.0
+                    badge_h := 16.0
+                    var bx = x
+                    var by = y - badge_h
+                    if by < 0.0 {
+                        by = y
+                        bx = x + width + 1.0
+                        if bx + badge_w > f64(self.width) { bx = x + width - badge_w }
+                    }
+                    cairo_rectangle(context, bx, by, badge_w, badge_h)
+                    cairo_fill(context)
+                    cairo_set_source_rgb(context, 1.0, 1.0, 1.0)
+                    cairo_move_to(context, bx + 3.0, by + 12.5)
+                    label := c(&digits)
+                    cairo_show_text(context, label.as_ptr())
+                }
+            }
+            status = cairo_status(context)
+            cairo_destroy(context)
+        }
+        if status == 0 { status = cairo_surface_write_to_png(surface, filename.as_ptr()) }
+        cairo_surface_destroy(surface)
+        if status != 0 { return Err("No se pudo guardar la imagen de la ventana") }
+        return Ok(())
+    }
+}

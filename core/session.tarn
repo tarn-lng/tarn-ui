@@ -51,6 +51,27 @@ pub struct Session { native native.Native
 extern "C" fn g_unix_fd_add_full(priority i32, fd i32, condition u32, function *u8, data *mut u8, notify *mut u8) u32
 extern "C" fn g_source_remove(id u32) i32
 
+/// Enter in text field `key` reports Action.Activate(action) with its text.
+pub fn Session.set_submit(&mut self, key string, action u32) Result<void, Error> { return checked_at(self.native.set_submit(&key, action), &"set_submit", &key) }
+/// Grey hint shown while text field `key` is empty.
+pub fn Session.set_placeholder(&mut self, key string, text string) Result<void, Error> { return checked_at(self.native.set_placeholder(&key, &text), &"set_placeholder", &key) }
+/// Adds or removes an application CSS class ([a-z0-9-]) on widget `key`.
+pub fn Session.set_class(&mut self, key string, class string, on bool) Result<void, Error> { return checked_at(self.native.set_class(&key, &class, on), &"set_class", &key) }
+/// Lets the user select and copy label `key`.
+pub fn Session.set_selectable(&mut self, key string, on bool) Result<void, Error> { return checked_at(self.native.set_selectable(&key, on), &"set_selectable", &key) }
+/// Chat-style scrolling: keeps the end of the page in view while the reader is there.
+pub fn Session.set_follow_end(&mut self, on bool) Result<void, Error> { return checked(self.native.set_follow_end(on), &"set_follow_end") }
+pub fn Session.scroll_to_end(&mut self) Result<void, Error> { return checked(self.native.scroll_to_end(), &"scroll_to_end") }
+/// Start-aligns label `key` (reading text) instead of centring it.
+pub fn Session.set_align_start(&mut self, key string) Result<void, Error> { return checked_at(self.native.set_align_start(&key), &"set_align_start", &key) }
+/// Escape anywhere in the window reports Action.Activate(action).
+pub fn Session.set_escape_action(&mut self, action u32) Result<void, Error> { return checked(self.native.set_escape_action(action), &"set_escape_action") }
+
+/// Names the application for the desktop (Wayland app_id, X11 WM_CLASS), so
+/// the taskbar shows its icon and window rules can match it. Call before run;
+/// use the basename of the app's .desktop file, e.g. "tarn-assistant".
+pub fn set_app_id(id string) Result<void, Error> { return checked_at(native.set_app_id(&id), &"set_app_id", &id) }
+
 // Requires the process main thread and no nested UI session. Native allocation
 // failure, ordinary return and body errors all clean up. Abort/exit do not unwind.
 pub unsafe fn run(title string, heading string,
@@ -279,4 +300,19 @@ pub fn Session.tree_container(&mut self, parent string, key string, kind u32, ti
 }
 pub fn Session.tree_text_area(&mut self, parent string, key string, text string, action u32, lines u32) Result<void, Error> {
     return checked_at(self.native.tree_text_area(&parent, &key, &text, action, lines), &"tree_text_area", &key)
+}
+
+// Despierta periódicamente sin bloquear el bucle; usa unwatch_fd para retirarlo.
+extern "C" fn g_timeout_add_full(priority i32, interval u32, callback *u8, data *mut u8, destroy *mut u8) u32
+fn interval_ready(data *mut u8) i32 {
+    native.wake(data)
+    return 1
+}
+pub fn Session.watch_interval(&mut self, milliseconds u32) Result<u32, Error> {
+    if milliseconds < 20 || milliseconds > 60000 { return Err(fail(1, "watch_interval")) }
+    var id: u32 = 0
+    unsafe { id = g_timeout_add_full(0, milliseconds, ffi.callback(interval_ready), self.native.wake_data(), ffi.null()) }
+    if id == 0 { return Err(fail(5, "watch_interval")) }
+    self.watches.push(id)
+    return Ok(id)
 }

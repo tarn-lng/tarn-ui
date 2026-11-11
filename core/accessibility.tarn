@@ -1,0 +1,511 @@
+// Observación y acciones AT-SPI sobre referencias verificadas de una ventana.
+import "ffi"
+import "string"
+import "time"
+
+extern "C" fn atspi_object_get_type() usize
+extern "C" fn atspi_application_get_type() usize
+extern "C" fn g_type_parent(kind usize) usize
+extern "C" fn g_type_query(kind usize, query *mut u8) void
+extern "C" fn atspi_accessible_clear_cache_single(node *mut u8) void
+extern "C" fn atspi_accessible_get_editable_text_iface(node *mut u8) *mut u8
+extern "C" fn atspi_editable_text_set_text_contents(node *mut u8, text *u8, error *mut *mut u8) i32
+extern "C" fn atspi_action_do_action(node *mut u8, index i32, error *mut *mut u8) i32
+extern "C" fn atspi_action_get_action_name(node *mut u8, index i32, error *mut *mut u8) *mut u8
+extern "C" fn g_error_free(error *mut u8) void
+extern "C" fn atspi_init() i32
+extern "C" fn atspi_set_timeout(normal i32, startup i32) void
+extern "C" fn atspi_get_desktop(index i32) *mut u8
+extern "C" fn atspi_accessible_get_child_count(node *mut u8, error *mut *mut u8) i32
+extern "C" fn atspi_accessible_get_child_at_index(node *mut u8, index i32, error *mut *mut u8) *mut u8
+extern "C" fn atspi_accessible_get_process_id(node *mut u8, error *mut *mut u8) u32
+extern "C" fn atspi_accessible_get_name(node *mut u8, error *mut *mut u8) *mut u8
+extern "C" fn atspi_accessible_get_role_name(node *mut u8, error *mut *mut u8) *mut u8
+extern "C" fn atspi_accessible_get_component_iface(node *mut u8) *mut u8
+extern "C" fn atspi_accessible_get_text_iface(node *mut u8) *mut u8
+extern "C" fn atspi_accessible_get_action_iface(node *mut u8) *mut u8
+extern "C" fn atspi_component_get_extents(node *mut u8, coords i32, error *mut *mut u8) *mut i32
+extern "C" fn atspi_text_get_text(node *mut u8, start i32, end i32, error *mut *mut u8) *mut u8
+extern "C" fn atspi_action_get_n_actions(node *mut u8, error *mut *mut u8) i32
+extern "C" fn atspi_accessible_get_state_set(node *mut u8) *mut u8
+extern "C" fn atspi_state_set_contains(states *mut u8, state i32) i32
+extern "C" fn g_object_unref(object *mut u8) void
+extern "C" fn g_free(data *mut u8) void
+
+pub copy struct Rect { pub x i32
+    pub y i32
+    pub width i32
+    pub height i32 }
+pub struct Element {
+    // Ruta de índices desde la ventana, y referencia D-Bus única del proveedor.
+    // La ruta permite volver a localizar; la referencia impide reutilizar el número.
+    pub route string
+    pub reference string
+    pub actions Vec<string>
+    pub id u32
+    pub parent u32
+    pub role string
+    pub name string
+    pub text string
+    pub rect Rect
+    pub actionable bool
+    pub editable bool
+    pub enabled bool
+    pub focusable bool }
+pub struct Snapshot { pub title string
+    pub elements Vec<Element>
+    pub truncated bool
+    // Elementos útiles encontrados; si supera elements.len(), se priorizó.
+    pub found u32 }
+
+// Candidato durante el recorrido: se numera y prioriza al final.
+struct Seen { element Element
+    focused bool }
+
+fn owned_text(raw *mut u8) string {
+    if ffi.is_null(raw) { return "" }
+    unsafe {
+        text := ffi.string_from_c(raw).unwrap_or("")
+        g_free(raw)
+        return text
+    }
+}
+// AtspiObject y AtspiApplication publican estos campos en su ABI C.
+// El tamaño de su padre GObject se consulta a GType en vez de fijarlo a 24.
+// GTypeQuery y punteros siguen la ABI Linux de 64 bits usada por Tarn UI.
+fn parent_size(kind usize) usize {
+    var query = [3]u64{0, 0, 0}
+    unsafe {
+        g_type_query(g_type_parent(kind), ffi.from_address(ffi.address(ffi.slice_mut(&mut query))))
+        var size: *u32 = ffi.from_address(ffi.address(ffi.slice(&query)) + 20)
+        return usize(ffi.read(size))
+    }
+}
+fn pointer_at(base *mut u8, offset usize) *mut u8 {
+    var slot: *mut *mut u8 = ffi.from_address(ffi.address(base) + offset)
+    unsafe { return ffi.read(slot) }
+}
+fn reference_of(node *mut u8) string {
+    unsafe {
+        base := parent_size(atspi_object_get_type())
+        app := pointer_at(node, base)
+        path := pointer_at(node, base + 8)
+        if ffi.is_null(app) || ffi.is_null(path) { return "" }
+        bus := pointer_at(app, parent_size(atspi_application_get_type()) + 8)
+        if ffi.is_null(bus) { return "" }
+        return ffi.string_from_c(bus).unwrap_or("") + " " + ffi.string_from_c(path).unwrap_or("")
+    }
+}
+fn clone_names(names &Vec<string>) Vec<string> {
+    var out: Vec<string> = Vec.new()
+    for name in names { out.push(name.clone()) }
+    return out
+}
+fn action_names(node *mut u8) Vec<string> {
+    var out: Vec<string> = Vec.new()
+    unsafe {
+        iface := atspi_accessible_get_action_iface(node)
+        if ffi.is_null(iface) { return out }
+        count := atspi_action_get_n_actions(iface, ffi.null())
+        var i = 0
+        for i < count && i < 32 {
+            out.push(owned_text(atspi_action_get_action_name(iface, i, ffi.null())))
+            i = i + 1
+        }
+        g_object_unref(iface)
+    }
+    return out
+}
+
+fn short(text string, maximum usize) string {
+    if text.len() <= maximum { return text }
+    var n = maximum
+    for n > 0 {
+        match string.slice(&text, 0, n) { Some(s) => { return s + "…" }
+            None => { n = n - 1 } }
+    }
+    return ""
+}
+fn expired(start time.Instant) bool {
+    return match time.Instant.now() {
+        Ok(now) => now.since(start).unwrap_or(time.Duration.seconds(10)).as_millis() >= 2500
+        Err(_) => true
+    }
+}
+fn bounds(node *mut u8) Rect {
+    var out = Rect{x: 0, y: 0, width: 0, height: 0}
+    unsafe {
+        component := atspi_accessible_get_component_iface(node)
+        if ffi.is_null(component) { return out }
+        // Relativas a la ventana: funcionan también en Wayland sin posición global.
+        raw := atspi_component_get_extents(component, 1, ffi.null())
+        if !ffi.is_null(raw) {
+            out = Rect{x: ffi.read(raw), y: ffi.read(ffi.offset(raw, 1)),
+                width: ffi.read(ffi.offset(raw, 2)), height: ffi.read(ffi.offset(raw, 3))}
+            g_free(ffi.from_address(ffi.address(raw)))
+        }
+        g_object_unref(component)
+    }
+    return out
+}
+const MAX_ELEMENTS usize = 160
+const MAX_CANDIDATES usize = 480
+const MAX_VISITED u32 = 900
+
+fn inside(r &Rect, window &Rect) bool {
+    if window.width <= 0 || window.height <= 0 { return true }
+    return r.x + r.width > 0 && r.y + r.height > 0 && r.x < window.width && r.y < window.height
+}
+
+// Recorre solo lo que se ve: un nodo oculto o fuera de la ventana no aporta
+// hijos (antes se colaban opciones de paneles cerrados). Solo guarda nodos
+// con nombre, texto o acción; los contenedores vacíos ceden su lugar al
+// ancestro más cercano. Un texto que repite el nombre de su padre se omite.
+fn visit(node *mut u8, route &string, parent u32, parent_name &string, depth u32, window &Rect, start time.Instant, seen &mut Vec<Seen>, visited &mut u32, truncated &mut bool) {
+    if *visited >= MAX_VISITED || seen.len() >= MAX_CANDIDATES || depth > 24 || expired(start) {
+        *truncated = true
+        return
+    }
+    *visited = *visited + 1
+    unsafe {
+        role := owned_text(atspi_accessible_get_role_name(node, ffi.null()))
+        // No leer ni recorrer campos de contraseña.
+        if role.eq(&"password text") { return }
+        states := atspi_accessible_get_state_set(node)
+        var showing = depth == 0
+        var editable = false
+        var enabled = false
+        var focusable = false
+        var focused = false
+        if !ffi.is_null(states) {
+            showing = atspi_state_set_contains(states, 25) != 0 && atspi_state_set_contains(states, 30) != 0
+            editable = atspi_state_set_contains(states, 7) != 0
+            // GTK4 comunica SENSITIVE sin ENABLED.
+            enabled = atspi_state_set_contains(states, 24) != 0
+            focusable = atspi_state_set_contains(states, 11) != 0
+            focused = atspi_state_set_contains(states, 12) != 0
+            g_object_unref(states)
+        }
+        if !showing && depth > 0 { return }
+        rect := bounds(node)
+        if depth > 0 && (rect.width <= 0 || rect.height <= 0 || !inside(&rect, window)) { return }
+        var next_parent = parent
+        var next_name = parent_name.clone()
+        name := short(owned_text(atspi_accessible_get_name(node, ffi.null())), 240)
+        var text = ""
+        text_iface := atspi_accessible_get_text_iface(node)
+        if !ffi.is_null(text_iface) {
+            text = short(owned_text(atspi_text_get_text(text_iface, 0, 256, ffi.null())), 512)
+            g_object_unref(text_iface)
+        }
+        action := atspi_accessible_get_action_iface(node)
+        var actionable = false
+        if !ffi.is_null(action) {
+            actionable = atspi_action_get_n_actions(action, ffi.null()) > 0
+            g_object_unref(action)
+        }
+        // Contenedores sin nombre ni texto (Qt los marca con acción) no aportan.
+        container := role.eq(&"filler") || role.eq(&"panel") || role.eq(&"grouping") || role.eq(&"scroll pane")
+        has_words := !name.is_empty() || !string.trim(&text).is_empty()
+        useful := has_words || editable || (actionable && !container)
+        // GTK4 marca con acción hasta las etiquetas: para texto estático no cuenta.
+        passive := role.eq(&"label") || role.eq(&"static") || !actionable
+        echo := passive && !editable && !parent_name.is_empty() &&
+            (name.eq(parent_name) || name.is_empty()) && (text.is_empty() || text.eq(parent_name))
+        if useful && !echo {
+            id := u32(seen.len()) + 1
+            seen.push(Seen { element: Element{route: route.clone(), reference: reference_of(node), actions: action_names(node), id: id, parent: parent, role: role, name: name.clone(),
+                text: text, rect: rect, actionable: actionable, editable: editable, enabled: enabled, focusable: focusable},
+                focused: focused })
+            next_parent = id
+            next_name = name
+        }
+        count := atspi_accessible_get_child_count(node, ffi.null())
+        var index = 0
+        for index < count {
+            if *visited >= MAX_VISITED || seen.len() >= MAX_CANDIDATES || expired(start) {
+                *truncated = true
+                break
+            }
+            child := atspi_accessible_get_child_at_index(node, index, ffi.null())
+            if !ffi.is_null(child) {
+                visit(child, &(route.clone() + "/" + string.from_i64(i64(index))), next_parent, &next_name, depth + 1, window, start, seen, visited, truncated)
+                g_object_unref(child)
+            }
+            index = index + 1
+        }
+    }
+}
+
+// Lo que más sirve para actuar va primero: foco, campos, controles, texto.
+fn priority(s &Seen) u32 {
+    e := &s.element
+    if s.focused { return 4 }
+    if e.editable { return 3 }
+    if e.actionable && e.enabled { return 2 }
+    if !e.text.is_empty() || !e.name.is_empty() { return 1 }
+    return 0
+}
+
+// Si sobran candidatos se quedan los de más prioridad (en orden de lectura),
+// se renumeran 1..n y cada padre apunta al antepasado conservado más cercano.
+fn select(seen Vec<Seen>) Vec<Element> {
+    var keep: Vec<bool> = Vec.new()
+    for _ in seen.as_slice() { keep.push(seen.len() <= MAX_ELEMENTS) }
+    if seen.len() > MAX_ELEMENTS {
+        var level: i64 = 4
+        var kept: usize = 0
+        for level >= 0 && kept < MAX_ELEMENTS {
+            var i: usize = 0
+            for i < seen.len() && kept < MAX_ELEMENTS {
+                if !keep.at(i) && i64(priority(seen.get(i))) == level {
+                    keep.replace(i, true)
+                    kept = kept + 1
+                }
+                i = i + 1
+            }
+            level = level - 1
+        }
+    }
+    // new_id[i] = número nuevo del candidato i (0 si se descarta).
+    var new_id: Vec<u32> = Vec.new()
+    var next: u32 = 0
+    for k in keep.as_slice() {
+        if k {
+            next = next + 1
+            new_id.push(next)
+        } else { new_id.push(0) }
+    }
+    var out: Vec<Element> = Vec.new()
+    var i: usize = 0
+    for i < seen.len() {
+        if keep.at(i) {
+            e := &seen.get(i).element
+            var p = e.parent
+            for p != 0 && new_id.at(usize(p - 1)) == 0 { p = seen.get(usize(p - 1)).element.parent }
+            var mapped: u32 = 0
+            if p != 0 { mapped = new_id.at(usize(p - 1)) }
+            out.push(Element{route: e.route.clone(), reference: e.reference.clone(), actions: clone_names(&e.actions), id: new_id.at(i), parent: mapped, role: e.role.clone(), name: e.name.clone(),
+                text: e.text.clone(), rect: e.rect, actionable: e.actionable, editable: e.editable,
+                enabled: e.enabled, focusable: e.focusable})
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Se exige PID y título exactos de KWin para no leer otra ventana de la app.
+// Ante ambigüedad no elige la primera. No cambia preferencias de accesibilidad.
+fn find_window(pid u32, title &string) Result<*mut u8, string> {
+    if pid == 0 || title.is_empty() { return Err("Falta la identidad de la ventana") }
+    start := match time.Instant.now() { Ok(t) => t
+        Err(_) => { return Err("No se pudo iniciar el reloj de observación") } }
+    unsafe {
+        status := atspi_init()
+        if status != 0 && status != 1 { return Err("No se pudo conectar con accesibilidad AT-SPI") }
+        atspi_set_timeout(150, 150)
+        desktop := atspi_get_desktop(0)
+        if ffi.is_null(desktop) { return Err("AT-SPI no expone aplicaciones") }
+        var selected: *mut u8 = ffi.null()
+        var matches: u32 = 0
+        count := atspi_accessible_get_child_count(desktop, ffi.null())
+        var i = 0
+        for i < count && i < 128 && !expired(start) {
+            app := atspi_accessible_get_child_at_index(desktop, i, ffi.null())
+            if !ffi.is_null(app) {
+                if atspi_accessible_get_process_id(app, ffi.null()) == pid {
+                    windows := atspi_accessible_get_child_count(app, ffi.null())
+                    var j = 0
+                    for j < windows && j < 128 && !expired(start) {
+                        window := atspi_accessible_get_child_at_index(app, j, ffi.null())
+                        if !ffi.is_null(window) {
+                            name := owned_text(atspi_accessible_get_name(window, ffi.null()))
+                            if name.eq(title) {
+                                matches = matches + 1
+                                if ffi.is_null(selected) { selected = window
+                                } else { g_object_unref(window) }
+                            } else { g_object_unref(window) }
+                        }
+                        j = j + 1
+                    }
+                }
+                g_object_unref(app)
+            }
+            i = i + 1
+        }
+        g_object_unref(desktop)
+        if ffi.is_null(selected) { return Err("La ventana no expone AT-SPI con su PID y título; puede necesitar accesibilidad activada o reiniciar la app") }
+        if matches != 1 || expired(start) {
+            g_object_unref(selected)
+            return Err("No se pudo identificar una única ventana accesible a tiempo")
+        }
+        return Ok(selected)
+    }
+}
+
+pub fn observe(pid u32, title &string) Result<Snapshot, string> {
+    selected := try find_window(pid, title)
+    start := match time.Instant.now() { Ok(t) => t
+        Err(_) => { unsafe { g_object_unref(selected) }
+            return Err("No se pudo iniciar el reloj de observación") } }
+    unsafe {
+        window := bounds(selected)
+        var seen: Vec<Seen> = Vec.new()
+        var visited: u32 = 0
+        var truncated = false
+        visit(selected, &"", 0, &"", 0, &window, start, &mut seen, &mut visited, &mut truncated)
+        g_object_unref(selected)
+        found := u32(seen.len())
+        elements := select(seen)
+        if u32(elements.len()) < found { truncated = true }
+        return Ok(Snapshot{title: title.clone(), elements: elements, truncated: truncated, found: found})
+    }
+}
+
+// Resuelve la ruta observada manteniendo una referencia propia en cada paso.
+fn resolve(root *mut u8, route &string) Result<*mut u8, string> {
+    unsafe {
+        var current = g_object_ref(root)
+        var depth: u32 = 0
+        for part in string.split(route, &"/") {
+            if part.is_empty() { continue }
+            depth = depth + 1
+            index := string.parse_i64(&part).unwrap_or(-1)
+            if depth > 24 || index < 0 || index > 100000 {
+                g_object_unref(current)
+                return Err("Ruta accesible no válida")
+            }
+            atspi_accessible_clear_cache_single(current)
+            next := atspi_accessible_get_child_at_index(current, i32(index), ffi.null())
+            g_object_unref(current)
+            if ffi.is_null(next) { return Err("El elemento ya no existe; vuelve a observar") }
+            current = next
+        }
+        atspi_accessible_clear_cache_single(current)
+        return Ok(current)
+    }
+}
+extern "C" fn g_object_ref(object *mut u8) *mut u8
+
+fn text_of(node *mut u8, end i32) string {
+    unsafe {
+        iface := atspi_accessible_get_text_iface(node)
+        if ffi.is_null(iface) { return "" }
+        text := owned_text(atspi_text_get_text(iface, 0, end, ffi.null()))
+        g_object_unref(iface)
+        return text
+    }
+}
+fn validate(node *mut u8, expected &Element) Result<void, string> {
+    if expected.reference.is_empty() || !reference_of(node).eq(&expected.reference) {
+        return Err("La referencia del elemento cambió; vuelve a observar")
+    }
+    unsafe {
+        role := owned_text(atspi_accessible_get_role_name(node, ffi.null()))
+        name := short(owned_text(atspi_accessible_get_name(node, ffi.null())), 240)
+        text := short(text_of(node, 256), 512)
+        r := bounds(node)
+        e := expected.rect
+        if role.eq(&"password text") { return Err("No se actúa sobre campos de contraseña") }
+        if !role.eq(&expected.role) || !name.eq(&expected.name) || !text.eq(&expected.text) ||
+            r.x != e.x || r.y != e.y || r.width != e.width || r.height != e.height {
+            return Err("El elemento cambió desde la observación; vuelve a observar")
+        }
+        states := atspi_accessible_get_state_set(node)
+        if ffi.is_null(states) { return Err("No se pudo comprobar el estado del elemento") }
+        usable := atspi_state_set_contains(states, 25) != 0 && atspi_state_set_contains(states, 30) != 0 &&
+            atspi_state_set_contains(states, 24) != 0 && atspi_state_set_contains(states, 6) == 0
+        g_object_unref(states)
+        if !usable { return Err("El elemento está oculto, deshabilitado o desconectado") }
+    }
+    return Ok(())
+}
+fn action_error(error *mut u8, fallback &string) string {
+    if ffi.is_null(error) { return fallback.clone() }
+    unsafe {
+        message := pointer_at(error, 8)
+        detail := ffi.string_from_c(message).unwrap_or("")
+        g_error_free(error)
+        return fallback.clone() + ": " + detail
+    }
+}
+fn write_node(node *mut u8, text &string) Result<void, string> {
+    value := match ffi.CString.new(text) { Some(s) => s
+        None => { return Err("El texto contiene un carácter NUL") } }
+    if text.len() > 4096 { return Err("El texto supera el límite de 4096 bytes") }
+    unsafe {
+        states := atspi_accessible_get_state_set(node)
+        if ffi.is_null(states) { return Err("No se pudo comprobar si el campo es editable") }
+        editable := atspi_state_set_contains(states, 7) != 0 && atspi_state_set_contains(states, 43) == 0
+        g_object_unref(states)
+        if !editable { return Err("El elemento no es editable") }
+        iface := atspi_accessible_get_editable_text_iface(node)
+        if ffi.is_null(iface) { return Err("El elemento no ofrece escritura AT-SPI") }
+        var failure: *mut u8 = ffi.null()
+        accepted := atspi_editable_text_set_text_contents(iface, value.as_ptr(), ffi.of_mut(&mut failure))
+        g_object_unref(iface)
+        if accepted == 0 || !ffi.is_null(failure) {
+            return Err(action_error(failure, &"AT-SPI no confirmó la escritura; observa antes de reintentar"))
+        }
+        var attempt = 0
+        for attempt < 5 {
+            atspi_accessible_clear_cache_single(node)
+            if text_of(node, 4097).eq(text) { return Ok(()) }
+            match time.sleep_blocking(time.Duration.milliseconds(30)) { Ok(_) => {}
+                Err(_) => {} }
+            attempt = attempt + 1
+        }
+        return Err("La escritura fue enviada, pero el texto leído no coincide; observa antes de reintentar")
+    }
+}
+fn invoke_node(node *mut u8, action &string) Result<void, string> {
+    if action.is_empty() { return Err("Indica una acción de las ofrecidas por el elemento") }
+    unsafe {
+        iface := atspi_accessible_get_action_iface(node)
+        if ffi.is_null(iface) { return Err("El elemento no ofrece acciones AT-SPI") }
+        var selected = -1
+        var matches = 0
+        count := atspi_action_get_n_actions(iface, ffi.null())
+        var i = 0
+        for i < count && i < 32 {
+            name := owned_text(atspi_action_get_action_name(iface, i, ffi.null()))
+            if name.eq(action) { selected = i
+                matches = matches + 1 }
+            i = i + 1
+        }
+        if matches != 1 {
+            g_object_unref(iface)
+            return Err("La acción no está disponible o es ambigua; vuelve a observar")
+        }
+        var failure: *mut u8 = ffi.null()
+        accepted := atspi_action_do_action(iface, selected, ffi.of_mut(&mut failure))
+        g_object_unref(iface)
+        if accepted == 0 || !ffi.is_null(failure) {
+            return Err(action_error(failure, &"AT-SPI no confirmó la acción; observa antes de reintentar"))
+        }
+        // El proveedor aceptó la llamada. Su efecto semántico se comprueba
+        // mediante una nueva observación; TRUE no significa «guardado/enviado».
+        return Ok(())
+    }
+}
+
+// El consumidor decide autorización. Esta API no enfoca ni emite teclas.
+// Se rechaza una ruta reutilizada si cambió su referencia, contenido o posición.
+pub fn perform(pid u32, title &string, expected &Element, operation &string, value &string) Result<void, string> {
+    if !operation.eq(&"write") && !operation.eq(&"invoke") { return Err("Operación AT-SPI no válida") }
+    root := try find_window(pid, title)
+    found := resolve(root, &expected.route)
+    unsafe { g_object_unref(root) }
+    node := try found
+    valid := validate(node, expected)
+    var outcome: Result<void, string> = Ok(())
+    match valid {
+        Err(e) => { outcome = Err(e) }
+        Ok(_) => {
+            if operation.eq(&"write") { outcome = write_node(node, value)
+            } else { outcome = invoke_node(node, value) }
+        }
+    }
+    unsafe { g_object_unref(node) }
+    return outcome
+}

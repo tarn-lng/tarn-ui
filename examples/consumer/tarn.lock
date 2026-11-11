@@ -1,0 +1,32 @@
+{
+  "manifest": "45ef8e66c9d296354d82dab46a4fc61778afd374fa172af74c60bfcdf8e37a8e",
+  "packages": [
+    {
+      "registry": "file:///home/safases/Documentos/proyectos/tarn-lng/ui/.build/registry/",
+      "release": {
+        "dependencies": {},
+        "entry": "lib.tarn",
+        "files": {
+          "README.md": "c50fc157eb14e3f2e1035ca04976a939dc3cec5b75f631a95124e7b53a71dc3c",
+          "core/components.tarn": "64d9851dad575e34d23df9c7aeb3a28ee470af8a483f13822a18fafc5831f4b5",
+          "core/forms.tarn": "4d623a12b522f1f769a86893d7ceabdbf5d4c14e1ace826aa399497d4e3efef1",
+          "core/navigation.tarn": "e838fac9f18f4b6e945a5d7c3bdf360bd7724b197fe1422c362be4bd192286ba",
+          "core/reactive.tarn": "54bd55ccee69123825f2508d4a7795b1084cd3f0caa3bd728022c8b87c135c33",
+          "core/session.tarn": "7925d26d902327c389b9fa52c2b8235dbe7432cfa1f5e4162d005ebd22f805fb",
+          "gtk/devtools.tarn": "860c25af58d5144b91d7c4e86b61f17aa33031f6c2627153ce9501d46c9d2d37",
+          "gtk/gtk.tarn": "1ccca89274dd35de35a9f55be375f346dd9a2334307683d2ca6b6b82e0ea9519",
+          "gtk/native.tarn": "46aba6d4dde6ea4b09973ce62d9866ba878e62f4499377f65b37b275e8256e41",
+          "gtk/protocol.tarn": "e1cbecdf697bbf47ab1f42cc072ba4c8bfc0fc35f3c4d136058fabfbd37e7f6b",
+          "lib.tarn": "fa300f6b1a4533e5a3eaeef0d20e50174dd7c0cedb4b4e650ceede11096ca609",
+          "tarn.toml": "d3f5b087304812123836d54aa0982a8a2cbadcd72c5af7627b65826bd95d004e"
+        },
+        "hash": "1cb61a17ebaf2ec92c6330d11cfbed8cdc01807fe4554c2b9132bb7140ca613e",
+        "name": "tarn_ui",
+        "published": 1793668536,
+        "schema": 1,
+        "version": "0.1.0"
+      }
+    }
+  ],
+  "schema": 1
+}

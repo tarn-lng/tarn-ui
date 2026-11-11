@@ -363,6 +363,26 @@ pub fn Native.widget(&self, key &string) *mut gtk.Widget {
     }
 }
 
+// Application identity (Wayland app_id, X11 WM_CLASS): without it KWin and
+// the taskbar see a generic "GTK Application" and window rules cannot target
+// the app. Reverse-DNS or plain names: [A-Za-z0-9._-], 1..255 bytes, set
+// before create.
+pub fn set_app_id(id &string) i32 {
+    if !main_thread() { return 2 }
+    if session_active() { return 3 }
+    if id.is_empty() || id.len() > 255 { return 1 }
+    for b in id.bytes() {
+        ok := (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 46 || b == 95 || b == 45
+        if !ok { return 1 }
+    }
+    name := match c(id) {
+        Ok(value) => value
+        Err(status) => { return status }
+    }
+    unsafe { gtk.g_set_prgname(name.as_ptr()) }
+    return 0
+}
+
 pub fn create(title &string, heading &string) Result<Native, i32> {
     if !main_thread() { return Err(2) }
     title_text := try c(title)
@@ -770,9 +790,14 @@ pub fn Native.add_page(&mut self, key &string) i32 {
     if ffi.is_null(self.pages) { self.make_pages() }
     unsafe {
         page := gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12)
-        margins(page, 24, 24, 0, 24)
+        // GtkStackPage repeats its child's accessible bounds. Keep that child
+        // at (0,0) and put spacing on an inner box, so AT-SPI does not count
+        // margins twice when translating coordinates to the window.
+        content := gtk.gtk_box_new(gtk.ORIENTATION_VERTICAL, 12)
+        margins(content, 24, 24, 0, 24)
+        gtk.gtk_box_append(page, content)
         stack_page := gtk.gtk_stack_add_named(self.pages, page, name.as_ptr())
-        self.insert(key, page, PAGE, false, 0)
+        self.insert(key, content, PAGE, false, 0)
     }
     self.page_count = self.page_count + 1
     return 0
@@ -2395,4 +2420,162 @@ pub fn Native.activate_menu(&mut self, key &string) bool {
 // Whether GTK can open a display, for tests that skip without one.
 pub fn display_available() bool {
     unsafe { return gtk.gtk_init_check() != 0 }
+}
+
+// ---- Assistant helpers (additive, ABI 14) ----
+const SUBMIT_KEY string = "tarn-ui-submit"
+const FOLLOW_KEY string = "tarn-ui-follow"
+const ESCAPE_KEY string = "tarn-ui-escape"
+const GDK_KEY_ESCAPE u32 = 65307
+
+fn data_u32(object *mut gtk.Widget, name &string) u32 {
+    key := literal(name)
+    unsafe { return u32(ffi.address(gtk.g_object_get_data(object, key.as_ptr()))) }
+}
+fn set_data_u32(object *mut gtk.Widget, name &string, value u32) {
+    key := literal(name)
+    unsafe { gtk.g_object_set_data(object, key.as_ptr(), ffi.from_address(usize(value))) }
+}
+
+fn entry_submitted(entry *mut gtk.Widget, block *mut u8) void {
+    action := data_u32(entry, &SUBMIT_KEY)
+    if action == 0 { return }
+    unsafe { enqueue(block, 1000 + i32(action), gtk.g_strdup(gtk.gtk_editable_get_text(entry))) }
+}
+
+// Enter in a text field reports `action` (with the text, like an edit event).
+// The field keeps reporting edits with its own action.
+pub fn Native.set_submit(&mut self, key &string, action u32) i32 {
+    if !valid_action(action) { return 1 }
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != ENTRY { return 1 }
+    first := data_u32(part.widget, &SUBMIT_KEY) == 0
+    set_data_u32(part.widget, &SUBMIT_KEY, action)
+    if first { handler := connect_uncounted(part.widget, &"activate", ffi.callback(entry_submitted), self.block) }
+    return 0
+}
+
+pub fn Native.set_placeholder(&mut self, key &string, text &string) i32 {
+    value := match c(text) {
+        Ok(v) => v
+        Err(status) => { return status }
+    }
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != ENTRY { return 1 }
+    unsafe { gtk.gtk_entry_set_placeholder_text(part.widget, value.as_ptr()) }
+    return 0
+}
+
+fn valid_class(name &string) bool {
+    if name.is_empty() || name.len() > 64 { return false }
+    for b in name.bytes() {
+        if !((b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45) { return false }
+    }
+    return true
+}
+
+// Adds or removes an application CSS class ([a-z0-9-]) on a keyed widget.
+pub fn Native.set_class(&mut self, key &string, class &string, on bool) i32 {
+    if !valid_class(class) { return 1 }
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    css(part.widget, class, on)
+    return 0
+}
+
+// Lets the user select and copy a label's text.
+pub fn Native.set_selectable(&mut self, key &string, on bool) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != LABEL { return 1 }
+    unsafe { gtk.gtk_label_set_selectable(part.widget, gbool(on)) }
+    return 0
+}
+
+fn page_adjustment(pages *mut gtk.Widget) *mut gtk.Widget {
+    unsafe { return gtk.gtk_scrolled_window_get_vadjustment(parent_of(parent_of(pages))) }
+}
+fn at_end(adjustment *mut gtk.Widget) bool {
+    unsafe {
+        return gtk.gtk_adjustment_get_value(adjustment) + gtk.gtk_adjustment_get_page_size(adjustment) >=
+            gtk.gtk_adjustment_get_upper(adjustment) - 24.0
+    }
+}
+// Remembers whether the reader is at the end; content growth keeps them there.
+fn follow_moved(adjustment *mut gtk.Widget, block *mut u8) void {
+    if data_u32(adjustment, &FOLLOW_KEY) == 0 { return }
+    if at_end(adjustment) { set_data_u32(adjustment, &FOLLOW_KEY, 2) } else { set_data_u32(adjustment, &FOLLOW_KEY, 1) }
+}
+fn follow_grown(adjustment *mut gtk.Widget, block *mut u8) void {
+    if data_u32(adjustment, &FOLLOW_KEY) != 2 { return }
+    unsafe {
+        gtk.gtk_adjustment_set_value(adjustment, gtk.gtk_adjustment_get_upper(adjustment) - gtk.gtk_adjustment_get_page_size(adjustment))
+    }
+}
+
+// Chat-style scrolling: while the reader is at the end of the page, new
+// content keeps the end in view; scrolling up stops following until they
+// return to the end.
+pub fn Native.set_follow_end(&mut self, on bool) i32 {
+    if ffi.is_null(self.pages) { return 1 }
+    adjustment := page_adjustment(self.pages)
+    if ffi.is_null(adjustment) { return 1 }
+    first := data_u32(adjustment, &FOLLOW_KEY) == 0
+    if on { set_data_u32(adjustment, &FOLLOW_KEY, 2) } else { set_data_u32(adjustment, &FOLLOW_KEY, 0) }
+    if on && first {
+        h1 := connect_uncounted(adjustment, &"value-changed", ffi.callback(follow_moved), self.block)
+        h2 := connect_uncounted(adjustment, &"changed", ffi.callback(follow_grown), self.block)
+    }
+    return 0
+}
+
+// Jumps to the end of the page and resumes following.
+pub fn Native.scroll_to_end(&mut self) i32 {
+    if ffi.is_null(self.pages) { return 1 }
+    adjustment := page_adjustment(self.pages)
+    if ffi.is_null(adjustment) { return 1 }
+    if data_u32(adjustment, &FOLLOW_KEY) != 0 { set_data_u32(adjustment, &FOLLOW_KEY, 2) }
+    unsafe { gtk.gtk_adjustment_set_value(adjustment, gtk.gtk_adjustment_get_upper(adjustment)) }
+    return 0
+}
+
+fn key_pressed(controller *mut gtk.Widget, keyval u32, keycode u32, state u32, block *mut u8) i32 {
+    if keyval != GDK_KEY_ESCAPE { return 0 }
+    action := data_u32(controller, &ESCAPE_KEY)
+    if action == 0 { return 0 }
+    enqueue(block, 1000 + i32(action), ffi.null())
+    return 1
+}
+
+// Escape anywhere in the window reports `action` (e.g. hide to the tray).
+pub fn Native.set_escape_action(&mut self, action u32) i32 {
+    if !valid_action(action) { return 1 }
+    unsafe {
+        controller := gtk.gtk_event_controller_key_new()
+        set_data_u32(controller, &ESCAPE_KEY, action)
+        handler := connect_uncounted(controller, &"key-pressed", ffi.callback(key_pressed), self.block)
+        gtk.gtk_widget_add_controller(self.window, controller)
+    }
+    return 0
+}
+
+// Reading text (chat, logs): start-aligned instead of GTK's centred default.
+pub fn Native.set_align_start(&mut self, key &string) i32 {
+    part := match self.lookup(key) {
+        Ok(found) => found
+        Err(status) => { return status }
+    }
+    if part.kind != LABEL { return 1 }
+    unsafe { gtk.gtk_label_set_xalign(part.widget, 0.0) }
+    return 0
 }

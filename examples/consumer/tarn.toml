@@ -1,0 +1,8 @@
+dependencies = { tarn_ui = { version = "^0.1.0", registry = "file:///home/safases/Documentos/proyectos/tarn-lng/ui/.build/registry/" } }
+[package]
+name = "tarn_ui_consumer"
+version = "0.1.0"
+entry = "main.tarn"
+
+[native]
+links = ["gtk-4", "gobject-2.0", "gio-2.0", "glib-2.0"]

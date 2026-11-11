@@ -1,0 +1,21 @@
+import "tarn_ui/core/session"
+import "tarn_ui/core/reactive"
+import "os"
+import "counter"
+
+fn main() {
+    var state: reactive.State<i64> = reactive.State.new(0)
+    unsafe {
+        match session.run("Consumidor tarn_ui", "Hola desde Tarn", fn(ui &mut session.Session) Result<void, session.Error> {
+            return reactive.drive_counter(ui, &mut state,
+                counter.reduce,
+                counter.view)
+        }) {
+            Ok(_) => { print("closed") }
+            Err(error) => {
+                print(error.message())
+                os.exit(1)
+            }
+        }
+    }
+}

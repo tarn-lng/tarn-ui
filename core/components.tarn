@@ -477,3 +477,11 @@ fn View.reconcile_regions(&self, ui &mut session.Session) Result<void, session.E
     }
     return Ok(())
 }
+
+/// Applies keyed regions directly (same reconciliation as View): widgets whose
+/// keys stay keep their identity and state; missing ones are removed.
+pub fn sync_regions(ui &mut session.Session, regions Vec<Region>) Result<void, session.Error> {
+    view := View { route: "regions", texts: Vec.new(), enabled: Vec.new(), inputs: Vec.new(), lists: Vec.new(), regions: regions }
+    try view.validate()
+    return view.reconcile_regions(ui)
+}

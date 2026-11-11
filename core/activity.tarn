@@ -1,0 +1,332 @@
+// Actividad evdev en Linux: solo contador y estado de pulsación; nunca texto,
+// códigos de tecla, posiciones ni nombres de dispositivos en la API o registros.
+// RemoteDesktop/AT-SPI no escriben en estos dispositivos del núcleo.
+import "ffi"
+import "fs"
+import "string"
+
+extern "C" fn open(path *u8, flags i32) i32
+extern "C" fn close(fd i32) i32
+extern "C" fn read(fd i32, buffer *mut u8, length usize) isize
+extern "C" fn ioctl(fd i32, request u64, buffer *mut u8) i32
+extern "C" fn __errno_location() *mut i32
+extern "C" fn epoll_create1(flags i32) i32
+extern "C" fn epoll_wait(fd i32, events *mut u8, maximum i32, timeout i32) i32
+extern "C" fn epoll_ctl(fd i32, operation i32, device i32, event *mut u8) i32
+
+struct Device { path string
+    fd i32 }
+pub struct Monitor { devices Vec<Device>
+    ready_fd i32
+    counter u64
+    closed bool }
+pub copy struct Sample { pub counter u64
+    pub held bool }
+
+fn errno() i32 { unsafe { return ffi.read(__errno_location()) } }
+fn zeros(size usize) Vec<u8> {
+    var bytes: Vec<u8> = Vec.with_capacity(size)
+    for bytes.len() < size { bytes.push(0) }
+    return bytes
+}
+fn relevant(name &string) Result<bool, string> {
+    mask := try fs.read_text(&("/sys/class/input/" + name + "/device/capabilities/ev")).map_err(fn(_) string { return "No se pudieron comprobar las capacidades de un dispositivo de entrada" })
+    trimmed := string.trim(&mask)
+    if trimmed.is_empty() { return Err("Capacidades de entrada vacías") }
+    b := trimmed.bytes()[trimmed.len() - 1]
+    var n: u8 = 0
+    if b >= 48 && b <= 57 { n = b - 48
+    } else if b >= 97 && b <= 102 { n = b - 87
+    } else { return Err("Capacidades de entrada no válidas") }
+    return Ok((n & 14) != 0)
+}
+fn device_paths() Result<Vec<string>, string> {
+    entries := try fs.read_dir(&"/dev/input").map_err(fn(_) string { return "No se pueden enumerar los dispositivos de entrada" })
+    var paths: Vec<string> = Vec.new()
+    for entry in entries {
+        name := entry.name().clone()
+        if string.starts_with(&name, &"event") && name.len() > 5 {
+            suffix := string.slice(&name, 5, name.len()).unwrap_or("")
+            if string.parse_u64(&suffix).is_some() && try relevant(&name) { paths.push("/dev/input/" + name) }
+        }
+    }
+    if paths.is_empty() || paths.len() > 64 { return Err("No se pudo identificar un conjunto acotado de dispositivos de entrada") }
+    return Ok(paths)
+}
+
+// Abre todos los dispositivos relevantes o falla y cierra los ya abiertos. No
+// modifica permisos ni captura en exclusiva: otros clientes siguen recibiendo entrada.
+pub fn connect() Result<Monitor, string> {
+    paths := try device_paths()
+    var m = Monitor{devices: Vec.new(), ready_fd: -1, counter: 0, closed: false}
+    unsafe { m.ready_fd = epoll_create1(0x80000) }
+    if m.ready_fd < 0 { return Err("No se pudo iniciar la vigilancia de actividad") }
+    for path in paths {
+        name := ffi.CString.new(&path).unwrap()
+        var fd: i32 = -1
+        unsafe { fd = open(name.as_ptr(), 0x800 | 0x80000) }
+        if fd < 0 {
+            m.close()
+            return Err("Falta permiso de lectura de los dispositivos evdev")
+        }
+        // EVIOCGVERSION: impide aceptar archivos ordinarios o fuentes sustituidas.
+        var version: i32 = 0
+        var valid: i32 = -1
+        unsafe { valid = ioctl(fd, 0x80044501, ffi.from_address(ffi.address(ffi.of_mut(&mut version)))) }
+        if valid < 0 {
+            unsafe { ignored := close(fd) }
+            m.close()
+            return Err("Un dispositivo de entrada no ofrece el protocolo evdev")
+        }
+        // epoll_event es una estructura empaquetada de 12 bytes en Linux x86_64.
+        var event = [3]u32{1 | 8 | 16, u32(fd), 0}
+        var registered: i32 = -1
+        unsafe { registered = epoll_ctl(m.ready_fd, 1, fd, ffi.from_address(ffi.address(ffi.slice_mut(&mut event)))) }
+        if registered < 0 {
+            unsafe { ignored := close(fd) }
+            m.close()
+            return Err("No se pudo vigilar un dispositivo de entrada")
+        }
+        m.devices.push(Device{path: path, fd: fd})
+    }
+    return Ok(m)
+}
+
+pub fn Monitor.fd(&self) i32 { return self.ready_fd }
+
+// Solo se examinan el tipo de evento y SYN_DROPPED; el código de tecla y el
+// valor no se interpretan ni se conservan. ABI input_event Linux x86_64: 24 bytes.
+pub fn activity_count(bytes &[]u8) Result<u64, string> {
+    if bytes.len() % 24 != 0 { return Err("Se recibió un evento de entrada incompleto") }
+    var count: u64 = 0
+    var i: usize = 0
+    for i < bytes.len() {
+        kind := u16(bytes[i + 16]) + u16(bytes[i + 17]) * 256
+        if kind == 0 && bytes[i + 18] == 3 && bytes[i + 19] == 0 { return Err("Se perdió parte de la actividad de entrada") }
+        if kind == 1 || kind == 2 || kind == 3 { count = count + 1 }
+        i = i + 24
+    }
+    return Ok(count)
+}
+
+fn Monitor.poll_inner(&mut self) Result<Sample, string> {
+    if self.closed { return Err("La vigilancia de actividad está cerrada") }
+    current := try device_paths()
+    if current.len() != self.devices.len() { return Err("Cambió el conjunto de dispositivos de entrada; vuelve a autorizar la continuación") }
+    for device in &self.devices {
+        var exists = false
+        for path in &current { if path.eq(&device.path) { exists = true } }
+        if !exists { return Err("Se retiró un dispositivo de entrada; se detiene la vigilancia") }
+    }
+    var buffer = zeros(768)
+    var held = false
+    for device in &self.devices {
+        var batch: u32 = 0
+        for {
+            var n: isize = -1
+            unsafe { n = read(device.fd, ffi.slice_mut(buffer.as_mut_slice()), buffer.len()) }
+            if n < 0 {
+                code := errno()
+                if code == 11 { break }
+                if code == 4 && batch < 32 { batch = batch + 1
+                    continue }
+                return Err("No se pudo comprobar la actividad de entrada")
+            }
+            if n == 0 { return Err("Se desconectó un dispositivo de entrada") }
+            counted := activity_count(&buffer.as_slice()[0..usize(n)])
+            // No conservar en memoria los datos crudos tras contarlos.
+            var j: usize = 0
+            for j < usize(n) { buffer.replace(j, 0)
+                j = j + 1 }
+            self.counter = self.counter + try counted
+            batch = batch + 1
+            if batch >= 32 { return Err("Hay más actividad de la que se puede verificar a tiempo") }
+        }
+        // EVIOCGKEY(96): incluye las teclas y botones que ya estaban presionados
+        // antes de abrir el monitor. Solo se expone si existe alguna pulsación.
+        var keys = [12]u64{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+        var status: i32 = -1
+        unsafe { status = ioctl(device.fd, 0x80604518, ffi.from_address(ffi.address(ffi.slice_mut(&mut keys)))) }
+        if status < 0 { return Err("No se pudo comprobar si quedan teclas o botones presionados") }
+        for bits in keys { if bits != 0 { held = true } }
+    }
+    var ready = zeros(12 * 64)
+    unsafe {
+        if epoll_wait(self.ready_fd, ffi.slice_mut(ready.as_mut_slice()), 64, 0) < 0 && errno() != 4 {
+            return Err("No se pudo comprobar el descriptor de vigilancia")
+        }
+    }
+    return Ok(Sample{counter: self.counter, held: held})
+}
+pub fn Monitor.poll(&mut self) Result<Sample, string> {
+    return match self.poll_inner() { Ok(s) => Ok(s)
+        Err(e) => { self.close()
+            return Err(e) } }
+}
+pub fn Monitor.close(&mut self) {
+    if self.closed { return }
+    unsafe {
+        for device in &self.devices { ignored := close(device.fd) }
+        if self.ready_fd >= 0 { ignored := close(self.ready_fd) }
+    }
+    self.devices = Vec.new()
+    self.ready_fd = -1
+    self.closed = true
+}
+
+// Canal unidireccional de contadores: no admite órdenes ni transmite teclas.
+import "time"
+extern "C" fn clock_gettime(clock i32, out *mut i64) i32
+extern "C" fn write(fd i32, buffer *u8, length usize) isize
+extern "C" fn fcntl(fd i32, operation i32, flags i32) i32
+extern "C" fn fstat(fd i32, buffer *mut u8) i32
+
+fn monotonic_ms() Result<u64, string> {
+    var stamp = [2]i64{0, 0}
+    unsafe {
+        if clock_gettime(1, ffi.slice_mut(&mut stamp)) != 0 || stamp[0] < 0 || stamp[1] < 0 {
+            return Err("No se pudo leer el reloj de actividad")
+        }
+    }
+    return Ok(u64(stamp[0]) * 1000 + u64(stamp[1]) / 1000000)
+}
+
+fn is_fifo(fd i32) bool {
+    // struct stat de Linux x86_64; st_mode está en el desplazamiento 24.
+    var metadata = zeros(144)
+    unsafe {
+        if fstat(fd, ffi.slice_mut(metadata.as_mut_slice())) != 0 { return false }
+    }
+    mode := u32(metadata.at(24)) + u32(metadata.at(25)) * 256
+    return (mode & 0xf000) == 0x1000
+}
+
+// El emisor no bloquea si no hay consumidor: descarta latidos completos; el
+// siguiente contador conserva toda la actividad acumulada. No se pierden eventos.
+pub fn publish(monitor &mut Monitor, fd i32) Result<void, string> {
+    if !is_fifo(fd) { return Err("El contador requiere una tubería de salida") }
+    unsafe {
+        flags := fcntl(fd, 3, 0)
+        if flags < 0 || fcntl(fd, 4, flags | 0x800) < 0 { return Err("No se pudo preparar el canal de actividad") }
+    }
+    for {
+        sample := try monitor.poll()
+        var held = "0"
+        if sample.held { held = "1" }
+        frame := string.from_u64(sample.counter) + " " + held + " " + string.from_u64(try monotonic_ms()) + "\n"
+        var written: isize = -1
+        unsafe { written = write(fd, ffi.slice(frame.bytes()), frame.len()) }
+        if written < 0 && errno() != 11 && errno() != 4 { return Err("Se cerró el consumidor de actividad") }
+        if written >= 0 && usize(written) != frame.len() { return Err("No se pudo enviar un latido completo") }
+        try time.sleep_blocking(time.Duration.milliseconds(20)).map_err(fn(_) string { return "Se interrumpió la vigilancia" })
+    }
+}
+
+pub struct Client { source i32
+    bytes Vec<u8>
+    clock time.Instant
+    last_ms u64
+    fresh bool
+    sample Option<Sample>
+    closed bool }
+pub fn subscribe(path &string) Result<Client, string> {
+    name := ffi.CString.new(path).ok_or("Ruta de actividad no válida")
+    encoded := try name
+    var source: i32 = -1
+    unsafe { source = open(encoded.as_ptr(), 0x800 | 0x80000 | 0x20000) }
+    if source < 0 { return Err("No está activo el monitor de actividad") }
+    if !is_fifo(source) {
+        unsafe { ignored := close(source) }
+        return Err("El canal de actividad no es una tubería")
+    }
+    clock := match time.Instant.now() { Ok(c) => c
+        Err(_) => { unsafe { ignored := close(source) }
+            return Err("No se pudo iniciar el reloj de vigilancia") } }
+    return Ok(Client{source: source, bytes: Vec.new(), clock: clock, last_ms: 0, fresh: false, sample: None, closed: false})
+}
+pub fn Client.fd(&self) i32 { return self.source }
+fn Client.poll_inner(&mut self) Result<Option<Sample>, string> {
+    if self.closed { return Err("La vigilancia de actividad está cerrada") }
+    now := try self.clock.elapsed().map_err(fn(_) string { return "No se pudo comprobar el plazo de vigilancia" })
+    var buffer = zeros(4096)
+    var batches: u32 = 0
+    for {
+        var n: isize = -1
+        unsafe { n = read(self.source, ffi.slice_mut(buffer.as_mut_slice()), buffer.len()) }
+        if n < 0 {
+            code := errno()
+            if code == 11 { break }
+            if code == 4 && batches < 16 { batches = batches + 1
+                continue }
+            return Err("No se pudo leer el estado de actividad")
+        }
+        if n == 0 { return Err("El monitor de actividad se desconectó") }
+        self.bytes.extend_from_slice(&buffer.as_slice()[0..usize(n)])
+        if self.bytes.len() > 65536 { return Err("El monitor envió demasiados datos sin verificar") }
+        batches = batches + 1
+        if batches >= 32 { return Err("El monitor excedió el límite de mensajes") }
+    }
+    var consumed: usize = 0
+    var i: usize = 0
+    for i < self.bytes.len() {
+        if self.bytes.at(i) == 10 {
+            line := string.from_utf8(&self.bytes.as_slice()[consumed..i]).unwrap_or("")
+            parts := string.split(&line, &" ")
+            if parts.len() != 3 { return Err("Respuesta de actividad no válida") }
+            counter := match string.parse_u64(parts.get(0)) { Some(n) => n
+                None => { return Err("Contador de actividad no válido") } }
+            if !parts.get(1).eq(&"0") && !parts.get(1).eq(&"1") { return Err("Estado de pulsación no válido") }
+            match self.sample { Some(previous) => {
+                if counter < previous.counter { return Err("El contador de actividad retrocedió") }
+            }
+                None => {} }
+            stamp := match string.parse_u64(parts.get(2)) { Some(n) => n
+                None => { return Err("Marca temporal de actividad no válida") } }
+            if stamp < self.last_ms { return Err("El reloj del monitor retrocedió") }
+            self.sample = Some(Sample{counter: counter, held: parts.get(1).eq(&"1")})
+            self.last_ms = stamp
+            consumed = i + 1
+        }
+        i = i + 1
+    }
+    if consumed > 0 {
+        var remaining: Vec<u8> = Vec.new()
+        remaining.extend_from_slice(&self.bytes.as_slice()[consumed..])
+        self.bytes = remaining
+    }
+    actual := try monotonic_ms()
+    if self.last_ms > actual { return Err("El monitor envió una marca temporal futura") }
+    if self.sample.is_some() && actual - self.last_ms <= 150 {
+        self.fresh = true
+        return match &self.sample { Some(sample) => Ok(Some(sample))
+            None => Ok(None) }
+    }
+    if self.fresh || now.as_millis() > 1000 { return Err("El monitor de actividad dejó de responder a tiempo") }
+    // Al abrir una FIFO puede haber latidos antiguos: drenarlos no autoriza
+    // acciones. Se exige un latido reciente antes de iniciar la quietud.
+    return Ok(None)
+}
+pub fn Client.poll(&mut self) Result<Option<Sample>, string> {
+    return match self.poll_inner() { Ok(s) => Ok(s)
+        Err(e) => { self.close()
+            return Err(e) } }
+}
+pub fn Client.close(&mut self) {
+    if self.closed { return }
+    unsafe { ignored := close(self.source) }
+    self.closed = true
+    self.bytes = Vec.new()
+}
+
+// Abrir el destino después de abandonar privilegios evita depender de cómo
+// sudo o un terminal redirigen stdout. El destino debe ser una FIFO existente.
+pub fn publish_to(monitor &mut Monitor, path &string) Result<void, string> {
+    encoded := match ffi.CString.new(path) { Some(s) => s
+        None => { return Err("Ruta de actividad no válida") } }
+    var fd: i32 = -1
+    unsafe { fd = open(encoded.as_ptr(), 1 | 0x800 | 0x80000 | 0x20000) }
+    if fd < 0 { return Err("No se pudo abrir el canal privado de actividad") }
+    result := publish(monitor, fd)
+    unsafe { ignored := close(fd) }
+    return result
+}
