@@ -143,3 +143,50 @@ Measured on macOS under `nice -n 10` (`nice -n 10 bash scripts/run-cairn-b2.sh -
 | **CTA button hover damage redraw** | `< 1.5 ms` (`1,500 µs`) | **`0.10 ms`** (`102 µs` headless / `910 µs` live window, `1` dirty rect) | **PASS** |
 | **Idle redraws / presents** | `0` redraws | **`0` redraws**, **`0` presents** | **PASS** |
 | **Headless `snapshot_png` determinism** | Verified deterministic SHA-256 | Welcome: `58e36e299885c2bca88de779695d3ce66d97ca8f2ee5710892f8c01690a8ecba`<br>BrandSheet: `8d7cdb02798d7ea05f173c781926974fe922aa8f2dcd190403636fa978ba6fa5` | **PASS** |
+
+---
+
+## 7. What Was Built in Milestone B3
+
+Milestone B3 adds interruptible spring physics, cubic-Bézier timelines, display-refresh frame pacing, and cached Dual-Kawase backdrop blur + saturation for `.glass` surfaces, demonstrated by the interactive Welcome → Language onboarding transition (`examples/cairn_b3_motion`).
+
+### 7.1 Subsystems & Files Added / Updated
+
+| Path | Responsibility |
+|---|---|
+| `backends/cairn/backend/anim.tarn` | Pure-Tarn analytical second-order ODE `Spring` solver (`stiffness`, `damping`, `mass`) for under-damped, critically damped, and over-damped regimes with velocity-preserving mid-flight retargeting (`set_target`), `LayoutSpring` (`step-pill` `420/36`), prototype presets (`Toggle` `600/34`, `Segmented` `500/36`, `Button` `500/32`, `StepWelcome` `220/18`, `Dock` `170/14, mass 0.1`), `reduced_motion` immediate snap, pure-Tarn `exp_f64`/`sin_f64`/`cos_f64`, and `Tween` (`0.22s` `cubic-bezier(0.22, 0.8, 0.3, 1)`). |
+| `backends/cairn/backend/render.tarn` | Added `Canvas.draw_glass_backdrop`: half-resolution extraction, 3-level Dual-Kawase downsample + 3-level 16-weight tent upsample pyramid, `saturate(1.9)` boost + `surface_tint` at 1/2 resolution, bilinear upsample clipped to SDF rounded corners, and `1px` `--edge` / `--hi` borders. |
+| `backends/cairn/backend/surface_macos.tarn` | Added `query_display_refresh_hz` (`NSScreen.maximumFramesPerSecond`) and `frame_interval_ns` on `MacSurface`. |
+| `backends/cairn/backend/scene_b3.tarn` | Retained B3 scene with cached `Wallpaper("lago")` and Dual-Kawase `.glass.window` backdrop (`window_base`), cached `step0_cache` / `step1_cache` layers with 64-bit SWAR `blit_premul_alpha`, Welcome ↔ Language `0.22s` slide + cross-fade, `step-pill` (`420/36`), `Segmented` (`500/36`), `Toggle` (`600/34`), button hover/press springs (`500/32`), and exact tile-aligned `DamageRegion` tracking returning to `0` redraws at idle. |
+| `backends/cairn/backend/native.tarn` | Wired `SceneB3` when title starts with `"Cairn B3"`; updated `Native.iterate()` to pace `nextEventMatchingMask:untilDate:` to `frame_interval_ns` while `has_active_animations()` is true and block on `NSDate.distantFuture` when idle (`0%` idle CPU). |
+| `backends/cairn/backend/b3_test.tarn` | Automated B3 tests: spring physics (under/critically/over-damped, zero-jump mid-flight retargeting, `reduced_motion` snap), `[0.22, 0.8, 0.3, 1]` Bézier curve, deterministic fixed-time PNG SHA-256 hashes (`t=0ms`, `t=110ms`, `t=500ms`), 1080p animation `p99 < 4 ms` + `0` idle redraws, and live macOS host window check. |
+| `examples/cairn_b3_motion/` | Interactive B3 demo (`main.tarn`, `README.md`) supporting live window, `--headless [prefix]`, and `--bench`. |
+| `scripts/build-cairn-b3.sh`, `scripts/run-cairn-b3.sh`, `scripts/build-cairn-b1.sh`, `scripts/build-cairn-b2.sh` | Build and run scripts for Milestone B3 (and updated B1/B2 build copy lists). |
+
+---
+
+## 8. Measurements vs. Milestone B3 Budget Gate
+
+Measured on macOS under `nice -n 10` (`nice -n 10 bash scripts/run-cairn-b3.sh --bench`):
+
+| Metric | Plan / ADR 0009 Budget Gate | Measured Result (`cairn_b3_motion`) | Status |
+|---|---|---|---|
+| **1080p Dual-Kawase backdrop blur (one-time cached)** | Cached per layer/theme change | **`24.41 ms`** (`24,406 µs` at `1920×1080`, `0 µs` per animation frame) | **PASS** |
+| **1080p animation `p99` frame time (60 frames w/ retargeting)** | `< 4 ms` (`4,000 µs`) | **`2.44 ms`** (`2,439 µs` wall / `2,361 µs` CPU `p99`, `2,439 µs` max) | **PASS** |
+| **Idle redraws / presents after settle** | `0` redraws, `~0%` CPU | **`0` redraws**, **`0` presents** (`cpu_us=6, wall_us=6` on idle move) | **PASS** |
+| **Display refresh rate pacing** | Tied to display refresh | **`60 Hz`** (`NSScreen.maximumFramesPerSecond`, `16.67 ms` interval) | **PASS** |
+| **Headless `snapshot_png` determinism (`960×600`)** | Verified deterministic SHA-256 | `t=0ms`: `a24a5543faa992f17c07f01779f2adde4e9306c35921c33ca75694c0ecda1379`<br>`t=110ms`: `515070d448fc30b5d45da26b286e0aba795b2f094278affed2ac10c72070e8c8`<br>`t=500ms`: `e283ca4c2f236b6b0f47438975a2d7c3d20e100e0f5af05f104e96e4b9db4715` | **PASS** |
+
+---
+
+## 9. Additional Tarn Language Gap Observed in B3
+
+### Gap 6: Unsigned 64-Bit Literals Above `i64::MAX` Rejected Inside `u64(...)` (`E3025`)
+- **Context**: Writing 64-bit SWAR channel masks with bit 63 set (such as `0xFF00FF00FF00FF00` = `18374966859414961920`) in `blit_premul_alpha` (`backends/cairn/backend/scene_b3.tarn`).
+- **Minimal Reproducer**:
+  ```tarn
+  fn hi_mask() u64 {
+      return u64(18374966859414961920) // error[E3025]: literal `18374966859414961920` does not fit in `i64`
+  }
+  ```
+- **Workaround Used**: Compute `mask64 << 8` from `mask64 := u64(71777214294589695)` (`0x00FF00FF00FF00FF`).

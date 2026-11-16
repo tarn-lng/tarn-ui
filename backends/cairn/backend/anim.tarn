@@ -1,0 +1,305 @@
+// Pure-Tarn Interruptible Animation System (`anim.tarn`) — Milestone B3:
+// - Analytical second-order ODE spring solver (`stiffness`, `damping`, `mass`)
+//   supporting under-damped, critically damped, and over-damped regimes with
+//   zero-jump mid-flight retargeting (preserving position and velocity).
+// - Cubic-Bézier timeline evaluator (`[0.22, 0.8, 0.3, 1]` for 0.22s step transitions).
+// - Shared-layout rectangle morph (`LayoutSpring`) for `step-pill` and `Segmented` pills.
+// - Reduced-motion support (`reduced_motion = true` snaps to target in one step).
+
+const LN2 f64 = 0.69314718055994530942
+const INV_LN2 f64 = 1.44269504088896340736
+const PI f64 = 3.14159265358979323846
+const TWO_PI f64 = 6.28318530717958647693
+
+// Pure-Tarn `exp(x)` using range reduction `x = k * ln(2) + r` (`|r| <= ln(2)/2`)
+// and a degree-9 Horner polynomial on `r`, scaled by `2^k`.
+pub fn exp_f64(x f64) f64 {
+    if x < -700.0 { return 0.0 }
+    if x > 700.0 { return 1.0e304 }
+    kf := (x * INV_LN2) + 0.5
+    var k = i32(kf)
+    if kf < 0.0 { k = i32(x * INV_LN2 - 0.5) }
+    r := x - f64(k) * LN2
+
+    // Horner evaluation of 1 + r + r^2/2! + ... + r^9/9!
+    var p = 1.0 / 362880.0
+    p = 1.0 / 40320.0 + r * p
+    p = 1.0 / 5040.0 + r * p
+    p = 1.0 / 720.0 + r * p
+    p = 1.0 / 120.0 + r * p
+    p = 1.0 / 24.0 + r * p
+    p = 1.0 / 6.0 + r * p
+    p = 0.5 + r * p
+    p = 1.0 + r * p
+    p = 1.0 + r * p
+
+    if k > 0 {
+        var i: i32 = 0
+        for i < k {
+            p = p * 2.0
+            i = i + 1
+        }
+    } else if k < 0 {
+        var i: i32 = 0
+        neg_k := 0 - k
+        for i < neg_k {
+            p = p * 0.5
+            i = i + 1
+        }
+    }
+    return p
+}
+
+pub fn sin_f64(rad f64) f64 {
+    var x = rad
+    for x > PI { x = x - TWO_PI }
+    for x < 0.0 - PI { x = x + TWO_PI }
+    x2 := x * x
+    return x * (1.0 - x2 / 6.0 * (1.0 - x2 / 20.0 * (1.0 - x2 / 42.0 * (1.0 - x2 / 72.0))))
+}
+
+pub fn cos_f64(rad f64) f64 {
+    var x = rad
+    for x > PI { x = x - TWO_PI }
+    for x < 0.0 - PI { x = x + TWO_PI }
+    x2 := x * x
+    return 1.0 - x2 * 0.5 * (1.0 - x2 / 12.0 * (1.0 - x2 / 30.0 * (1.0 - x2 / 56.0 * (1.0 - x2 / 90.0))))
+}
+
+// Analytical second-order spring matching Framer Motion `(stiffness, damping, mass)`.
+pub struct Spring {
+    pub stiffness f64
+    pub damping f64
+    pub mass f64
+    pub pos f64
+    pub vel f64
+    pub target f64
+    pub active bool
+    pub rest_eps f64
+    pub vel_eps f64
+}
+
+pub fn Spring.new(initial f64, stiffness f64, damping f64, mass f64, rest_eps f64) Spring {
+    return Spring {
+        stiffness: stiffness,
+        damping: damping,
+        mass: mass,
+        pos: initial,
+        vel: 0.0,
+        target: initial,
+        active: false,
+        rest_eps: rest_eps,
+        vel_eps: rest_eps * 10.0,
+    }
+}
+
+// Prototype spring presets from `desktop-spec.md` §1.12
+pub fn spring_toggle(initial f64) Spring { return Spring.new(initial, 600.0, 34.0, 1.0, 0.001) }
+pub fn spring_segmented(initial f64) Spring { return Spring.new(initial, 500.0, 36.0, 1.0, 0.01) }
+pub fn spring_sidebar(initial f64) Spring { return Spring.new(initial, 420.0, 36.0, 1.0, 0.01) }
+pub fn spring_button(initial f64) Spring { return Spring.new(initial, 500.0, 32.0, 1.0, 0.001) }
+pub fn spring_welcome_mark(initial f64) Spring { return Spring.new(initial, 220.0, 18.0, 1.0, 0.001) }
+pub fn spring_dock(initial f64) Spring { return Spring.new(initial, 170.0, 14.0, 0.1, 0.01) }
+
+// Interruptibly retargets the spring while preserving current position and velocity.
+pub fn Spring.set_target(&mut self, new_target f64) {
+    self.target = new_target
+    if (new_target - self.pos).abs() >= self.rest_eps || self.vel.abs() >= self.vel_eps {
+        self.active = true
+    } else {
+        self.pos = new_target
+        self.vel = 0.0
+        self.active = false
+    }
+}
+
+pub fn Spring.snap(&mut self, value f64) {
+    self.pos = value
+    self.target = value
+    self.vel = 0.0
+    self.active = false
+}
+
+// Advances the spring analytically by `dt_s` seconds. Returns `true` if `pos` updated.
+pub fn Spring.advance(&mut self, dt_s f64, reduced_motion bool) bool {
+    if !self.active { return false }
+    if reduced_motion {
+        self.pos = self.target
+        self.vel = 0.0
+        self.active = false
+        return true
+    }
+    if dt_s <= 0.0 { return false }
+    var dt = dt_s
+    if dt > 0.05 { dt = 0.05 }
+
+    m := self.mass
+    k := self.stiffness
+    c := self.damping
+    omega0 := (k / m).sqrt()
+    zeta := c / (2.0 * (k * m).sqrt())
+    y0 := self.pos - self.target
+    v0 := self.vel
+
+    var y = 0.0
+    var v = 0.0
+
+    if zeta < 0.9999 {
+        // Under-damped oscillation
+        omega_d := omega0 * (1.0 - zeta * zeta).sqrt()
+        decay := exp_f64(0.0 - zeta * omega0 * dt)
+        a := y0
+        b := (zeta * omega0 * y0 + v0) / omega_d
+        cos_t := cos_f64(omega_d * dt)
+        sin_t := sin_f64(omega_d * dt)
+        y = decay * (a * cos_t + b * sin_t)
+        v = decay * ((0.0 - zeta * omega0 * a + omega_d * b) * cos_t - (zeta * omega0 * b + omega_d * a) * sin_t)
+    } else if zeta <= 1.0001 {
+        // Critically damped
+        decay := exp_f64(0.0 - omega0 * dt)
+        c1 := y0
+        c2 := v0 + omega0 * y0
+        y = decay * (c1 + c2 * dt)
+        v = decay * (c2 - omega0 * (c1 + c2 * dt))
+    } else {
+        // Over-damped
+        gamma := omega0 * (zeta * zeta - 1.0).sqrt()
+        r1 := 0.0 - omega0 * zeta + gamma
+        r2 := 0.0 - omega0 * zeta - gamma
+        c1 := (v0 - r2 * y0) / (r1 - r2)
+        c2 := y0 - c1
+        e1 := exp_f64(r1 * dt)
+        e2 := exp_f64(r2 * dt)
+        y = c1 * e1 + c2 * e2
+        v = c1 * r1 * e1 + c2 * r2 * e2
+    }
+
+    self.pos = self.target + y
+    self.vel = v
+
+    if y.abs() < self.rest_eps && v.abs() < self.vel_eps {
+        self.pos = self.target
+        self.vel = 0.0
+        self.active = false
+    }
+    return true
+}
+
+// Evaluates a cubic Bézier easing curve `B(u) = (x(u), y(u))` for `t in [0, 1]`.
+pub fn cubic_bezier(p1x f64, p1y f64, p2x f64, p2y f64, t f64) f64 {
+    if t <= 0.0 { return 0.0 }
+    if t >= 1.0 { return 1.0 }
+    ax := 3.0 * p1x - 3.0 * p2x + 1.0
+    bx := 3.0 * p2x - 6.0 * p1x
+    cx := 3.0 * p1x
+
+    // Solve x(u) = t using Newton-Raphson with clamped fallback
+    var u = t
+    var iter: i32 = 0
+    for iter < 6 {
+        xu := ((ax * u + bx) * u + cx) * u
+        err := xu - t
+        if err.abs() < 1.0e-6 { break }
+        dx := (3.0 * ax * u + 2.0 * bx) * u + cx
+        if dx.abs() < 1.0e-6 { break }
+        u = u - err / dx
+        if u < 0.0 { u = 0.0 }
+        if u > 1.0 { u = 1.0 }
+        iter = iter + 1
+    }
+
+    ay := 3.0 * p1y - 3.0 * p2y + 1.0
+    by := 3.0 * p2y - 6.0 * p1y
+    cy := 3.0 * p1y
+    return ((ay * u + by) * u + cy) * u
+}
+
+// Evaluates Framer Motion's `ease: [0.22, 0.8, 0.3, 1]` used for step transitions.
+pub fn ease_cairn_step(t f64) f64 {
+    return cubic_bezier(0.22, 0.8, 0.3, 1.0, t)
+}
+
+// Interruptible cubic-Bézier tween timeline (`0.0 -> 1.0`).
+pub struct Tween {
+    pub elapsed_s f64
+    pub duration_s f64
+    pub active bool
+    pub progress f64
+    pub eased f64
+}
+
+pub fn Tween.new(duration_s f64) Tween {
+    return Tween {
+        elapsed_s: duration_s,
+        duration_s: duration_s,
+        active: false,
+        progress: 1.0,
+        eased: 1.0,
+    }
+}
+
+pub fn Tween.start(&mut self) {
+    self.elapsed_s = 0.0
+    self.progress = 0.0
+    self.eased = 0.0
+    self.active = true
+}
+
+pub fn Tween.advance(&mut self, dt_s f64, reduced_motion bool) bool {
+    if !self.active { return false }
+    if reduced_motion || self.duration_s <= 0.0 {
+        self.elapsed_s = self.duration_s
+        self.progress = 1.0
+        self.eased = 1.0
+        self.active = false
+        return true
+    }
+    if dt_s <= 0.0 { return false }
+    self.elapsed_s = self.elapsed_s + dt_s
+    if self.elapsed_s >= self.duration_s {
+        self.elapsed_s = self.duration_s
+        self.progress = 1.0
+        self.eased = 1.0
+        self.active = false
+    } else {
+        self.progress = self.elapsed_s / self.duration_s
+        self.eased = ease_cairn_step(self.progress)
+    }
+    return true
+}
+
+// Shared-layout (`layoutId`) animated rectangle (`x, y, w, h`) using 4 coupled springs.
+pub struct LayoutSpring {
+    pub x Spring
+    pub y Spring
+    pub w Spring
+    pub h Spring
+}
+
+pub fn LayoutSpring.new(x f64, y f64, w f64, h f64, stiffness f64, damping f64) LayoutSpring {
+    return LayoutSpring {
+        x: Spring.new(x, stiffness, damping, 1.0, 0.05),
+        y: Spring.new(y, stiffness, damping, 1.0, 0.05),
+        w: Spring.new(w, stiffness, damping, 1.0, 0.05),
+        h: Spring.new(h, stiffness, damping, 1.0, 0.05),
+    }
+}
+
+pub fn LayoutSpring.set_target(&mut self, x f64, y f64, w f64, h f64) {
+    self.x.set_target(x)
+    self.y.set_target(y)
+    self.w.set_target(w)
+    self.h.set_target(h)
+}
+
+pub fn LayoutSpring.is_active(&self) bool {
+    return self.x.active || self.y.active || self.w.active || self.h.active
+}
+
+pub fn LayoutSpring.advance(&mut self, dt_s f64, reduced_motion bool) bool {
+    c0 := self.x.advance(dt_s, reduced_motion)
+    c1 := self.y.advance(dt_s, reduced_motion)
+    c2 := self.w.advance(dt_s, reduced_motion)
+    c3 := self.h.advance(dt_s, reduced_motion)
+    return c0 || c1 || c2 || c3
+}

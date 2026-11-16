@@ -1,0 +1,864 @@
+// Retained Scene for Milestone B3 (`scene_b3.tarn`):
+// - Cached `Wallpaper("lago")` layer + Dual-Kawase `blur(38px) saturate(1.9)`
+//   cached `.glass.window` backdrop (`window_base`).
+// - Onboarding step transition (`Step 0: Bienvenida` <-> `Step 1: Idioma y región`)
+//   with `0.22s` `cubic-bezier(0.22, 0.8, 0.3, 1)` slide + cross-fade, interruptible
+//   `step-pill` shared-layout spring (`420/36`), `Segmented` sliding pill (`500/36`),
+//   `Toggle` knob spring (`600/34`), and button hover/press springs (`500/32`).
+// - Exact tile-aligned `DamageRegion` tracking during animation: only the union of
+//   previous and current animating bounds is redrawn, returning to 0 redraws at idle.
+import "ffi"
+import "backend/damage"
+import "backend/render"
+import "backend/text"
+import "backend/icons"
+import "backend/anim"
+import "backend/png"
+import "backend/objc"
+
+pub const ITEM_NONE i32 = -1
+pub const ITEM_SIDEBAR_0 i32 = 0
+pub const ITEM_SIDEBAR_1 i32 = 1
+pub const ITEM_BTN_BACK i32 = 2
+pub const ITEM_BTN_PRIMARY i32 = 3
+pub const ITEM_SEG_24H i32 = 4
+pub const ITEM_SEG_12H i32 = 5
+pub const ITEM_TOGGLE_AUTO i32 = 6
+pub const ITEM_MARK_CARD i32 = 7
+
+pub struct SceneB3 {
+    pub width i32
+    pub height i32
+    pub scale i32
+    pub dark bool
+    pub accent_idx u32
+    pub transparency u32
+    pub palette render.ThemePalette
+    pub frame render.Canvas
+    pub wallpaper render.Canvas
+    pub window_base render.Canvas
+    pub mark_cache render.Canvas
+    pub step0_cache render.Canvas
+    pub step1_cache render.Canvas
+    pub step_caches_valid bool
+    pub welcome_para text.ParagraphLayout
+    pub window_shadow render.NineSliceShadow
+    pub damage damage.DamageRegion
+    pub fonts text.FontPair
+    pub atlas text.GlyphAtlas
+
+    // Layout geometry
+    pub win_rect damage.Rect
+    pub sidebar_rect damage.Rect
+    pub content_rect damage.Rect
+    pub step0_rect damage.Rect
+    pub step1_rect damage.Rect
+    pub btn_back_bounds damage.Rect
+    pub btn_primary_bounds damage.Rect
+    pub seg_bounds damage.Rect
+    pub toggle_bounds damage.Rect
+    pub mark_bounds damage.Rect
+
+    // Interactive & animation state
+    pub step i32
+    pub prev_step i32
+    pub step_dir f64
+    pub time_24h bool
+    pub auto_tz bool
+    pub reduced_motion bool
+    pub hovered_id i32
+    pub pressed_id i32
+
+    pub step_tween anim.Tween
+    pub step_pill anim.LayoutSpring
+    pub seg_pill anim.Spring
+    pub toggle_knob anim.Spring
+    pub hover_primary anim.Spring
+    pub press_primary anim.Spring
+    pub hover_back anim.Spring
+    pub press_back anim.Spring
+    pub mark_hover anim.Spring
+
+    // Previous dirty bounds for exact damage union
+    pub prev_pill_rect damage.Rect
+
+    // Timings & telemetry
+    pub first_frame_ns u64
+    pub blur_ns u64
+    pub frames_rendered u64
+    pub tiles_rendered u64
+}
+
+fn step_pill_rect(s &SceneB3, st i32) damage.Rect {
+    if st == 0 { return s.step0_rect }
+    return s.step1_rect
+}
+
+fn scale_alpha(c render.Color, alpha_f f64) render.Color {
+    if alpha_f >= 0.999 { return c }
+    if alpha_f <= 0.001 { return render.rgba(c.r, c.g, c.b, 0) }
+    na := u8(f64(c.a) * alpha_f + 0.5)
+    return render.rgba(c.r, c.g, c.b, na)
+}
+
+fn scale_rect(r damage.Rect, sc f64) damage.Rect {
+    if (sc - 1.0).abs() < 0.0005 { return r }
+    nw := i32(f64(r.w) * sc + 0.5)
+    nh := i32(f64(r.h) * sc + 0.5)
+    nx := r.x + (r.w - nw) / 2
+    ny := r.y + (r.h - nh) / 2
+    return damage.rect(nx, ny, nw, nh)
+}
+
+fn expand_rect(r damage.Rect, pad i32) damage.Rect {
+    return damage.rect(r.x - pad, r.y - pad, r.w + pad * 2, r.h + pad * 2)
+}
+
+fn mix_f(c1 render.Color, c2 render.Color, t f64) render.Color {
+    var cl = t
+    if cl < 0.0 { cl = 0.0 }
+    if cl > 1.0 { cl = 1.0 }
+    return render.color_mix(c2, u32(cl * 100.0 + 0.5), c1)
+}
+
+fn draw_solid_rrect(c &mut render.Canvas, bounds damage.Rect, fill render.Color, border render.Color, hi render.Color, r f64, bw f64, clip damage.Rect) {
+    c.draw_rrect(bounds, render.RRectStyle {
+        fill_top: fill,
+        fill_bottom: fill,
+        border_color: border,
+        inner_hi: hi,
+        radii: render.uniform_radii(r),
+        border_width: bw,
+    }, clip)
+}
+
+pub fn SceneB3.new(width i32, height i32, scale i32) SceneB3 {
+    t0 := objc.monotonic_ns()
+    s := f64(scale)
+    pal := render.theme_palette(true, 5527510, 45) // #5457d6 Cairn Indigo
+    fonts := match text.load_cairn_fonts() {
+        Ok(fp) => fp
+        Err(code) => { panic("SceneB3 load_cairn_fonts failed: " + code.to_string()) }
+    }
+    var atlas = text.GlyphAtlas.new(512, 512)
+
+    var wp = render.Canvas.new(width, height, scale)
+    wp.render_wallpaper_lago()
+
+    var w_base = render.Canvas.new(width, height, scale)
+    full := damage.rect(0, 0, width, height)
+    w_base.blit_from(&wp, full)
+
+    // Window geometry (centered, matching SetupWindow)
+    var win_w = i32(860.0 * s)
+    var win_h = i32(526.0 * s)
+    if win_w > width - 48 { win_w = width - 48 }
+    if win_h > height - 44 { win_h = height - 44 }
+    win_x := (width - win_w) / 2
+    win_y := (height - win_h) / 2
+    win_rect := damage.rect(win_x, win_y, win_w, win_h)
+
+    win_shadow := render.NineSliceShadow.precompute(26.0 * s, 28.0 * s, 12 * scale, 0, render.rgba(8, 10, 40, 178))
+    w_base.draw_shadow_9slice(win_rect, &win_shadow, full)
+
+    // Dual-Kawase backdrop blur(38px) + saturate(1.9) + glass tint + border + highlight
+    tb0 := objc.monotonic_ns()
+    win_radii := render.uniform_radii(26.0 * s)
+    w_base.draw_glass_backdrop(&wp, win_rect, win_radii, pal.surface, pal.edge, pal.hi, 1.9, full)
+    tb1 := objc.monotonic_ns()
+
+    // Sidebar glass tint (`234px`)
+    side_w := i32(234.0 * s)
+    sidebar_rect := damage.rect(win_x, win_y, side_w, win_h)
+    side_radii := render.Radii { tl: 26.0 * s, tr: 0.0, br: 0.0, bl: 26.0 * s }
+    w_base.draw_rrect(sidebar_rect, render.RRectStyle {
+        fill_top: pal.side,
+        fill_bottom: pal.side,
+        border_color: render.rgba(0, 0, 0, 0),
+        inner_hi: render.rgba(0, 0, 0, 0),
+        radii: side_radii,
+        border_width: 0.0,
+    }, sidebar_rect)
+    draw_solid_rrect(&mut w_base, damage.rect(win_x + side_w, win_y + 1, 1, win_h - 2), pal.line, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 0.0, 0.0, full)
+
+    // Traffic lights
+    tl_y := win_y + i32(20.0 * s)
+    tl_b := render.rgba(0, 0, 0, 56)
+    tl_h := render.rgba(0, 0, 0, 0)
+    draw_solid_rrect(&mut w_base, damage.rect(win_x + i32(20.0 * s), tl_y, 11, 11), render.rgb(255, 95, 87), tl_b, tl_h, 5.5, 1.0, full)
+    draw_solid_rrect(&mut w_base, damage.rect(win_x + i32(38.0 * s), tl_y, 11, 11), render.rgb(254, 188, 46), tl_b, tl_h, 5.5, 1.0, full)
+    draw_solid_rrect(&mut w_base, damage.rect(win_x + i32(56.0 * s), tl_y, 11, 11), render.rgb(40, 200, 64), tl_b, tl_h, 5.5, 1.0, full)
+
+    // Sidebar brand header
+    dl_logo := icons.draw_cairn_logo(&mut w_base, &mut atlas, &fonts.display, f64(win_x) + 18.0 * s, f64(win_y) + 44.0 * s, 26.0 * s, 14.0 * s, 10.0 * s, pal.text, pal.muted, full)
+    var st_cap = text.body_style(10.5 * s, pal.muted, true)
+    st_cap.tracking_em = 0.12
+    d_hdr := text.draw_text_line(&mut w_base, &mut atlas, &fonts.body, &"ONBOARDING · B3", f64(win_x) + 18.0 * s, f64(win_y) + 84.0 * s, 198.0 * s, 0, st_cap, full)
+
+    // Static sidebar step placeholders (steps 2..7)
+    step_x := win_x + i32(12.0 * s)
+    step_w := side_w - i32(24.0 * s)
+    step_h := i32(30.0 * s)
+    step0_rect := damage.rect(step_x, win_y + i32(106.0 * s), step_w, step_h)
+    step1_rect := damage.rect(step_x, win_y + i32(140.0 * s), step_w, step_h)
+    static_names := [6]string{
+        "Apariencia",
+        "Tu cuenta",
+        "Red Wi-Fi",
+        "Aplicaciones",
+        "Privacidad y seguridad",
+        "Todo está listo",
+    }
+    var si: i32 = 2
+    for si < 8 {
+        sy := win_y + i32(106.0 * s) + si * i32(34.0 * s)
+        cy := sy + (step_h - 18) / 2
+        draw_solid_rrect(&mut w_base, damage.rect(step_x + 8, cy, 18, 18), pal.card, pal.line, tl_h, 9.0, 1.0, full)
+        var st_num = text.body_style(10.5 * s, pal.muted, true)
+        st_num.tabular_nums = true
+        dn := text.draw_text_line(&mut w_base, &mut atlas, &fonts.body, &(si + 1).to_string(), f64(step_x + 8), f64(cy + 3), 18.0, 1, st_num, full)
+        st_lbl := text.body_style(12.5 * s, pal.muted, false)
+        dl := text.draw_text_truncated(&mut w_base, &mut atlas, &fonts.body, &static_names[usize(si - 2)], f64(step_x + 32), f64(sy + 7), f64(step_w - 40), 0, st_lbl, full)
+        si = si + 1
+    }
+
+    // Sidebar bottom summary card
+    sum_rect := damage.rect(win_x + i32(14.0 * s), win_y + win_h - i32(106.0 * s), side_w - i32(28.0 * s), i32(92.0 * s))
+    draw_solid_rrect(&mut w_base, sum_rect, pal.card, pal.line, tl_h, 14.0 * s, 1.0, full)
+    d_sum0 := text.draw_text_line(&mut w_base, &mut atlas, &fonts.body, &"Animación en Tarn puro", f64(sum_rect.x + 12), f64(sum_rect.y + 12), f64(sum_rect.w - 24), 0, text.body_style(11.5 * s, pal.text, true), full)
+    d_sum1 := text.draw_text_line(&mut w_base, &mut atlas, &fonts.body, &"Springs 420/36 · 500/36 · 600/34", f64(sum_rect.x + 12), f64(sum_rect.y + 32), f64(sum_rect.w - 24), 0, text.body_style(10.5 * s, pal.muted, false), full)
+    d_sum2 := text.draw_text_line(&mut w_base, &mut atlas, &fonts.body, &"Dual-Kawase + Damage Tiles", f64(sum_rect.x + 12), f64(sum_rect.y + 50), f64(sum_rect.w - 24), 0, text.body_style(10.5 * s, pal.accent_text, false), full)
+    d_sum3 := text.draw_text_line(&mut w_base, &mut atlas, &fonts.body, &"0 redraws en reposo", f64(sum_rect.x + 12), f64(sum_rect.y + 68), f64(sum_rect.w - 24), 0, text.body_style(10.5 * s, pal.muted, false), full)
+
+    // Content region + footer hairline
+    content_x := win_x + side_w + 1
+    content_w := win_w - side_w - 1
+    footer_h := i32(60.0 * s)
+    content_rect := damage.rect(content_x, win_y + 1, content_w, win_h - footer_h - 2)
+    footer_y := win_y + win_h - footer_h
+    draw_solid_rrect(&mut w_base, damage.rect(content_x, footer_y, content_w, 1), pal.line, tl_h, tl_h, 0.0, 0.0, full)
+
+    btn_back_bounds := damage.rect(content_x + i32(28.0 * s), footer_y + i32(12.0 * s), i32(104.0 * s), i32(36.0 * s))
+    btn_primary_bounds := damage.rect(content_x + content_w - i32(178.0 * s), footer_y + i32(12.0 * s), i32(150.0 * s), i32(36.0 * s))
+
+    // Step 0 mark card bounds + pre-rendered mark_cache & welcome_para
+    mark_sz := i32(92.0 * s)
+    mark_bounds := damage.rect(content_x + (content_w - mark_sz) / 2, win_y + i32(42.0 * s), mark_sz, mark_sz)
+    var mark_cache = render.Canvas.new(mark_sz, mark_sz, scale)
+    icons.draw_cairn_mark(&mut mark_cache, 18.0 * s, 18.0 * s, f64(mark_sz) - 36.0 * s, damage.rect(0, 0, mark_sz, mark_sz))
+
+    para_w := f64(content_w - i32(100.0 * s))
+    var st_p_init = text.body_style(13.5 * s, pal.muted, false)
+    st_p_init.line_height = 1.45
+    welcome_para := text.layout_paragraph(&fonts.body,
+        &"Cairn es un sistema operativo experimental construido desde cero sobre un microkernel escrito en Tarn, con animaciones por resortes físicos y desenfoque Dual-Kawase.",
+        para_w, st_p_init)
+
+    // Step 1 interactive bounds
+    form_x := content_x + i32(36.0 * s)
+    form_w := content_w - i32(72.0 * s)
+    seg_bounds := damage.rect(form_x, win_y + i32(246.0 * s), i32(236.0 * s), i32(38.0 * s))
+    toggle_bounds := damage.rect(form_x + form_w - i32(58.0 * s), win_y + i32(242.0 * s), i32(46.0 * s), i32(28.0 * s))
+
+    var frame = render.Canvas.new(width, height, scale)
+    frame.blit_from(&w_base, full)
+
+    var dmg = damage.DamageRegion.new()
+    dmg.add_full(width, height)
+
+    var scene = SceneB3 {
+        width: width,
+        height: height,
+        scale: scale,
+        dark: true,
+        accent_idx: 0,
+        transparency: 45,
+        palette: pal,
+        frame: frame,
+        wallpaper: wp,
+        window_base: w_base,
+        mark_cache: mark_cache,
+        step0_cache: render.Canvas.new(content_rect.w, content_rect.h, scale),
+        step1_cache: render.Canvas.new(content_rect.w, content_rect.h, scale),
+        step_caches_valid: false,
+        welcome_para: welcome_para,
+        window_shadow: win_shadow,
+        damage: dmg,
+        fonts: fonts,
+        atlas: atlas,
+        win_rect: win_rect,
+        sidebar_rect: sidebar_rect,
+        content_rect: content_rect,
+        step0_rect: step0_rect,
+        step1_rect: step1_rect,
+        btn_back_bounds: btn_back_bounds,
+        btn_primary_bounds: btn_primary_bounds,
+        seg_bounds: seg_bounds,
+        toggle_bounds: toggle_bounds,
+        mark_bounds: mark_bounds,
+        step: 0,
+        prev_step: 0,
+        step_dir: 1.0,
+        time_24h: true,
+        auto_tz: true,
+        reduced_motion: false,
+        hovered_id: ITEM_NONE,
+        pressed_id: ITEM_NONE,
+        step_tween: anim.Tween.new(0.22),
+        step_pill: anim.LayoutSpring.new(f64(step0_rect.x), f64(step0_rect.y), f64(step0_rect.w), f64(step0_rect.h), 420.0, 36.0),
+        seg_pill: anim.spring_segmented(0.0),
+        toggle_knob: anim.spring_toggle(1.0),
+        hover_primary: anim.spring_button(0.0),
+        press_primary: anim.spring_button(1.0),
+        hover_back: anim.spring_button(0.0),
+        press_back: anim.spring_button(1.0),
+        mark_hover: anim.spring_welcome_mark(1.0),
+        prev_pill_rect: step0_rect,
+        first_frame_ns: 0,
+        blur_ns: tb1 - tb0,
+        frames_rendered: 0,
+        tiles_rendered: 0,
+    }
+    redrawn := scene.render_damaged()
+    t1 := objc.monotonic_ns()
+    scene.first_frame_ns = t1 - t0
+    return scene
+}
+
+pub fn SceneB3.has_active_animations(&self) bool {
+    return self.step_tween.active ||
+        self.step_pill.is_active() ||
+        self.seg_pill.active ||
+        self.toggle_knob.active ||
+        self.hover_primary.active ||
+        self.press_primary.active ||
+        self.hover_back.active ||
+        self.press_back.active ||
+        self.mark_hover.active
+}
+
+pub fn SceneB3.ensure_step_caches(&mut self) {
+    if self.step_caches_valid { return }
+    cw := self.content_rect.w
+    ch := self.content_rect.h
+    cx0 := self.content_rect.x
+    cy0 := self.content_rect.y
+    full_c := damage.rect(0, 0, cw, ch)
+    // Temporarily render step 0 & step 1 into offscreen caches by offsetting content_rect to (0,0)
+    // Actually we can render directly into self.frame with origin shifted, or draw_step_* into step0_cache/step1_cache
+    // by temporarily swapping self.frame and self.content_rect!
+    orig_cr := self.content_rect
+    orig_win_y := self.win_rect.y
+    orig_mark := self.mark_bounds
+    orig_seg := self.seg_bounds
+    orig_tg := self.toggle_bounds
+
+    self.content_rect = damage.rect(0, 0, cw, ch)
+    self.win_rect.y = orig_win_y - cy0
+    self.mark_bounds = damage.rect(orig_mark.x - cx0, orig_mark.y - cy0, orig_mark.w, orig_mark.h)
+    self.seg_bounds = damage.rect(orig_seg.x - cx0, orig_seg.y - cy0, orig_seg.w, orig_seg.h)
+    self.toggle_bounds = damage.rect(orig_tg.x - cx0, orig_tg.y - cy0, orig_tg.w, orig_tg.h)
+
+    // Render step 0 into step0_cache
+    draw_step_welcome(self.scale, &self.palette, &self.fonts, &mut self.atlas, &mut self.step0_cache,
+        self.content_rect, self.mark_bounds, &self.mark_cache, &self.welcome_para, self.mark_hover.pos,
+        0, 1.0, full_c)
+
+    // Render step 1 into step1_cache
+    draw_step_language(self.scale, &self.palette, &self.fonts, &mut self.atlas, &mut self.step1_cache,
+        self.content_rect, self.win_rect.y, self.seg_bounds, self.toggle_bounds,
+        self.seg_pill.pos, self.toggle_knob.pos, 0, 1.0, full_c)
+
+    self.content_rect = orig_cr
+    self.win_rect.y = orig_win_y
+    self.mark_bounds = orig_mark
+    self.seg_bounds = orig_seg
+    self.toggle_bounds = orig_tg
+    self.step_caches_valid = true
+}
+
+pub fn SceneB3.go_to_step(&mut self, next_step i32) {
+    if next_step == self.step { return }
+    self.ensure_step_caches()
+    self.prev_step = self.step
+    self.step = next_step
+    if next_step > self.prev_step { self.step_dir = 1.0 } else { self.step_dir = -1.0 }
+    self.step_tween.start()
+    target_r := step_pill_rect(self, next_step)
+    self.step_pill.set_target(f64(target_r.x), f64(target_r.y), f64(target_r.w), f64(target_r.h))
+    self.damage.add(expand_rect(self.step0_rect.union(&self.step1_rect), 2), self.width, self.height)
+    self.damage.add(self.content_rect, self.width, self.height)
+    self.damage.add(self.btn_back_bounds, self.width, self.height)
+    self.damage.add(self.btn_primary_bounds, self.width, self.height)
+}
+
+// Advances all active springs & timelines by `dt_s` and records exact damaged rects.
+pub fn SceneB3.step_animations(&mut self, dt_s f64) bool {
+    var any = false
+    rm := self.reduced_motion
+
+    if self.step_tween.advance(dt_s, rm) {
+        self.damage.add(self.content_rect, self.width, self.height)
+        any = true
+    }
+    if self.step_pill.advance(dt_s, rm) {
+        curr := damage.rect(i32(self.step_pill.x.pos + 0.5), i32(self.step_pill.y.pos + 0.5),
+            i32(self.step_pill.w.pos + 0.5), i32(self.step_pill.h.pos + 0.5))
+        self.damage.add(expand_rect(self.prev_pill_rect.union(&curr), 2), self.width, self.height)
+        self.prev_pill_rect = curr
+        any = true
+    }
+    if self.seg_pill.advance(dt_s, rm) {
+        self.step_caches_valid = false
+        self.damage.add(expand_rect(self.seg_bounds, 2), self.width, self.height)
+        self.damage.add(damage.rect(self.content_rect.x + 28, self.seg_bounds.y + 44, self.content_rect.w - 56, 76), self.width, self.height)
+        any = true
+    }
+    if self.toggle_knob.advance(dt_s, rm) {
+        self.step_caches_valid = false
+        self.damage.add(expand_rect(self.toggle_bounds, 4), self.width, self.height)
+        any = true
+    }
+    if self.hover_primary.advance(dt_s, rm) || self.press_primary.advance(dt_s, rm) {
+        self.damage.add(expand_rect(self.btn_primary_bounds, 6), self.width, self.height)
+        any = true
+    }
+    if self.hover_back.advance(dt_s, rm) || self.press_back.advance(dt_s, rm) {
+        self.damage.add(expand_rect(self.btn_back_bounds, 6), self.width, self.height)
+        any = true
+    }
+    if self.mark_hover.advance(dt_s, rm) {
+        self.step_caches_valid = false
+        self.damage.add(expand_rect(self.mark_bounds, 8), self.width, self.height)
+        any = true
+    }
+    return any
+}
+
+fn pt_in(r damage.Rect, x i32, y i32) bool {
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+fn hit_test(s &SceneB3, x i32, y i32) i32 {
+    if pt_in(s.btn_primary_bounds, x, y) { return ITEM_BTN_PRIMARY }
+    if pt_in(s.btn_back_bounds, x, y) { return ITEM_BTN_BACK }
+    if pt_in(s.step0_rect, x, y) { return ITEM_SIDEBAR_0 }
+    if pt_in(s.step1_rect, x, y) { return ITEM_SIDEBAR_1 }
+    if s.step == 0 && pt_in(s.mark_bounds, x, y) { return ITEM_MARK_CARD }
+    if s.step == 1 {
+        if pt_in(s.seg_bounds, x, y) {
+            mid_x := s.seg_bounds.x + s.seg_bounds.w / 2
+            if x < mid_x { return ITEM_SEG_24H }
+            return ITEM_SEG_12H
+        }
+        if pt_in(s.toggle_bounds, x, y) { return ITEM_TOGGLE_AUTO }
+    }
+    return ITEM_NONE
+}
+
+pub fn SceneB3.on_pointer_move(&mut self, x i32, y i32) bool {
+    next := hit_test(self, x, y)
+    if next == self.hovered_id { return false }
+    prev := self.hovered_id
+    self.hovered_id = next
+
+    if prev == ITEM_BTN_PRIMARY || next == ITEM_BTN_PRIMARY {
+        if next == ITEM_BTN_PRIMARY { self.hover_primary.set_target(1.0) } else { self.hover_primary.set_target(0.0) }
+    }
+    if prev == ITEM_BTN_BACK || next == ITEM_BTN_BACK {
+        if next == ITEM_BTN_BACK { self.hover_back.set_target(1.0) } else { self.hover_back.set_target(0.0) }
+    }
+    if prev == ITEM_MARK_CARD || next == ITEM_MARK_CARD {
+        if next == ITEM_MARK_CARD { self.mark_hover.set_target(1.05) } else { self.mark_hover.set_target(1.0) }
+    }
+    return self.has_active_animations()
+}
+
+pub fn SceneB3.on_pointer_down(&mut self, x i32, y i32) bool {
+    hit := hit_test(self, x, y)
+    self.pressed_id = hit
+    if hit == ITEM_BTN_PRIMARY {
+        self.press_primary.set_target(0.97)
+        return true
+    }
+    if hit == ITEM_BTN_BACK {
+        self.press_back.set_target(0.97)
+        return true
+    }
+    return false
+}
+
+pub fn SceneB3.on_pointer_up(&mut self, x i32, y i32) i32 {
+    hit := hit_test(self, x, y)
+    was := self.pressed_id
+    self.pressed_id = ITEM_NONE
+    self.press_primary.set_target(1.0)
+    self.press_back.set_target(1.0)
+    if hit == ITEM_NONE || hit != was { return ITEM_NONE }
+
+    if hit == ITEM_BTN_PRIMARY || hit == ITEM_SIDEBAR_1 {
+        self.go_to_step(1)
+    } else if hit == ITEM_BTN_BACK || hit == ITEM_SIDEBAR_0 {
+        self.go_to_step(0)
+    } else if hit == ITEM_SEG_24H {
+        self.time_24h = true
+        self.seg_pill.set_target(0.0)
+        self.damage.add(expand_rect(self.seg_bounds, 2), self.width, self.height)
+    } else if hit == ITEM_SEG_12H {
+        self.time_24h = false
+        self.seg_pill.set_target(1.0)
+        self.damage.add(expand_rect(self.seg_bounds, 2), self.width, self.height)
+    } else if hit == ITEM_TOGGLE_AUTO {
+        self.auto_tz = !self.auto_tz
+        if self.auto_tz { self.toggle_knob.set_target(1.0) } else { self.toggle_knob.set_target(0.0) }
+        self.damage.add(expand_rect(self.toggle_bounds, 4), self.width, self.height)
+    }
+    return hit
+}
+
+fn blend_px_alpha(dst_p32 *mut u32, idx usize, spx u32, a_fp u32) {
+    s_rb := (((spx & 16711935) * a_fp + 8388736) >> 8) & 16711935
+    s_ga := (((spx >> 8) & 16711935) * a_fp + 8388736) & 4278255360
+    esrc := s_rb | s_ga
+    esa := esrc >> 24
+    if esa == 0 { return }
+    unsafe {
+        p_px := ffi.offset_mut(dst_p32, idx)
+        if esa >= 255 {
+            ffi.write(p_px, esrc)
+        } else {
+            inv := 255 - esa
+            d32 := ffi.read(ffi.to_const(p_px))
+            rb := (((d32 & 16711935) * inv + 8388736) >> 8) & 16711935
+            ga := (((d32 >> 8) & 16711935) * inv + 8388736) & 4278255360
+            ffi.write(p_px, esrc + (rb | ga))
+        }
+    }
+}
+
+fn blit_premul_alpha(dst &mut render.Canvas, src &render.Canvas, dx i32, dy i32, alpha_f f64, clip damage.Rect) {
+    r := damage.rect(dx, dy, src.width, src.height).intersect(&clip).clamp(dst.width, dst.height)
+    if r.is_empty() { return }
+    a_fp_i := i32(alpha_f * 256.0 + 0.5)
+    if a_fp_i <= 0 { return }
+    a_fp := u32(a_fp_i)
+    a_fp64 := u64(a_fp_i)
+    mask64 := u64(71777214294589695)       // 0x00FF00FF00FF00FF
+    round64 := u64(36029346783166592)      // 0x0080008000800080
+    hi_mask64 := mask64 << 8               // 0xFF00FF00FF00FF00
+    dst_base := ffi.vec_mut(&mut dst.pixels)
+    var dst_p32: *mut u32 = ffi.from_address(ffi.address(ffi.to_const(dst_base)))
+    src_base := ffi.vec(&src.pixels)
+    var src_p32: *u32 = ffi.from_address(ffi.address(src_base))
+    var src_p64: *u64 = ffi.from_address(ffi.address(src_base))
+    dw := usize(dst.width)
+    sw := usize(src.width)
+    var py = r.y
+    y_end := r.bottom()
+    row_w := usize(r.w)
+    for py < y_end {
+        sy := py - dy
+        d_row := usize(py) * dw + usize(r.x)
+        s_row := usize(sy) * sw + usize(r.x - dx)
+        var col: usize = 0
+        if ((s_row + col) & 1) != 0 && col < row_w {
+            var spx: u32 = 0
+            unsafe { spx = ffi.read(ffi.offset(src_p32, s_row + col)) }
+            if spx != 0 { blend_px_alpha(dst_p32, d_row + col, spx, a_fp) }
+            col = col + 1
+        }
+        // Fast aligned u64 (2-pixel) skip and SWAR blend when both pixels share alpha
+        var sp64: *u64 = ffi.offset(src_p64, (s_row + col) >> 1)
+        var dp32: *mut u32 = ffi.offset_mut(dst_p32, d_row + col)
+        var dp64: *mut u64 = ffi.from_address(ffi.address(ffi.to_const(dp32)))
+        for col + 2 <= row_w {
+            var pair64: u64 = 0
+            unsafe { pair64 = ffi.read(sp64) }
+            if pair64 != 0 {
+                a0 := (pair64 >> 24) & 255
+                a1 := pair64 >> 56
+                if a0 == a1 {
+                    s_rb := (((pair64 & mask64) * a_fp64 + round64) >> 8) & mask64
+                    s_ga := (((pair64 >> 8) & mask64) * a_fp64 + round64) & hi_mask64
+                    esrc := s_rb | s_ga
+                    esa := esrc >> 56
+                    if esa > 0 {
+                        unsafe {
+                            if esa >= 255 {
+                                ffi.write(dp64, esrc)
+                            } else {
+                                inv64 := u64(255 - esa)
+                                d64 := ffi.read(ffi.to_const(dp64))
+                                d_rb := (((d64 & mask64) * inv64 + round64) >> 8) & mask64
+                                d_ga := (((d64 >> 8) & mask64) * inv64 + round64) & hi_mask64
+                                ffi.write(dp64, esrc + (d_rb | d_ga))
+                            }
+                        }
+                    }
+                } else {
+                    spx0 := u32(pair64 & 4294967295)
+                    spx1 := u32(pair64 >> 32)
+                    if spx0 != 0 { blend_px_alpha(dp32, 0, spx0, a_fp) }
+                    if spx1 != 0 { blend_px_alpha(dp32, 1, spx1, a_fp) }
+                }
+            }
+            sp64 = ffi.offset(sp64, 1)
+            dp32 = ffi.offset_mut(dp32, 2)
+            dp64 = ffi.offset_mut(dp64, 1)
+            col = col + 2
+        }
+        for col < row_w {
+            var spx: u32 = 0
+            unsafe { spx = ffi.read(ffi.offset(src_p32, s_row + col)) }
+            if spx != 0 { blend_px_alpha(dst_p32, d_row + col, spx, a_fp) }
+            col = col + 1
+        }
+        py = py + 1
+    }
+}
+
+fn draw_step_welcome(scale i32, palette &render.ThemePalette, fonts &text.FontPair, atlas &mut text.GlyphAtlas, dst &mut render.Canvas,
+    content_rect damage.Rect, mark_bounds damage.Rect, mark_cache &render.Canvas, welcome_para &text.ParagraphLayout,
+    mark_hover_pos f64, x_off i32, alpha f64, tile damage.Rect) {
+    if alpha <= 0.01 { return }
+    sc := f64(scale)
+    cx := content_rect.x + content_rect.w / 2 + x_off
+    mark_r := scale_rect(damage.rect(mark_bounds.x + x_off, mark_bounds.y, mark_bounds.w, mark_bounds.h), mark_hover_pos)
+    if tile.intersects(&expand_rect(mark_r, 2)) {
+        draw_solid_rrect(dst, mark_r, scale_alpha(palette.card, alpha), scale_alpha(palette.line, alpha), scale_alpha(palette.hi, alpha), 26.0 * sc * mark_hover_pos, 1.0, tile)
+        if (mark_hover_pos - 1.0).abs() < 0.005 {
+            blit_premul_alpha(dst, mark_cache, mark_r.x, mark_r.y, alpha, tile)
+        } else {
+            icons.draw_cairn_mark(dst, f64(mark_r.x) + 18.0 * sc, f64(mark_r.y) + 18.0 * sc, f64(mark_r.w) - 36.0 * sc, tile)
+        }
+    }
+
+    h1_y := mark_bounds.y + mark_bounds.h + i32(20.0 * sc)
+    st_h1 := text.display_style(34.0 * sc, scale_alpha(palette.text, alpha))
+    d1 := text.draw_text_line(dst, atlas, &fonts.display, &"Bienvenido a Cairn",
+        f64(content_rect.x + x_off), f64(h1_y), f64(content_rect.w), 1, st_h1, tile)
+
+    sub_y := h1_y + i32(42.0 * sc)
+    st_sub := text.display_style(18.0 * sc, scale_alpha(palette.accent_text, alpha))
+    d2 := text.draw_text_line(dst, atlas, &fonts.display, &"Tu sistema. Tus reglas.",
+        f64(content_rect.x + x_off), f64(sub_y), f64(content_rect.w), 1, st_sub, tile)
+
+    para_y := sub_y + i32(34.0 * sc)
+    para_w := f64(content_rect.w - i32(100.0 * sc))
+    var st_p = text.body_style(13.5 * sc, scale_alpha(palette.muted, alpha), false)
+    st_p.line_height = 1.45
+    d3 := text.draw_paragraph_layout(dst, atlas, &fonts.body, welcome_para,
+        f64(content_rect.x + i32(50.0 * sc) + x_off), f64(para_y), para_w, 1, st_p, tile)
+
+    // 3 feature chips
+    chips_y := para_y + i32(76.0 * sc)
+    chip_labels := [3]string{"Microkernel en Tarn", "Memoria segura", "A tu manera"}
+    chip_icons := [3]u32{icons.ICON_BOX, icons.ICON_SHIELD_CHECK, icons.ICON_PALETTE}
+    chip_ws := [3]i32{i32(158.0 * sc), i32(138.0 * sc), i32(118.0 * sc)}
+    total_w := chip_ws[0] + chip_ws[1] + chip_ws[2] + i32(16.0 * sc)
+    var cur_x = cx - total_w / 2
+    var ci: usize = 0
+    for ci < 3 {
+        cr := damage.rect(cur_x, chips_y, chip_ws[ci], i32(28.0 * sc))
+        if tile.intersects(&cr) {
+            draw_solid_rrect(dst, cr, scale_alpha(palette.card, alpha), scale_alpha(palette.line, alpha), render.rgba(0, 0, 0, 0), 14.0 * sc, 1.0, tile)
+            ic := icons.draw_icon(dst, atlas, chip_icons[ci], cr.x + 10, cr.y + 6, 14.0 * sc, 2.0, scale_alpha(palette.accent_text, alpha), tile)
+            dc := text.draw_text_line(dst, atlas, &fonts.body, &chip_labels[ci], f64(cr.x + 28), f64(cr.y + 7), f64(cr.w - 34), 0, text.body_style(11.5 * sc, scale_alpha(palette.text, alpha), true), tile)
+        }
+        cur_x = cur_x + chip_ws[ci] + i32(8.0 * sc)
+        ci = ci + 1
+    }
+}
+
+fn draw_step_language(scale i32, palette &render.ThemePalette, fonts &text.FontPair, atlas &mut text.GlyphAtlas, dst &mut render.Canvas,
+    content_rect damage.Rect, win_y i32, seg_bounds damage.Rect, toggle_bounds damage.Rect,
+    seg_pill_pos f64, toggle_knob_pos f64, x_off i32, alpha f64, tile damage.Rect) {
+    if alpha <= 0.01 { return }
+    sc := f64(scale)
+    fx := content_rect.x + i32(36.0 * sc) + x_off
+    fw := content_rect.w - i32(72.0 * sc)
+
+    d_h1 := text.draw_text_line(dst, atlas, &fonts.display, &"Idioma y región",
+        f64(fx), f64(win_y + i32(28.0 * sc)), f64(fw), 0, text.display_style(27.0 * sc, scale_alpha(palette.text, alpha)), tile)
+    d_sub := text.draw_text_line(dst, atlas, &fonts.body, &"Elige tu idioma principal, país, distribución de teclado y formato de hora.",
+        f64(fx), f64(win_y + i32(62.0 * sc)), f64(fw), 0, text.body_style(13.0 * sc, scale_alpha(palette.muted, alpha), false), tile)
+
+    // 3 Select cards
+    labels := [3]string{"Idioma", "Región", "Teclado"}
+    vals := [3]string{"Español", "Colombia", "Latinoamericano"}
+    row_icons := [3]u32{icons.ICON_LANGUAGES, icons.ICON_MAP_PIN, icons.ICON_KEYBOARD}
+    var ri: usize = 0
+    for ri < 3 {
+        ry := win_y + i32(98.0 * sc) + i32(ri) * i32(46.0 * sc)
+        rr := damage.rect(fx, ry, fw, i32(38.0 * sc))
+        if tile.intersects(&rr) {
+            draw_solid_rrect(dst, rr, scale_alpha(palette.card, alpha), scale_alpha(palette.line, alpha), render.rgba(0, 0, 0, 0), 12.0 * sc, 1.0, tile)
+            ic := icons.draw_icon(dst, atlas, row_icons[ri], rr.x + 12, rr.y + 11, 15.0 * sc, 2.0, scale_alpha(palette.accent_text, alpha), tile)
+            dl := text.draw_text_line(dst, atlas, &fonts.body, &labels[ri], f64(rr.x + 36), f64(rr.y + 11), 140.0, 0, text.body_style(13.0 * sc, scale_alpha(palette.muted, alpha), false), tile)
+            dv := text.draw_text_line(dst, atlas, &fonts.body, &vals[ri], f64(rr.x + 180), f64(rr.y + 11), f64(fw - 210), 2, text.body_style(13.0 * sc, scale_alpha(palette.text, alpha), true), tile)
+        }
+        ri = ri + 1
+    }
+
+    // Segmented control (`#seg-hora`: 24 horas / 12 horas) with sliding pill (500/36)
+    seg_r := damage.rect(seg_bounds.x + x_off, seg_bounds.y, seg_bounds.w, seg_bounds.h)
+    if tile.intersects(&seg_r) {
+        draw_solid_rrect(dst, seg_r, scale_alpha(palette.track, alpha), scale_alpha(palette.line, alpha), render.rgba(0, 0, 0, 0), 12.0 * sc, 1.0, tile)
+        half_w := (seg_r.w - 6) / 2
+        pill_x := seg_r.x + 3 + i32(f64(half_w) * seg_pill_pos + 0.5)
+        pill_r := damage.rect(pill_x, seg_r.y + 3, half_w, seg_r.h - 6)
+        draw_solid_rrect(dst, pill_r, scale_alpha(palette.pill, alpha), render.rgba(0, 0, 0, 0), scale_alpha(palette.hi, alpha), 9.0 * sc, 0.0, tile)
+        d_s0 := text.draw_text_line(dst, atlas, &fonts.body, &"24 horas", f64(seg_r.x + 3), f64(seg_r.y + 10), f64(half_w), 1, text.body_style(12.5 * sc, scale_alpha(palette.text, alpha), true), tile)
+        d_s1 := text.draw_text_line(dst, atlas, &fonts.body, &"12 horas", f64(seg_r.x + 3 + half_w), f64(seg_r.y + 10), f64(half_w), 1, text.body_style(12.5 * sc, scale_alpha(palette.text, alpha), true), tile)
+    }
+
+    // Toggle switch (`600/34` spring)
+    tg_r := damage.rect(toggle_bounds.x + x_off, toggle_bounds.y, toggle_bounds.w, toggle_bounds.h)
+    if tile.intersects(&expand_rect(tg_r, 2)) {
+        d_tgl := text.draw_text_line(dst, atlas, &fonts.body, &"Zona automática",
+            f64(tg_r.x - 130), f64(tg_r.y + 6), 122.0, 2, text.body_style(12.5 * sc, scale_alpha(palette.muted, alpha), false), tile)
+        track_col := mix_f(palette.track, palette.accent, toggle_knob_pos)
+        draw_solid_rrect(dst, tg_r, scale_alpha(track_col, alpha), scale_alpha(palette.line, alpha), render.rgba(0, 0, 0, 0), 14.0 * sc, 1.0, tile)
+        knob_travel := f64(tg_r.w - 22 - 6)
+        kx := tg_r.x + 3 + i32(knob_travel * toggle_knob_pos + 0.5)
+        kr := damage.rect(kx, tg_r.y + 3, 22, 22)
+        dst.draw_rrect(kr, render.RRectStyle {
+            fill_top: scale_alpha(render.rgb(255, 255, 255), alpha),
+            fill_bottom: scale_alpha(render.rgb(240, 242, 255), alpha),
+            border_color: render.rgba(0, 0, 0, 30),
+            inner_hi: render.rgba(0, 0, 0, 0),
+            radii: render.uniform_radii(11.0),
+            border_width: 1.0,
+        }, tile)
+    }
+
+    // Live Preview Card
+    prev_r := damage.rect(fx, seg_r.y + i32(52.0 * sc), fw, i32(62.0 * sc))
+    if tile.intersects(&prev_r) {
+        draw_solid_rrect(dst, prev_r, scale_alpha(palette.card, alpha), scale_alpha(palette.line, alpha), render.rgba(0, 0, 0, 0), 14.0 * sc, 1.0, tile)
+        d_pl := text.draw_text_line(dst, atlas, &fonts.body, &"Vista previa de fecha y hora",
+            f64(prev_r.x + 14), f64(prev_r.y + 11), f64(prev_r.w - 28), 0, text.body_style(11.5 * sc, scale_alpha(palette.muted, alpha), false), tile)
+        var time_str = "Lunes, 16 de noviembre · 16:12"
+        if seg_pill_pos >= 0.5 { time_str = "Lunes, 16 de noviembre · 4:12 p. m." }
+        var st_pv = text.body_style(15.0 * sc, scale_alpha(palette.text, alpha), true)
+        st_pv.tabular_nums = true
+        d_pv := text.draw_text_line(dst, atlas, &fonts.body, &time_str,
+            f64(prev_r.x + 14), f64(prev_r.y + 32), f64(prev_r.w - 28), 0, st_pv, tile)
+    }
+}
+
+pub fn SceneB3.draw_tile(&mut self, tile damage.Rect) {
+    self.frame.blit_from(&self.window_base, tile)
+    s := f64(self.scale)
+
+    // 1. Sidebar `step-pill` (`420/36` spring) + Step 0 & Step 1 labels
+    if tile.intersects(&self.sidebar_rect) {
+        pill_r := damage.rect(i32(self.step_pill.x.pos + 0.5), i32(self.step_pill.y.pos + 0.5),
+            i32(self.step_pill.w.pos + 0.5), i32(self.step_pill.h.pos + 0.5))
+        if tile.intersects(&pill_r) {
+            draw_solid_rrect(&mut self.frame, pill_r, self.palette.accent_soft, self.palette.line, render.rgba(0, 0, 0, 0), 10.0 * s, 1.0, tile)
+        }
+        names := [2]string{"Bienvenida", "Idioma y región"}
+        rects := [2]damage.Rect{self.step0_rect, self.step1_rect}
+        var i: usize = 0
+        for i < 2 {
+            sr := rects[i]
+            if tile.intersects(&sr) {
+                is_cur := self.step == i32(i)
+                cy := sr.y + (sr.h - 18) / 2
+                var badge_col = self.palette.card
+                var lbl_col = self.palette.muted
+                if is_cur {
+                    badge_col = self.palette.accent
+                    lbl_col = self.palette.text
+                }
+                draw_solid_rrect(&mut self.frame, damage.rect(sr.x + 8, cy, 18, 18), badge_col, self.palette.line, render.rgba(0, 0, 0, 0), 9.0, 1.0, tile)
+                var st_n = text.body_style(10.5 * s, render.rgb(255, 255, 255), true)
+                st_n.tabular_nums = true
+                dn := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &(i32(i) + 1).to_string(), f64(sr.x + 8), f64(cy + 3), 18.0, 1, st_n, tile)
+                dl := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &names[i], f64(sr.x + 32), f64(sr.y + 7), f64(sr.w - 40), 0, text.body_style(12.5 * s, lbl_col, is_cur), tile)
+            }
+            i = i + 1
+        }
+    }
+
+    // 2. Content area (with fast cached step-layer slide + fade)
+    content_clip := self.content_rect.intersect(&tile)
+    if !content_clip.is_empty() {
+        if self.step_tween.active && self.step_caches_valid {
+            eased := self.step_tween.eased
+            out_x := self.content_rect.x + i32(-20.0 * self.step_dir * eased + 0.5)
+            in_x := self.content_rect.x + i32(28.0 * self.step_dir * (1.0 - eased) + 0.5)
+            if self.prev_step == 0 {
+                blit_premul_alpha(&mut self.frame, &self.step0_cache, out_x, self.content_rect.y, 1.0 - eased, content_clip)
+            } else {
+                blit_premul_alpha(&mut self.frame, &self.step1_cache, out_x, self.content_rect.y, 1.0 - eased, content_clip)
+            }
+            if self.step == 0 {
+                blit_premul_alpha(&mut self.frame, &self.step0_cache, in_x, self.content_rect.y, eased, content_clip)
+            } else {
+                blit_premul_alpha(&mut self.frame, &self.step1_cache, in_x, self.content_rect.y, eased, content_clip)
+            }
+        } else if self.step_caches_valid {
+            if self.step == 0 {
+                blit_premul_alpha(&mut self.frame, &self.step0_cache, self.content_rect.x, self.content_rect.y, 1.0, content_clip)
+            } else {
+                blit_premul_alpha(&mut self.frame, &self.step1_cache, self.content_rect.x, self.content_rect.y, 1.0, content_clip)
+            }
+        } else if self.step == 0 {
+            draw_step_welcome(self.scale, &self.palette, &self.fonts, &mut self.atlas, &mut self.frame,
+                self.content_rect, self.mark_bounds, &self.mark_cache, &self.welcome_para, self.mark_hover.pos,
+                0, 1.0, content_clip)
+        } else {
+            draw_step_language(self.scale, &self.palette, &self.fonts, &mut self.atlas, &mut self.frame,
+                self.content_rect, self.win_rect.y, self.seg_bounds, self.toggle_bounds,
+                self.seg_pill.pos, self.toggle_knob.pos, 0, 1.0, content_clip)
+        }
+    }
+
+    // 3. Footer buttons with hover/press springs (`500/32`)
+    back_r := scale_rect(self.btn_back_bounds, self.press_back.pos)
+    if tile.intersects(&back_r) {
+        fill_b := mix_f(self.palette.card, self.palette.card_hover, self.hover_back.pos)
+        var lbl_b = self.palette.muted
+        if self.step == 1 { lbl_b = self.palette.text }
+        draw_solid_rrect(&mut self.frame, back_r, fill_b, self.palette.line, render.rgba(0, 0, 0, 0), 12.0 * s, 1.0, tile)
+        ib := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_ARROW_LEFT, back_r.x + 14, back_r.y + 10, 14.0 * s, 2.0, lbl_b, tile)
+        db := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"Atrás", f64(back_r.x + 34), f64(back_r.y + 10), 60.0, 0, text.body_style(13.0 * s, lbl_b, true), tile)
+    }
+
+    prim_r := scale_rect(self.btn_primary_bounds, self.press_primary.pos)
+    if tile.intersects(&prim_r) {
+        acc_hover := mix_f(self.palette.accent, render.rgb(255, 255, 255), 0.14 * self.hover_primary.pos)
+        self.frame.draw_rrect(prim_r, render.RRectStyle {
+            fill_top: acc_hover,
+            fill_bottom: self.palette.accent,
+            border_color: render.rgba(255, 255, 255, 45),
+            inner_hi: self.palette.hi,
+            radii: render.uniform_radii(12.0 * s),
+            border_width: 1.0,
+        }, tile)
+        var prim_lbl = "Comenzar"
+        if self.step == 1 { prim_lbl = "Continuar" }
+        dp := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &prim_lbl, f64(prim_r.x + 18), f64(prim_r.y + 10), f64(prim_r.w - 48), 1, text.body_style(13.5 * s, render.rgb(255, 255, 255), true), tile)
+        ip := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_ARROW_RIGHT, prim_r.right() - 28, prim_r.y + 10, 14.0 * s, 2.0, render.rgb(255, 255, 255), tile)
+    }
+}
+
+pub fn SceneB3.render_damaged(&mut self) u32 {
+    if self.damage.is_empty() { return 0 }
+    n := self.damage.len()
+    var i: usize = 0
+    for i < n {
+        r := self.damage.at(i)
+        self.draw_tile(r)
+        i = i + 1
+    }
+    self.frames_rendered = self.frames_rendered + 1
+    self.tiles_rendered = self.tiles_rendered + u64(n)
+    return u32(n)
+}
+
+pub fn SceneB3.snapshot_png(&self, path &string) Result<string, i32> {
+    return png.write_bgra_png(path, self.frame.pixels.as_slice(), u32(self.width), u32(self.height))
+}

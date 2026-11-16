@@ -18,7 +18,22 @@ pub struct MacSurface {
     pub logical_w i32
     pub logical_h i32
     pub scale i32
+    pub refresh_hz u32
+    pub frame_interval_ns u64
     pub presents u64
+}
+
+pub fn query_display_refresh_hz(window *mut u8) u32 {
+    var screen = objc.send(window, &"screen")
+    if objc.is_nil(screen) {
+        screen = objc.send(objc.class(&"NSScreen"), &"mainScreen")
+    }
+    if objc.is_nil(screen) { return 60 }
+    fps := objc.number(objc.send(screen, &"maximumFramesPerSecond"))
+    if fps >= 30 && fps <= 240 {
+        return u32(fps)
+    }
+    return 60
 }
 
 pub fn create(window *mut u8, view *mut u8, logical_w i32, logical_h i32) Result<MacSurface, i32> {
@@ -36,6 +51,9 @@ pub fn create(window *mut u8, view *mut u8, logical_w i32, logical_h i32) Result
     objc.tell1(window, &"setAcceptsMouseMovedEvents:", objc.flag(true))
     objc.tell1(layer, &"setContentsGravity:", objc.nsstring(&"kCAGravityResize"))
 
+    hz := query_display_refresh_hz(window)
+    interval_ns := 1000000000 / u64(hz)
+
     var space: *mut u8 = objc.nil()
     unsafe { space = objc.CGColorSpaceCreateDeviceRGB() }
     if objc.is_nil(space) { return Err(5) }
@@ -48,6 +66,8 @@ pub fn create(window *mut u8, view *mut u8, logical_w i32, logical_h i32) Result
         logical_w: logical_w,
         logical_h: logical_h,
         scale: scale,
+        refresh_hz: hz,
+        frame_interval_ns: interval_ns,
         presents: 0,
     })
 }

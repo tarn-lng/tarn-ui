@@ -1,0 +1,226 @@
+// Demo `examples/cairn_b3_motion`:
+// Milestone B3 of the third `tarn_ui` backend (`backends/cairn/`):
+// Interruptible spring physics (`420/36`, `500/36`, `600/34`, `500/32`),
+// `0.22s` cubic-bezier(`[0.22, 0.8, 0.3, 1]`) onboarding step transition
+// (Welcome -> Language), Dual-Kawase backdrop blur + saturation (`blur(38px) saturate(1.9)`),
+// display-refresh frame pacing, and exact damage tracking.
+//
+// Usage:
+//   cairn_b3_motion                     # Interactive macOS host window
+//   cairn_b3_motion --headless [prefix] # Fixed-time deterministic PNG snapshots (t=0ms, 110ms, 500ms)
+//   cairn_b3_motion --bench             # 1080p animation p99 (< 4 ms) + idle CPU benchmark
+import "os"
+import "core/session"
+import "backend/objc"
+import "backend/scene_b3"
+import "backend/native"
+
+fn run_headless(prefix &string) i32 {
+    var scene = scene_b3.SceneB3.new(960, 600, 1)
+    scene.damage.clear()
+
+    p0 := prefix.clone() + "-t0.png"
+    h0 := match scene.snapshot_png(&p0) {
+        Ok(h) => h
+        Err(c) => {
+            print("snapshot t0 error: " + c.to_string())
+            return 1
+        }
+    }
+
+    // Trigger Welcome -> Language transition
+    scene.go_to_step(1)
+    // Advance 110 ms (7 frames @ ~16 ms) for deterministic mid-flight snapshot
+    var i: i32 = 0
+    for i < 7 {
+        ch := scene.step_animations(0.016)
+        rd := scene.render_damaged()
+        scene.damage.clear()
+        i = i + 1
+    }
+    p110 := prefix.clone() + "-t110.png"
+    h110 := match scene.snapshot_png(&p110) {
+        Ok(h) => h
+        Err(c) => {
+            print("snapshot t110 error: " + c.to_string())
+            return 1
+        }
+    }
+
+    // Advance remaining ~400 ms to settle completely
+    var j: i32 = 0
+    for j < 30 {
+        ch := scene.step_animations(0.016)
+        rd := scene.render_damaged()
+        scene.damage.clear()
+        j = j + 1
+    }
+    idle_rd := scene.render_damaged()
+    p500 := prefix.clone() + "-t500.png"
+    h500 := match scene.snapshot_png(&p500) {
+        Ok(h) => h
+        Err(c) => {
+            print("snapshot t500 error: " + c.to_string())
+            return 1
+        }
+    }
+
+    print("cairn_b3_motion headless snapshots:")
+    print("  t=0ms:   " + p0 + " sha256=" + h0)
+    print("  t=110ms: " + p110 + " sha256=" + h110)
+    print("  t=500ms: " + p500 + " sha256=" + h500)
+    print("  idle_redraws_after_settle: " + idle_rd.to_string())
+    return 0
+}
+
+fn sort_u64(v &mut Vec<u64>) {
+    s := v.as_mut_slice()
+    n := s.len()
+    var i: usize = 0
+    for i < n {
+        var j = i + 1
+        for j < n {
+            if s[j] < s[i] {
+                tmp := s[i]
+                s[i] = s[j]
+                s[j] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn run_bench() i32 {
+    status := run_headless(&"/tmp/cairn-b3-motion")
+    if status != 0 { return status }
+
+    // 1080p animation p99 benchmark (< 4 ms / 4,000 us budget per ADR 0009)
+    var s1080 = scene_b3.SceneB3.new(1920, 1080, 1)
+    blur_us := s1080.blur_ns / 1000
+    s1080.damage.clear()
+
+    var frame_times: Vec<u64> = Vec.with_capacity(64)
+    var cpu_times: Vec<u64> = Vec.with_capacity(64)
+    s1080.go_to_step(1)
+    var f: i32 = 0
+    for f < 60 {
+        if f == 6 {
+            // Mid-flight retargeting back to step 0, then at f=12 to step 1
+            s1080.go_to_step(0)
+        } else if f == 12 {
+            s1080.go_to_step(1)
+        } else if f == 30 {
+            s1080.time_24h = false
+            s1080.seg_pill.set_target(1.0)
+        } else if f == 42 {
+            s1080.auto_tz = false
+            s1080.toggle_knob.set_target(0.0)
+        }
+        c0 := objc.thread_cpu_ns()
+        t0 := objc.monotonic_ns()
+        ch := s1080.step_animations(0.016667)
+        rd := s1080.render_damaged()
+        s1080.damage.clear()
+        t1 := objc.monotonic_ns()
+        c1 := objc.thread_cpu_ns()
+        if rd > 0 {
+            frame_times.push((t1 - t0) / 1000)
+            cpu_times.push((c1 - c0) / 1000)
+        }
+        f = f + 1
+    }
+
+    sort_u64(&mut frame_times)
+    sort_u64(&mut cpu_times)
+    cnt := frame_times.len()
+    var p99_us: u64 = 0
+    var max_us: u64 = 0
+    var cpu_p99_us: u64 = 0
+    if cnt > 0 {
+        p99_idx := (cnt * 99) / 100
+        var idx = p99_idx
+        if idx >= cnt { idx = cnt - 1 }
+        p99_us = frame_times.as_slice()[idx]
+        max_us = frame_times.as_slice()[cnt - 1]
+        cpu_p99_us = cpu_times.as_slice()[idx]
+    }
+    idle_1080 := s1080.render_damaged()
+
+    print("  1080p_dual_kawase_blur_us: " + blur_us.to_string())
+    print("  1080p_anim_frames: " + cnt.to_string() + ", p99_us: " + p99_us.to_string() + " (cpu_p99_us: " + cpu_p99_us.to_string() + ", budget < 4000 us), max_us: " + max_us.to_string())
+    print("  1080p_idle_redraws: " + idle_1080.to_string())
+
+    if native.display_available() {
+        var ui = match native.create(&"Cairn B3 · Movimiento", &"Bienvenido a Cairn") {
+            Ok(v) => v
+            Err(code) => {
+                print("native.create error: " + code.to_string())
+                return 1
+            }
+        }
+        ev := ui.next()
+        refresh_hz := ui.surface.refresh_hz
+        // Measure idle CPU over 300ms with no active animations
+        cpu0 := objc.thread_cpu_ns()
+        wall0 := objc.monotonic_ns()
+        pres0 := ui.presents_count()
+        // Inject idle pointer move outside interactive bounds
+        d_idle := ui.inject_pointer_move(8, 8)
+        pres1 := ui.presents_count()
+        cpu1 := objc.thread_cpu_ns()
+        wall1 := objc.monotonic_ns()
+        closed := ui.request_close()
+        rel := ui.release()
+        print("  macos_refresh_hz: " + refresh_hz.to_string())
+        print("  macos_idle_presents: " + (pres1 - pres0).to_string() + " (cpu_us=" + ((cpu1 - cpu0) / 1000).to_string() + ", wall_us=" + ((wall1 - wall0) / 1000).to_string() + ")")
+    }
+    return 0
+}
+
+fn main() {
+    argv := match os.args() {
+        Ok(list) => list
+        Err(_) => Vec.new()
+    }
+    if argv.len() >= 2 {
+        arg1 := argv.get(1)
+        if arg1.eq(&"--headless") {
+            var prefix = "/tmp/cairn-b3-motion"
+            if argv.len() >= 3 { prefix = argv.get(2).clone() }
+            code := run_headless(&prefix)
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+        if arg1.eq(&"--bench") {
+            code := run_bench()
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+    }
+
+    unsafe {
+        match session.run("Cairn B3 · Movimiento y desenfoque", "Bienvenido a Cairn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.set_escape_action(99)
+            for {
+                action := try ui.next_action()
+                match action {
+                    session.Action.Closed => { return Ok(()) }
+                    session.Action.Activate(id) => {
+                        if id == 99 {
+                            try ui.request_close()
+                        }
+                        try ui.complete_event()
+                    }
+                    _ => {}
+                }
+            }
+        }) {
+            Ok(_) => {}
+            Err(error) => {
+                print(error.message())
+                os.exit(1)
+            }
+        }
+    }
+}

@@ -8,9 +8,9 @@ compiler="${TARN_BIN:-$(command -v tarn)}"
 cairn="$root/backends/cairn/backend"
 mkdir -p "$build/source/backend" "$build/source/core"
 cp "$cairn/damage.tarn" "$cairn/render.tarn" "$cairn/png.tarn" \
-   "$cairn/text.tarn" "$cairn/icons.tarn" \
+   "$cairn/text.tarn" "$cairn/icons.tarn" "$cairn/anim.tarn" \
    "$cairn/objc.tarn" "$cairn/surface_macos.tarn" "$cairn/surface_linux.tarn" \
-   "$cairn/scene_b1.tarn" "$cairn/scene_b2.tarn" "$cairn/native.tarn" "$build/source/backend/"
+   "$cairn/scene_b1.tarn" "$cairn/scene_b2.tarn" "$cairn/scene_b3.tarn" "$cairn/native.tarn" "$build/source/backend/"
 cp "$cairn/devtools_off.tarn" "$build/source/backend/devtools.tarn"
 cp "$root/core/session.tarn" "$build/source/core/session.tarn"
 cp "$root/examples/cairn_b1_rects/main.tarn" "$build/source/main.tarn"

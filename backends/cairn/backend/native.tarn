@@ -8,6 +8,7 @@ import "collections"
 import "backend/objc"
 import "backend/scene_b1"
 import "backend/scene_b2"
+import "backend/scene_b3"
 import "backend/surface_macos"
 
 const OPENED usize = 0
@@ -99,6 +100,9 @@ pub struct Native {
     pub scene scene_b1.SceneB1
     pub scene_b2 Vec<scene_b2.SceneB2>
     pub use_b2 bool
+    pub scene_b3 Vec<scene_b3.SceneB3>
+    pub use_b3 bool
+    pub last_anim_ns u64
     title string
     heading string
     counter_enabled bool
@@ -274,6 +278,9 @@ pub fn abi() u32 { return 14 }
 pub fn Native.native_window(&self) *mut u8 { return self.window }
 pub fn Native.first_frame_nanos(&self) u64 { return self.first_frame_ns }
 pub fn Native.frames_rendered(&self) u64 {
+    if self.use_b3 && !self.scene_b3.is_empty() {
+        return self.scene_b3.get(0).frames_rendered
+    }
     if self.use_b2 && !self.scene_b2.is_empty() {
         return self.scene_b2.get(0).frames_rendered
     }
@@ -359,9 +366,17 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
 
     t0 := objc.monotonic_ns()
     is_b2 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B2")
+    is_b3 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B3")
     var scene = scene_b1.SceneB1.new(1, 1, 1)
     var sb2_vec: Vec<scene_b2.SceneB2> = Vec.new()
-    if is_b2 {
+    var sb3_vec: Vec<scene_b3.SceneB3> = Vec.new()
+    if is_b3 {
+        var sb3 = scene_b3.SceneB3.new(w, h, 1)
+        blitted3 := surf.present_damaged(sb3.frame.pixels.as_slice(), w, h, sb3.frame.stride, &sb3.damage)
+        sb3.damage.clear()
+        sb3_vec.push(sb3)
+        scene.damage.clear()
+    } else if is_b2 {
         var sb2 = scene_b2.SceneB2.new(w, h, 1)
         if heading.eq(&"Identidad de marca") {
             sb2.brand_open = true
@@ -395,6 +410,9 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
         scene: scene,
         scene_b2: sb2_vec,
         use_b2: is_b2,
+        scene_b3: sb3_vec,
+        use_b3: is_b3,
+        last_anim_ns: t1,
         title: title.clone(),
         heading: heading.clone(),
         counter_enabled: false,
@@ -439,6 +457,20 @@ fn Native.writable(&self) i32 {
 
 // Re-renders only damaged tiles and presents to the host surface if anything changed.
 pub fn Native.flush_damage(&mut self) u32 {
+    if self.use_b3 && !self.scene_b3.is_empty() {
+        sb3 := self.scene_b3.get_mut(0)
+        if sb3.damage.is_empty() { return 0 }
+        tiles3 := sb3.render_damaged()
+        blitted3 := self.surface.present_damaged(
+            sb3.frame.pixels.as_slice(),
+            self.width,
+            self.height,
+            sb3.frame.stride,
+            &sb3.damage
+        )
+        sb3.damage.clear()
+        return tiles3
+    }
     if self.use_b2 && !self.scene_b2.is_empty() {
         sb2 := self.scene_b2.get_mut(0)
         if sb2.damage.is_empty() { return 0 }
@@ -469,6 +501,12 @@ pub fn Native.flush_damage(&mut self) u32 {
 // Synthetic pointer move injection (in window-local top-left coordinates) for
 // deterministic hover damage benchmarking and testing without OS Accessibility permissions.
 pub fn Native.inject_pointer_move(&mut self, x i32, y i32) u32 {
+    if self.use_b3 && !self.scene_b3.is_empty() {
+        if self.scene_b3.get_mut(0).on_pointer_move(x, y) {
+            return self.flush_damage()
+        }
+        return 0
+    }
     if self.use_b2 && !self.scene_b2.is_empty() {
         if self.scene_b2.get_mut(0).on_pointer_move(x, y) {
             return self.flush_damage()
@@ -483,6 +521,16 @@ pub fn Native.inject_pointer_move(&mut self, x i32, y i32) u32 {
 
 // Synthetic click injection on a B1/B2 card/button or keyed widget.
 pub fn Native.inject_click_at(&mut self, x i32, y i32) u32 {
+    if self.use_b3 && !self.scene_b3.is_empty() {
+        down3 := self.scene_b3.get_mut(0).on_pointer_down(x, y)
+        self.flush_damage()
+        act3 := self.scene_b3.get_mut(0).on_pointer_up(x, y)
+        tiles3 := self.flush_damage()
+        if act3 != scene_b3.ITEM_NONE {
+            enqueue(self.block, 1001 + act3, objc.nil())
+        }
+        return tiles3
+    }
     if self.use_b2 && !self.scene_b2.is_empty() {
         down2 := self.scene_b2.get_mut(0).on_pointer_down(x, y)
         self.flush_damage()
@@ -595,71 +643,112 @@ pub fn Native.iterate(&mut self) {
         objc.objc_autoreleasePoolPop(self.pool)
         self.pool = objc.objc_autoreleasePoolPush()
     }
-    future := objc.send(objc.class(&"NSDate"), &"distantFuture")
+    animating := self.use_b3 && !self.scene_b3.is_empty() && self.scene_b3.get(0).has_active_animations()
+    var until_date = objc.send(objc.class(&"NSDate"), &"distantFuture")
+    if animating {
+        now0 := objc.monotonic_ns()
+        target_ns := self.last_anim_ns + self.surface.frame_interval_ns
+        var wait_s = 0.001
+        if target_ns > now0 {
+            wait_s = f64(target_ns - now0) / 1000000000.0
+            if wait_s < 0.001 { wait_s = 0.001 }
+            if wait_s > 0.02 { wait_s = 0.02 }
+        }
+        until_date = objc.send_f(objc.class(&"NSDate"), &"dateWithTimeIntervalSinceNow:", wait_s, 0.0)
+    }
     event := objc.send4(application, &"nextEventMatchingMask:untilDate:inMode:dequeue:",
-        objc.word(18446744073709551615), future, objc.nsstring(&objc.DEFAULT_MODE), objc.flag(true))
-    if objc.is_nil(event) { return }
-    ev_type := objc.number(objc.send(event, &"type"))
-    if ev_type == objc.EVENT_MOUSE_MOVED || ev_type == objc.EVENT_LEFT_MOUSE_DRAGGED {
-        match parse_event_point(event, self.height) {
-            Some(pt) => {
-                if self.use_b2 && !self.scene_b2.is_empty() {
-                    if self.scene_b2.get_mut(0).on_pointer_move(pt[0], pt[1]) {
+        objc.word(18446744073709551615), until_date, objc.nsstring(&objc.DEFAULT_MODE), objc.flag(true))
+    if !objc.is_nil(event) {
+        ev_type := objc.number(objc.send(event, &"type"))
+        if ev_type == objc.EVENT_MOUSE_MOVED || ev_type == objc.EVENT_LEFT_MOUSE_DRAGGED {
+            match parse_event_point(event, self.height) {
+                Some(pt) => {
+                    if self.use_b3 && !self.scene_b3.is_empty() {
+                        if self.scene_b3.get_mut(0).on_pointer_move(pt[0], pt[1]) {
+                            self.last_anim_ns = objc.monotonic_ns()
+                            self.flush_damage()
+                        }
+                    } else if self.use_b2 && !self.scene_b2.is_empty() {
+                        if self.scene_b2.get_mut(0).on_pointer_move(pt[0], pt[1]) {
+                            self.flush_damage()
+                        }
+                    } else if self.scene.on_pointer_move(pt[0], pt[1]) {
                         self.flush_damage()
                     }
-                } else if self.scene.on_pointer_move(pt[0], pt[1]) {
-                    self.flush_damage()
                 }
+                None => {}
             }
-            None => {}
-        }
-    } else if ev_type == objc.EVENT_LEFT_MOUSE_DOWN {
-        match parse_event_point(event, self.height) {
-            Some(pt) => {
-                if self.use_b2 && !self.scene_b2.is_empty() {
-                    if self.scene_b2.get_mut(0).on_pointer_down(pt[0], pt[1]) {
+        } else if ev_type == objc.EVENT_LEFT_MOUSE_DOWN {
+            match parse_event_point(event, self.height) {
+                Some(pt) => {
+                    if self.use_b3 && !self.scene_b3.is_empty() {
+                        if self.scene_b3.get_mut(0).on_pointer_down(pt[0], pt[1]) {
+                            self.last_anim_ns = objc.monotonic_ns()
+                            self.flush_damage()
+                        }
+                    } else if self.use_b2 && !self.scene_b2.is_empty() {
+                        if self.scene_b2.get_mut(0).on_pointer_down(pt[0], pt[1]) {
+                            self.flush_damage()
+                        }
+                    } else if self.scene.on_pointer_down(pt[0], pt[1]) {
                         self.flush_damage()
                     }
-                } else if self.scene.on_pointer_down(pt[0], pt[1]) {
-                    self.flush_damage()
                 }
+                None => {}
             }
-            None => {}
-        }
-    } else if ev_type == objc.EVENT_LEFT_MOUSE_UP {
-        match parse_event_point(event, self.height) {
-            Some(pt) => {
-                if self.use_b2 && !self.scene_b2.is_empty() {
-                    act2 := self.scene_b2.get_mut(0).on_pointer_up(pt[0], pt[1])
-                    self.flush_damage()
-                    if act2 != scene_b2.ITEM_NONE {
-                        enqueue(self.block, 1001 + act2, objc.nil())
-                    }
-                } else {
-                    act := self.scene.on_pointer_up(pt[0], pt[1])
-                    self.flush_damage()
-                    if act != scene_b1.CARD_NONE {
-                        if self.counter_enabled && act == scene_b1.CARD_BTN_PRIMARY {
-                            enqueue(self.block, 3, objc.nil())
-                        } else {
-                            enqueue(self.block, 1001 + act, objc.nil())
+        } else if ev_type == objc.EVENT_LEFT_MOUSE_UP {
+            match parse_event_point(event, self.height) {
+                Some(pt) => {
+                    if self.use_b3 && !self.scene_b3.is_empty() {
+                        act3 := self.scene_b3.get_mut(0).on_pointer_up(pt[0], pt[1])
+                        self.last_anim_ns = objc.monotonic_ns()
+                        self.flush_damage()
+                        if act3 != scene_b3.ITEM_NONE {
+                            enqueue(self.block, 1001 + act3, objc.nil())
+                        }
+                    } else if self.use_b2 && !self.scene_b2.is_empty() {
+                        act2 := self.scene_b2.get_mut(0).on_pointer_up(pt[0], pt[1])
+                        self.flush_damage()
+                        if act2 != scene_b2.ITEM_NONE {
+                            enqueue(self.block, 1001 + act2, objc.nil())
+                        }
+                    } else {
+                        act := self.scene.on_pointer_up(pt[0], pt[1])
+                        self.flush_damage()
+                        if act != scene_b1.CARD_NONE {
+                            if self.counter_enabled && act == scene_b1.CARD_BTN_PRIMARY {
+                                enqueue(self.block, 3, objc.nil())
+                            } else {
+                                enqueue(self.block, 1001 + act, objc.nil())
+                            }
                         }
                     }
                 }
+                None => {}
             }
-            None => {}
+        } else if ev_type == objc.EVENT_KEY_DOWN {
+            keycode := objc.number(objc.send(event, &"keyCode"))
+            if keycode == 53 && self.escape_action != 0 {
+                enqueue(self.block, 1000 + i32(self.escape_action), objc.nil())
+                return
+            }
         }
-    } else if ev_type == objc.EVENT_KEY_DOWN {
-        keycode := objc.number(objc.send(event, &"keyCode"))
-        if keycode == 53 && self.escape_action != 0 {
-            enqueue(self.block, 1000 + i32(self.escape_action), objc.nil())
-            return
+        if ev_type != objc.EVENT_APPLICATION_DEFINED {
+            objc.tell1(application, &"sendEvent:", event)
+        }
+        objc.tell(application, &"updateWindows")
+    }
+
+    if self.use_b3 && !self.scene_b3.is_empty() && self.scene_b3.get(0).has_active_animations() {
+        now := objc.monotonic_ns()
+        var dt_s = f64(now - self.last_anim_ns) / 1000000000.0
+        if dt_s < 0.001 { dt_s = f64(self.surface.frame_interval_ns) / 1000000000.0 }
+        if dt_s > 0.05 { dt_s = 0.05 }
+        self.last_anim_ns = now
+        if self.scene_b3.get_mut(0).step_animations(dt_s) {
+            self.flush_damage()
         }
     }
-    if ev_type != objc.EVENT_APPLICATION_DEFINED {
-        objc.tell1(application, &"sendEvent:", event)
-    }
-    objc.tell(application, &"updateWindows")
 }
 
 pub fn Native.event_text(&self) Option<string> {
@@ -1309,6 +1398,12 @@ pub fn Native.snapshot_png(&mut self, path &string) i32 {
         Err(failure) => { return failure }
     }
     self.flush_damage()
+    if self.use_b3 && !self.scene_b3.is_empty() {
+        return match self.scene_b3.get(0).snapshot_png(path) {
+            Ok(_) => 0
+            Err(code) => code
+        }
+    }
     if self.use_b2 && !self.scene_b2.is_empty() {
         return match self.scene_b2.get(0).snapshot_png(path) {
             Ok(_) => 0
