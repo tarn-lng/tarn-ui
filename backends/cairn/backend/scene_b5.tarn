@@ -1,0 +1,1014 @@
+// Retained Onboarding Scene for Milestone B5 (`scene_b5.tarn`):
+// Full 9-step Cairn Onboarding Prototype in pure Tarn:
+//   Step 0: Bienvenida (`StepWelcome`)
+//   Step 1: Idioma y región (`StepLanguage`)
+//   Step 2: Apariencia (`StepAppearance` + live `MiniDesktop` preview)
+//   Step 3: Tu cuenta (`StepUser` + `pwScore` + Avatar + ADR 0012 Recovery Key)
+//   Step 4: Red Wi-Fi (`StepWifi` [MOCK])
+//   Step 5: Navegador (`StepBrowser` ADR 0024: 0 preselected, randomized order)
+//   Step 6: Aplicaciones (`StepStore` ADR 0024 Collections [MOCK] + offline gate)
+//   Step 7: Privacidad y seguridad (`StepPrivacy`)
+//   Step 8: Todo está listo (`StepDone`)
+import "backend/damage"
+import "backend/render"
+import "backend/text"
+import "backend/icons"
+import "backend/anim"
+import "backend/theme"
+import "backend/b5_model"
+import "backend/png"
+import "backend/objc"
+
+pub const HIT_NONE i32 = -1
+pub const HIT_BTN_BACK i32 = 10
+pub const HIT_BTN_SKIP i32 = 11
+pub const HIT_BTN_NEXT i32 = 12
+pub const HIT_SIDEBAR_BASE i32 = 100     // 100..108
+pub const HIT_LANG_SEL_BASE i32 = 200    // 200..202
+pub const HIT_LANG_SEG i32 = 203
+pub const HIT_APP_MODE_BASE i32 = 210    // 210..212
+pub const HIT_APP_ACCENT_BASE i32 = 220  // 220..225
+pub const HIT_APP_WP_BASE i32 = 230      // 230..233
+pub const HIT_APP_SLIDER i32 = 240
+pub const HIT_APP_DOCK_BASE i32 = 250    // 250..252
+pub const HIT_USER_FIELD_BASE i32 = 300  // 300=name, 301=user, 302=pw, 303=pw2
+pub const HIT_USER_EYE i32 = 304
+pub const HIT_USER_AUTOLOGIN i32 = 305
+pub const HIT_USER_AVATAR_BASE i32 = 310 // 310..315
+pub const HIT_WIFI_TOGGLE i32 = 400
+pub const HIT_WIFI_NET_BASE i32 = 410    // 410..414
+pub const HIT_WIFI_PW_INP i32 = 420
+pub const HIT_WIFI_PW_JOIN i32 = 421
+pub const HIT_WIFI_PW_CANCEL i32 = 422
+pub const HIT_BROWSER_BASE i32 = 500     // 500..506
+pub const HIT_BROWSER_MORE i32 = 510
+pub const HIT_STORE_GO_WIFI i32 = 600
+pub const HIT_STORE_COL_BASE i32 = 610   // 610..612
+pub const HIT_PRIV_BASE i32 = 700        // 700..704
+
+fn draw_solid(c &mut render.Canvas, bounds damage.Rect, fill render.Color, border render.Color, hi render.Color, r f64, bw f64, clip damage.Rect) {
+    c.draw_rrect(bounds, render.RRectStyle {
+        fill_top: fill,
+        fill_bottom: fill,
+        border_color: border,
+        inner_hi: hi,
+        radii: render.uniform_radii(r),
+        border_width: bw,
+    }, clip)
+}
+
+fn pt_in(r damage.Rect, x i32, y i32) bool {
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+pub struct SceneB5 {
+    pub width i32
+    pub height i32
+    pub scale i32
+    pub headless_safe bool
+    pub model b5_model.OnboardingState
+    pub th theme.Theme
+    pub frame render.Canvas
+    pub wallpaper render.Canvas
+    pub window_base render.Canvas
+    pub mark_cache render.Canvas
+    pub window_shadow render.NineSliceShadow
+    pub damage damage.DamageRegion
+    pub fonts text.FontPair
+    pub atlas text.GlyphAtlas
+
+    pub win_rect damage.Rect
+    pub sidebar_rect damage.Rect
+    pub content_rect damage.Rect
+    pub footer_rect damage.Rect
+    pub btn_back_rect damage.Rect
+    pub btn_skip_rect damage.Rect
+    pub btn_next_rect damage.Rect
+
+    pub step_pill anim.LayoutSpring
+    pub step_tween anim.Tween
+    pub prev_pill_rect damage.Rect
+    pub prev_step i32
+    pub step_dir f64
+
+    pub hovered_hit i32
+    pub focused_field i32 // -1 none, 0=name, 1=user, 2=pw, 3=pw2, 4=wifi_pw
+
+    pub first_frame_ns u64
+    pub frames_rendered u64
+}
+
+fn step_rect_for(win_rect damage.Rect, step i32, scale i32) damage.Rect {
+    s := f64(scale)
+    sx := win_rect.x + i32(12.0 * s)
+    sw := i32(226.0 * s)
+    sh := i32(28.0 * s)
+    sy := win_rect.y + i32(102.0 * s) + step * i32(31.0 * s)
+    return damage.rect(sx, sy, sw, sh)
+}
+
+fn rebuild_b5_base(w_base &mut render.Canvas, wp &render.Canvas, th &theme.Theme,
+    win_rect damage.Rect, win_shadow &render.NineSliceShadow, scale i32) {
+    full := damage.rect(0, 0, w_base.width, w_base.height)
+    w_base.blit_from(wp, full)
+    w_base.draw_shadow_9slice(win_rect, win_shadow, full)
+    s := f64(scale)
+    pal := th.palette
+    w_base.draw_glass_backdrop(wp, win_rect, render.uniform_radii(26.0 * s), pal.surface, pal.edge, pal.hi, 1.9, full)
+
+    side_w := i32(250.0 * s)
+    side_r := damage.rect(win_rect.x, win_rect.y, side_w, win_rect.h)
+    w_base.draw_rrect(side_r, render.RRectStyle {
+        fill_top: pal.side,
+        fill_bottom: pal.side,
+        border_color: render.rgba(0, 0, 0, 0),
+        inner_hi: render.rgba(0, 0, 0, 0),
+        radii: render.Radii { tl: 26.0 * s, tr: 0.0, br: 0.0, bl: 26.0 * s },
+        border_width: 0.0,
+    }, side_r)
+    draw_solid(w_base, damage.rect(win_rect.x + side_w, win_rect.y + 1, 1, win_rect.h - 2), pal.line, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 0.0, 0.0, full)
+
+    // Footer hairline
+    footer_h := i32(58.0 * s)
+    cx := win_rect.x + side_w + 1
+    cw := win_rect.w - side_w - 1
+    draw_solid(w_base, damage.rect(cx, win_rect.bottom() - footer_h, cw, 1), pal.line, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 0.0, 0.0, full)
+
+    // Traffic lights
+    tl_y := win_rect.y + i32(18.0 * s)
+    tl_b := render.rgba(0, 0, 0, 56)
+    tl_h := render.rgba(0, 0, 0, 0)
+    draw_solid(w_base, damage.rect(win_rect.x + i32(18.0 * s), tl_y, 11, 11), th.semantic.tl_close, tl_b, tl_h, 5.5, 1.0, full)
+    draw_solid(w_base, damage.rect(win_rect.x + i32(36.0 * s), tl_y, 11, 11), th.semantic.tl_min, tl_b, tl_h, 5.5, 1.0, full)
+    draw_solid(w_base, damage.rect(win_rect.x + i32(54.0 * s), tl_y, 11, 11), th.semantic.tl_max, tl_b, tl_h, 5.5, 1.0, full)
+}
+
+pub fn SceneB5.new(width i32, height i32, scale i32, shuffle_seed u64, headless_safe bool) SceneB5 {
+    t0 := objc.monotonic_ns()
+    s := f64(scale)
+    model := b5_model.OnboardingState.new(shuffle_seed)
+    th := theme.Theme.new(model.is_dark(), model.accent_idx, model.transparency)
+    fonts := match text.load_cairn_fonts() {
+        Ok(fp) => fp
+        Err(code) => { panic("SceneB5 load_cairn_fonts failed: " + code.to_string()) }
+    }
+    var atlas = text.GlyphAtlas.new(512, 512)
+    var wp = render.Canvas.new(width, height, scale)
+    wp.render_wallpaper_lago()
+
+    var win_w = i32(900.0 * s)
+    var win_h = i32(556.0 * s)
+    if win_w > width - 32 { win_w = width - 32 }
+    if win_h > height - 28 { win_h = height - 28 }
+    win_x := (width - win_w) / 2
+    win_y := (height - win_h) / 2
+    win_rect := damage.rect(win_x, win_y, win_w, win_h)
+
+    win_shadow := render.NineSliceShadow.precompute(26.0 * s, 28.0 * s, 12 * scale, 0, th.semantic.shadow_window)
+    var w_base = render.Canvas.new(width, height, scale)
+    rebuild_b5_base(&mut w_base, &wp, &th, win_rect, &win_shadow, scale)
+
+    side_w := i32(250.0 * s)
+    sidebar_rect := damage.rect(win_x, win_y, side_w, win_h)
+    footer_h := i32(58.0 * s)
+    cx := win_x + side_w + 1
+    cw := win_w - side_w - 1
+    content_rect := damage.rect(cx, win_y + 1, cw, win_h - footer_h - 2)
+    footer_rect := damage.rect(cx, win_y + win_h - footer_h, cw, footer_h)
+
+    btn_back_rect := damage.rect(cx + i32(22.0 * s), footer_rect.y + i32(11.0 * s), i32(96.0 * s), i32(36.0 * s))
+    btn_skip_rect := damage.rect(cx + cw - i32(262.0 * s), footer_rect.y + i32(11.0 * s), i32(96.0 * s), i32(36.0 * s))
+    btn_next_rect := damage.rect(cx + cw - i32(154.0 * s), footer_rect.y + i32(11.0 * s), i32(132.0 * s), i32(36.0 * s))
+
+    mark_sz := i32(84.0 * s)
+    var mark_cache = render.Canvas.new(mark_sz, mark_sz, scale)
+    icons.draw_cairn_mark(&mut mark_cache, 14.0 * s, 14.0 * s, f64(mark_sz) - 28.0 * s, damage.rect(0, 0, mark_sz, mark_sz))
+
+    r0 := step_rect_for(win_rect, 0, scale)
+    var frame = render.Canvas.new(width, height, scale)
+    frame.blit_from(&w_base, damage.rect(0, 0, width, height))
+    var dmg = damage.DamageRegion.new()
+    dmg.add_full(width, height)
+
+    var sc = SceneB5 {
+        width: width,
+        height: height,
+        scale: scale,
+        headless_safe: headless_safe,
+        model: model,
+        th: th,
+        frame: frame,
+        wallpaper: wp,
+        window_base: w_base,
+        mark_cache: mark_cache,
+        window_shadow: win_shadow,
+        damage: dmg,
+        fonts: fonts,
+        atlas: atlas,
+        win_rect: win_rect,
+        sidebar_rect: sidebar_rect,
+        content_rect: content_rect,
+        footer_rect: footer_rect,
+        btn_back_rect: btn_back_rect,
+        btn_skip_rect: btn_skip_rect,
+        btn_next_rect: btn_next_rect,
+        step_pill: anim.LayoutSpring.new(f64(r0.x), f64(r0.y), f64(r0.w), f64(r0.h), 420.0, 36.0),
+        step_tween: anim.Tween.new(0.22),
+        prev_pill_rect: r0,
+        prev_step: 0,
+        step_dir: 1.0,
+        hovered_hit: HIT_NONE,
+        focused_field: -1,
+        first_frame_ns: 0,
+        frames_rendered: 0,
+    }
+    rd := sc.render_damaged()
+    t1 := objc.monotonic_ns()
+    sc.first_frame_ns = t1 - t0
+    return sc
+}
+
+pub fn SceneB5.has_active_animations(&self) bool {
+    return self.step_tween.active || self.step_pill.is_active()
+}
+
+pub fn SceneB5.sync_theme(&mut self) {
+    c0 := self.th.set_dark(self.model.is_dark())
+    c1 := self.th.set_accent(self.model.accent_idx)
+    c2 := self.th.set_transparency(self.model.transparency)
+    if !c0 && !c1 && !c2 { return }
+    self.window_shadow = render.NineSliceShadow.precompute(26.0 * f64(self.scale), 28.0 * f64(self.scale), 12 * self.scale, 0, self.th.semantic.shadow_window)
+    rebuild_b5_base(&mut self.window_base, &self.wallpaper, &self.th, self.win_rect, &self.window_shadow, self.scale)
+    self.damage.add(self.win_rect, self.width, self.height)
+}
+
+pub fn SceneB5.go_to_step(&mut self, next_step i32) {
+    if next_step < 0 || next_step >= b5_model.STEP_COUNT || next_step == self.model.step { return }
+    self.prev_step = self.model.step
+    self.model.step = next_step
+    if next_step > self.model.highest_step { self.model.highest_step = next_step }
+    if next_step > self.prev_step { self.step_dir = 1.0 } else { self.step_dir = -1.0 }
+    self.focused_field = -1
+    self.step_tween.start()
+    tr := step_rect_for(self.win_rect, next_step, self.scale)
+    self.step_pill.set_target(f64(tr.x), f64(tr.y), f64(tr.w), f64(tr.h))
+    self.damage.add(self.sidebar_rect, self.width, self.height)
+    self.damage.add(self.content_rect, self.width, self.height)
+    self.damage.add(self.footer_rect, self.width, self.height)
+}
+
+pub fn SceneB5.step_animations(&mut self, dt_s f64) bool {
+    var any = false
+    if self.step_tween.advance(dt_s, false) {
+        self.damage.add(self.content_rect, self.width, self.height)
+        any = true
+    }
+    if self.step_pill.advance(dt_s, false) {
+        curr := damage.rect(i32(self.step_pill.x.pos + 0.5), i32(self.step_pill.y.pos + 0.5),
+            i32(self.step_pill.w.pos + 0.5), i32(self.step_pill.h.pos + 0.5))
+        self.damage.add(damage.rect(self.sidebar_rect.x, self.prev_pill_rect.y - 4, self.sidebar_rect.w, self.prev_pill_rect.h + 8), self.width, self.height)
+        self.damage.add(damage.rect(self.sidebar_rect.x, curr.y - 4, self.sidebar_rect.w, curr.h + 8), self.width, self.height)
+        self.prev_pill_rect = curr
+        any = true
+    }
+    return any
+}
+
+fn draw_toggle(c &mut render.Canvas, r damage.Rect, on bool, pal render.ThemePalette, clip damage.Rect) {
+    var tcol = pal.track
+    var kx = r.x + 3
+    if on {
+        tcol = pal.accent
+        kx = r.right() - 23
+    }
+    draw_solid(c, r, tcol, pal.line, render.rgba(0, 0, 0, 0), 13.0, 1.0, clip)
+    draw_solid(c, damage.rect(kx, r.y + 3, 20, 20), render.rgb(255, 255, 255), render.rgba(0, 0, 0, 30), render.rgba(0, 0, 0, 0), 10.0, 1.0, clip)
+}
+
+fn draw_step_header(sc &mut SceneB5, title &string, subtitle &string, clip damage.Rect) {
+    s := f64(sc.scale)
+    pal := sc.th.palette
+    fx := sc.content_rect.x + i32(28.0 * s)
+    fw := sc.content_rect.w - i32(56.0 * s)
+    d1 := text.draw_text_line(&mut sc.frame, &mut sc.atlas, &sc.fonts.display, title, f64(fx), f64(sc.win_rect.y + i32(22.0 * s)), f64(fw), 0, text.display_style(24.0 * s, pal.text), clip)
+    d2 := text.draw_text_line(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, subtitle, f64(fx), f64(sc.win_rect.y + i32(52.0 * s)), f64(fw), 0, text.body_style(12.5 * s, pal.muted, false), clip)
+}
+
+fn draw_mini_desktop(sc &mut SceneB5, r damage.Rect, clip damage.Rect) {
+    if !clip.intersects(&r) { return }
+    s := f64(sc.scale)
+    pal := sc.th.palette
+    // Mini wallpaper background tint
+    var bg_top = render.rgb(26, 36, 92)
+    var bg_bot = render.rgb(54, 46, 118)
+    if sc.model.wallpaper_idx == 1 {
+        bg_top = render.rgb(20, 64, 72)
+        bg_bot = render.rgb(34, 96, 86)
+    } else if sc.model.wallpaper_idx == 2 {
+        bg_top = render.rgb(66, 34, 68)
+        bg_bot = render.rgb(122, 66, 56)
+    } else if sc.model.wallpaper_idx == 3 {
+        bg_top = render.rgb(24, 28, 42)
+        bg_bot = render.rgb(44, 52, 76)
+    }
+    sc.frame.draw_rrect(r, render.RRectStyle {
+        fill_top: bg_top,
+        fill_bottom: bg_bot,
+        border_color: pal.line_strong,
+        inner_hi: pal.hi,
+        radii: render.uniform_radii(12.0 * s),
+        border_width: 1.0,
+    }, clip)
+
+    // Topbar in mini desktop
+    if sc.model.dock_style != 1 {
+        tb := damage.rect(r.x + 8, r.y + 6, r.w - 16, 12)
+        draw_solid(&mut sc.frame, tb, pal.surface, pal.edge, pal.hi, 6.0, 1.0, clip)
+    }
+    // Mini window
+    win_x := r.x + if_i32(sc.model.dock_style == 2, 34, 22)
+    mw := damage.rect(win_x, r.y + 26, r.w - 56, r.h - 62)
+    draw_solid(&mut sc.frame, mw, pal.surface, pal.edge, pal.hi, 8.0, 1.0, clip)
+    draw_solid(&mut sc.frame, damage.rect(mw.x + 10, mw.y + 12, 48, 8), pal.accent, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 4.0, 0.0, clip)
+
+    // Dock / Bar
+    if sc.model.dock_style == 0 {
+        dk := damage.rect(r.x + (r.w - 110) / 2, r.bottom() - 24, 110, 18)
+        draw_solid(&mut sc.frame, dk, pal.surface, pal.edge, pal.hi, 8.0, 1.0, clip)
+    } else if sc.model.dock_style == 1 {
+        dk := damage.rect(r.x + 6, r.bottom() - 22, r.w - 12, 16)
+        draw_solid(&mut sc.frame, dk, pal.surface, pal.edge, pal.hi, 6.0, 1.0, clip)
+    } else {
+        dk := damage.rect(r.x + 6, r.y + 24, 20, r.h - 32)
+        draw_solid(&mut sc.frame, dk, pal.surface, pal.edge, pal.hi, 8.0, 1.0, clip)
+    }
+}
+
+fn if_i32(cond bool, a i32, b i32) i32 {
+    if cond { return a }
+    return b
+}
+
+pub fn SceneB5.draw_tile(&mut self, tile damage.Rect) {
+    self.frame.blit_from(&self.window_base, tile)
+    s := f64(self.scale)
+    pal := self.th.palette
+
+    // 1. Sidebar
+    if tile.intersects(&self.sidebar_rect) {
+        dl := icons.draw_cairn_logo(&mut self.frame, &mut self.atlas, &self.fonts.display, f64(self.win_rect.x) + 18.0 * s, f64(self.win_rect.y) + 42.0 * s, 24.0 * s, 13.0 * s, 9.0 * s, pal.text, pal.muted, tile)
+        var st_cap = text.body_style(10.0 * s, pal.muted, true)
+        st_cap.tracking_em = 0.08
+        dp := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &b5_model.ftl_progress(self.model.step), f64(self.win_rect.x) + 18.0 * s, f64(self.win_rect.y) + 80.0 * s, 210.0 * s, 0, st_cap, tile)
+
+        pill_r := damage.rect(i32(self.step_pill.x.pos + 0.5), i32(self.step_pill.y.pos + 0.5), i32(self.step_pill.w.pos + 0.5), i32(self.step_pill.h.pos + 0.5))
+        if tile.intersects(&pill_r) {
+            draw_solid(&mut self.frame, pill_r, pal.accent_soft, pal.line, render.rgba(0, 0, 0, 0), 10.0 * s, 1.0, tile)
+        }
+
+        var si: i32 = 0
+        for si < b5_model.STEP_COUNT {
+            sr := step_rect_for(self.win_rect, si, self.scale)
+            if tile.intersects(&sr) {
+                is_cur := si == self.model.step
+                is_done := si < self.model.step
+                cy := sr.y + (sr.h - 16) / 2
+                var bcol = pal.card
+                var lcol = pal.muted
+                if is_cur {
+                    bcol = pal.accent
+                    lcol = pal.text
+                } else if is_done {
+                    bcol = self.th.semantic.success
+                }
+                draw_solid(&mut self.frame, damage.rect(sr.x + 8, cy, 16, 16), bcol, pal.line, render.rgba(0, 0, 0, 0), 8.0, 1.0, tile)
+                if is_done {
+                    ic := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_CHECK, sr.x + 10, cy + 2, 12.0 * s, 2.0, render.rgb(255, 255, 255), tile)
+                } else {
+                    var st_n = text.body_style(9.5 * s, render.rgb(255, 255, 255), true)
+                    st_n.tabular_nums = true
+                    dn := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &(si + 1).to_string(), f64(sr.x + 8), f64(cy + 2), 16.0, 1, st_n, tile)
+                }
+                nm := b5_model.step_name(si)
+                dl2 := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &nm, f64(sr.x + 30), f64(sr.y + 6), f64(sr.w - 38), 0, text.body_style(12.0 * s, lcol, is_cur), tile)
+            }
+            si = si + 1
+        }
+
+        // Bottom StorageMeter / summary card
+        sum_r := damage.rect(self.win_rect.x + i32(14.0 * s), self.win_rect.bottom() - i32(84.0 * s), i32(222.0 * s), i32(70.0 * s))
+        if tile.intersects(&sum_r) {
+            draw_solid(&mut self.frame, sum_r, pal.card, pal.line, render.rgba(0, 0, 0, 0), 12.0 * s, 1.0, tile)
+            tenths := self.model.storage_tenths_gb()
+            gb_str := (tenths / 10).to_string() + "." + (tenths % 10).to_string() + " GB"
+            d_s0 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"Espacio estimado", f64(sum_r.x + 10), f64(sum_r.y + 10), 120.0, 0, text.body_style(11.0 * s, pal.muted, false), tile)
+            var st_gb = text.body_style(12.0 * s, pal.text, true)
+            st_gb.tabular_nums = true
+            d_s1 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &gb_str, f64(sum_r.x + 130), f64(sum_r.y + 10), 82.0, 2, st_gb, tile)
+            bar_r := damage.rect(sum_r.x + 10, sum_r.y + 34, sum_r.w - 20, 6)
+            draw_solid(&mut self.frame, bar_r, pal.track, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 3.0, 0.0, tile)
+            var fw = (bar_r.w * i32(tenths)) / 140
+            if fw > bar_r.w { fw = bar_r.w }
+            draw_solid(&mut self.frame, damage.rect(bar_r.x, bar_r.y, fw, 6), pal.accent, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 3.0, 0.0, tile)
+            var net_lbl = "Sin conexión"
+            if !self.model.network.is_empty() { net_lbl = self.model.network.clone() }
+            d_s2 := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &net_lbl, f64(sum_r.x + 10), f64(sum_r.y + 48), f64(sum_r.w - 20), 0, text.body_style(10.5 * s, pal.accent_text, false), tile)
+        }
+    }
+
+    // 2. Active step content (with 0.22s slide offset when step_tween.active)
+    c_clip := self.content_rect.intersect(&tile)
+    if !c_clip.is_empty() {
+        var x_off: i32 = 0
+        if self.step_tween.active {
+            x_off = i32(28.0 * self.step_dir * (1.0 - self.step_tween.eased) + 0.5)
+        }
+        self.draw_active_step(x_off, c_clip)
+    }
+
+    // 3. Footer
+    if tile.intersects(&self.footer_rect) {
+        if self.model.step > 0 {
+            draw_solid(&mut self.frame, self.btn_back_rect, pal.card, pal.line, render.rgba(0, 0, 0, 0), 11.0 * s, 1.0, tile)
+            db := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &b5_model.ftl(&"common-back"), f64(self.btn_back_rect.x), f64(self.btn_back_rect.y + 10), f64(self.btn_back_rect.w), 1, text.body_style(13.0 * s, pal.text, true), tile)
+        }
+        if self.model.can_skip() {
+            draw_solid(&mut self.frame, self.btn_skip_rect, pal.card, pal.line, render.rgba(0, 0, 0, 0), 11.0 * s, 1.0, tile)
+            ds := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &b5_model.ftl(&"common-skip"), f64(self.btn_skip_rect.x), f64(self.btn_skip_rect.y + 10), f64(self.btn_skip_rect.w), 1, text.body_style(13.0 * s, pal.muted, true), tile)
+        }
+        if self.model.step == b5_model.STEP_USER && !self.model.user_valid() {
+            hint := self.model.missing_user_hint()
+            dh := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &hint, f64(self.btn_back_rect.right() + 10), f64(self.footer_rect.y + 20), f64(self.btn_next_rect.x - self.btn_back_rect.right() - 20), 0, text.body_style(11.0 * s, self.th.semantic.warning, false), tile)
+        }
+        can_go := self.model.can_continue()
+        var n_fill = pal.accent
+        var n_lbl_col = render.rgb(255, 255, 255)
+        if !can_go {
+            n_fill = pal.track
+            n_lbl_col = pal.muted
+        }
+        var n_lbl = b5_model.ftl(&"common-continue")
+        if self.model.step == b5_model.STEP_WELCOME { n_lbl = b5_model.ftl(&"welcome-cta-start") } else if self.model.step == b5_model.STEP_DONE { n_lbl = b5_model.ftl(&"done-cta-enter") }
+        draw_solid(&mut self.frame, self.btn_next_rect, n_fill, render.rgba(255, 255, 255, 45), pal.hi, 11.0 * s, 1.0, tile)
+        dn := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &n_lbl, f64(self.btn_next_rect.x), f64(self.btn_next_rect.y + 10), f64(self.btn_next_rect.w), 1, text.body_style(13.0 * s, n_lbl_col, true), tile)
+    }
+}
+
+fn SceneB5.draw_active_step(&mut self, x_off i32, clip damage.Rect) {
+    s := f64(self.scale)
+    pal := self.th.palette
+    fx := self.content_rect.x + i32(28.0 * s) + x_off
+    fw := self.content_rect.w - i32(56.0 * s)
+    st := self.model.step
+
+    if st == b5_model.STEP_WELCOME {
+        msz := self.mark_cache.width
+        mr := damage.rect(self.content_rect.x + (self.content_rect.w - msz) / 2 + x_off, self.win_rect.y + i32(50.0 * s), msz, msz)
+        draw_solid(&mut self.frame, mr, pal.card, pal.line, pal.hi, 24.0 * s, 1.0, clip)
+        icons.draw_cairn_mark(&mut self.frame, f64(mr.x) + 14.0 * s, f64(mr.y) + 14.0 * s, f64(msz) - 28.0 * s, clip)
+        d1 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.display, &b5_model.ftl(&"welcome-heading"), f64(self.content_rect.x + x_off), f64(mr.bottom() + 20), f64(self.content_rect.w), 1, text.display_style(32.0 * s, pal.text), clip)
+        d2 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.display, &b5_model.ftl(&"brand-slogan"), f64(self.content_rect.x + x_off), f64(mr.bottom() + 60), f64(self.content_rect.w), 1, text.display_style(17.0 * s, pal.accent_text), clip)
+        para := text.layout_paragraph(&self.fonts.body, &b5_model.ftl(&"welcome-body"), f64(fw - 40), text.body_style(13.0 * s, pal.muted, false))
+        d3 := text.draw_paragraph_layout(&mut self.frame, &mut self.atlas, &self.fonts.body, &para, f64(fx + 20), f64(mr.bottom() + 94), f64(fw - 40), 1, text.body_style(13.0 * s, pal.muted, false), clip)
+        return
+    }
+
+    if st == b5_model.STEP_LANGUAGE {
+        draw_step_header(self, &b5_model.ftl(&"step-language-name"), &b5_model.ftl(&"step-language-subtitle"), clip)
+        langs := [5]string{"Español", "English", "Português", "Français", "Deutsch"}
+        regs := [8]string{"Colombia", "México", "Argentina", "Chile", "Perú", "España", "Estados Unidos", "Brasil"}
+        kbds := [5]string{"Latinoamericano", "Español (España)", "Inglés (EE. UU.)", "Inglés internacional", "Portugués (Brasil)"}
+        labels := [3]string{"Idioma del sistema", "Región", "Distribución de teclado"}
+        vals := [3]string{langs[usize(self.model.lang_idx % 5)].clone(), regs[usize(self.model.region_idx % 8)].clone(), kbds[usize(self.model.kbd_idx % 5)].clone()}
+        var ri: usize = 0
+        for ri < 3 {
+            rr := damage.rect(fx, self.win_rect.y + i32(96.0 * s) + i32(ri) * 46, fw, 38)
+            draw_solid(&mut self.frame, rr, pal.card, pal.line, render.rgba(0, 0, 0, 0), 12.0 * s, 1.0, clip)
+            dl := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &labels[ri], f64(rr.x + 14), f64(rr.y + 11), 200.0, 0, text.body_style(12.5 * s, pal.muted, false), clip)
+            dv := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &vals[ri], f64(rr.x + 220), f64(rr.y + 11), f64(fw - 236), 2, text.body_style(12.5 * s, pal.text, true), clip)
+            ri = ri + 1
+        }
+        seg_r := damage.rect(fx, self.win_rect.y + 242, 236, 36)
+        draw_solid(&mut self.frame, seg_r, pal.track, pal.line, render.rgba(0, 0, 0, 0), 11.0 * s, 1.0, clip)
+        hw := (seg_r.w - 6) / 2
+        px := seg_r.x + 3 + if_i32(!self.model.time_24h, hw, 0)
+        draw_solid(&mut self.frame, damage.rect(px, seg_r.y + 3, hw, seg_r.h - 6), pal.pill, render.rgba(0, 0, 0, 0), pal.hi, 8.0 * s, 0.0, clip)
+        ds0 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"24 horas", f64(seg_r.x + 3), f64(seg_r.y + 9), f64(hw), 1, text.body_style(12.0 * s, pal.text, true), clip)
+        ds1 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"12 horas", f64(seg_r.x + 3 + hw), f64(seg_r.y + 9), f64(hw), 1, text.body_style(12.0 * s, pal.text, true), clip)
+
+        prev_r := damage.rect(fx, 292 + self.win_rect.y, fw, 62)
+        draw_solid(&mut self.frame, prev_r, pal.card, pal.line, render.rgba(0, 0, 0, 0), 12.0 * s, 1.0, clip)
+        dp0 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"Así verás la fecha y la hora", f64(prev_r.x + 14), f64(prev_r.y + 10), f64(prev_r.w - 28), 0, text.body_style(11.5 * s, pal.muted, false), clip)
+        var tstr = "Lunes, 16 de noviembre · 18:45"
+        if !self.model.time_24h { tstr = "Lunes, 16 de noviembre · 6:45 p. m." }
+        dp1 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &tstr, f64(prev_r.x + 14), f64(prev_r.y + 32), f64(prev_r.w - 28), 0, text.body_style(14.5 * s, pal.text, true), clip)
+        return
+    }
+
+    if st == b5_model.STEP_APPEARANCE {
+        draw_step_header(self, &b5_model.ftl(&"step-appearance-name"), &b5_model.ftl(&"step-appearance-subtitle"), clip)
+        left_w := (fw - 18) / 2
+        // Mode segmented
+        mr := damage.rect(fx, self.win_rect.y + 92, left_w, 34)
+        draw_solid(&mut self.frame, mr, pal.track, pal.line, render.rgba(0, 0, 0, 0), 10.0 * s, 1.0, clip)
+        mw3 := (mr.w - 6) / 3
+        draw_solid(&mut self.frame, damage.rect(mr.x + 3 + self.model.mode_idx * mw3, mr.y + 3, mw3, mr.h - 6), pal.pill, render.rgba(0, 0, 0, 0), pal.hi, 8.0 * s, 0.0, clip)
+        modes := [3]string{"Claro", "Oscuro", "Auto"}
+        var mi: i32 = 0
+        for mi < 3 {
+            dm := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &modes[usize(mi)], f64(mr.x + 3 + mi * mw3), f64(mr.y + 8), f64(mw3), 1, text.body_style(11.5 * s, pal.text, mi == self.model.mode_idx), clip)
+            mi = mi + 1
+        }
+        // 6 Accents
+        var ai: u32 = 0
+        for ai < 6 {
+            ar := damage.rect(fx + i32(ai) * 40, self.win_rect.y + 142, 30, 30)
+            acol := render.hex_rgb(theme.accent_hex(ai))
+            var bcol = pal.line
+            if ai == self.model.accent_idx { bcol = pal.text }
+            draw_solid(&mut self.frame, ar, acol, bcol, pal.hi, 15.0, 2.0, clip)
+            ai = ai + 1
+        }
+        // 4 Wallpapers
+        var wi: i32 = 0
+        for wi < 4 {
+            wr := damage.rect(fx + wi * 68, self.win_rect.y + 188, 60, 38)
+            var bcol = pal.line
+            if wi == self.model.wallpaper_idx { bcol = pal.accent }
+            draw_solid(&mut self.frame, wr, pal.card, bcol, pal.hi, 8.0, 2.0, clip)
+            wi = wi + 1
+        }
+        // Transparency slider
+        sr := damage.rect(fx, self.win_rect.y + 242, left_w, 28)
+        draw_solid(&mut self.frame, damage.rect(sr.x, sr.y + 11, sr.w, 6), pal.track, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 3.0, 0.0, clip)
+        fill_w := (sr.w * i32(self.model.transparency)) / 100
+        draw_solid(&mut self.frame, damage.rect(sr.x, sr.y + 11, fill_w, 6), pal.accent, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 3.0, 0.0, clip)
+        draw_solid(&mut self.frame, damage.rect(sr.x + fill_w - 9, sr.y + 5, 18, 18), render.rgb(255, 255, 255), pal.accent, render.rgba(0, 0, 0, 0), 9.0, 2.0, clip)
+
+        // 3 Dock cards
+        docks := [3]string{"Dock flotante", "Barra completa", "Dock lateral"}
+        var di: i32 = 0
+        for di < 3 {
+            dr := damage.rect(fx, self.win_rect.y + 286 + di * 42, left_w, 34)
+            var bcol = pal.line
+            if di == self.model.dock_style { bcol = pal.accent }
+            draw_solid(&mut self.frame, dr, pal.card, bcol, render.rgba(0, 0, 0, 0), 10.0, 1.5, clip)
+            dd := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &docks[usize(di)], f64(dr.x + 12), f64(dr.y + 9), f64(dr.w - 24), 0, text.body_style(12.0 * s, pal.text, di == self.model.dock_style), clip)
+            di = di + 1
+        }
+        // Live MiniDesktop preview on right
+        mini_r := damage.rect(fx + left_w + 18, self.win_rect.y + 92, fw - left_w - 18, 185)
+        draw_mini_desktop(self, mini_r, clip)
+        return
+    }
+
+    if st == b5_model.STEP_USER {
+        draw_step_header(self, &b5_model.ftl(&"step-user-name"), &b5_model.ftl(&"step-user-subtitle"), clip)
+        left_w := fw - 190
+        // Note: passwords are ALWAYS masked in headless snapshots (`headless_safe`) and when `!show_pw`.
+        pw_shown := if_str(self.model.show_pw && !self.headless_safe, &self.model.pw, &b5_model.mask_password(&self.model.pw))
+        pw2_shown := if_str(self.model.show_pw && !self.headless_safe, &self.model.pw2, &b5_model.mask_password(&self.model.pw2))
+        f_labels := [4]string{"Nombre completo", "Usuario", "Contraseña (mín. 8)", "Confirmar contraseña"}
+        f_vals := [4]string{self.model.user_name.clone(), self.model.username.clone(), pw_shown, pw2_shown}
+        var fi: i32 = 0
+        for fi < 4 {
+            fr := damage.rect(fx, self.win_rect.y + 92 + fi * 54, left_w, 34)
+            var bcol = pal.line
+            if self.focused_field == fi { bcol = pal.accent }
+            draw_solid(&mut self.frame, fr, pal.card, bcol, render.rgba(0, 0, 0, 0), 10.0, 1.0, clip)
+            dl := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &f_labels[usize(fi)], f64(fr.x), f64(fr.y - 14), f64(left_w), 0, text.body_style(10.5 * s, pal.muted, false), clip)
+            dv := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &f_vals[usize(fi)], f64(fr.x + 10), f64(fr.y + 9), f64(fr.w - 20), 0, text.body_style(12.5 * s, pal.text, false), clip)
+            fi = fi + 1
+        }
+        // Password strength meter (4 bars)
+        sc_pw := b5_model.pw_score(&self.model.pw)
+        var scol = self.th.semantic.error_border
+        if sc_pw == 1 { scol = self.th.semantic.warning } else if sc_pw == 2 { scol = render.rgb(201, 162, 28) } else if sc_pw >= 3 { scol = self.th.semantic.success }
+        var bi: i32 = 0
+        bw4 := (left_w - 18) / 4
+        for bi < 4 {
+            var bc = pal.track
+            if bi < sc_pw || (sc_pw == 0 && !self.model.pw.is_empty() && bi == 0) { bc = scol }
+            draw_solid(&mut self.frame, damage.rect(fx + bi * (bw4 + 6), self.win_rect.y + 306, bw4, 5), bc, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 2.5, 0.0, clip)
+            bi = bi + 1
+        }
+        // Auto-login toggle + ADR 0012 Recovery Key badge
+        tg_r := damage.rect(fx + left_w - 44, self.win_rect.y + 324, 44, 26)
+        draw_toggle(&mut self.frame, tg_r, self.model.auto_login, pal, clip)
+        dtg := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"Iniciar sesión automáticamente", f64(fx), f64(tg_r.y + 5), f64(left_w - 52), 0, text.body_style(12.0 * s, pal.text, false), clip)
+        drk := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"Clave de recuperación (ADR 0012): CAIRN-8F4A-91C2", f64(fx), f64(self.win_rect.y + 364), f64(fw), 0, text.body_style(11.0 * s, pal.accent_text, true), clip)
+
+        // Right-hand Avatar card
+        av_card := damage.rect(fx + left_w + 16, self.win_rect.y + 92, 174, 200)
+        draw_solid(&mut self.frame, av_card, pal.card, pal.line, pal.hi, 14.0, 1.0, clip)
+        av_col := render.hex_rgb(theme.accent_hex(self.model.avatar_color_idx))
+        draw_solid(&mut self.frame, damage.rect(av_card.x + 52, av_card.y + 20, 70, 70), av_col, pal.hi, pal.hi, 35.0, 1.0, clip)
+        dn_card := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.display, &self.model.user_name, f64(av_card.x + 10), f64(av_card.y + 104), 154.0, 1, text.display_style(14.5 * s, pal.text), clip)
+        du_card := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &("@" + self.model.username.clone()), f64(av_card.x + 10), f64(av_card.y + 128), 154.0, 1, text.body_style(11.5 * s, pal.muted, false), clip)
+        return
+    }
+
+    if st == b5_model.STEP_WIFI {
+        draw_step_header(self, &b5_model.ftl(&"step-wifi-title"), &b5_model.ftl(&"step-wifi-subtitle"), clip)
+        tg_r := damage.rect(fx + fw - 44, self.win_rect.y + 94, 44, 26)
+        draw_toggle(&mut self.frame, tg_r, self.model.wifi_on, pal, clip)
+        var st_txt = "Sin conexión a internet"
+        if !self.model.network.is_empty() { st_txt = "Conectado a " + self.model.network.clone() }
+        ds := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &st_txt, f64(fx), f64(tg_r.y + 5), f64(fw - 56), 0, text.body_style(13.0 * s, pal.accent_text, true), clip)
+        if self.model.wifi_on {
+            nets := b5_model.mock_wifi_networks()
+            var ni: usize = 0
+            for ni < nets.len() {
+                nr := damage.rect(fx, self.win_rect.y + 134 + i32(ni) * 44, fw, 36)
+                is_conn := self.model.network.eq(&nets.get(ni).ssid)
+                var bcol = pal.line
+                if is_conn { bcol = pal.accent }
+                draw_solid(&mut self.frame, nr, pal.card, bcol, render.rgba(0, 0, 0, 0), 10.0, 1.0, clip)
+                dn := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &nets.get(ni).ssid, f64(nr.x + 12), f64(nr.y + 10), f64(fw - 110), 0, text.body_style(12.5 * s, pal.text, is_conn), clip)
+                var tag = "Abierta"
+                if nets.get(ni).secured { tag = "Segura" }
+                if is_conn { tag = "Conectada" }
+                dt := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &tag, f64(nr.right() - 96), f64(nr.y + 10), 84.0, 2, text.body_style(11.5 * s, pal.muted, is_conn), clip)
+                ni = ni + 1
+            }
+        }
+        return
+    }
+
+    if st == b5_model.STEP_BROWSER {
+        draw_step_header(self, &b5_model.ftl(&"step-browser-name"), &b5_model.ftl(&"step-browser-subtitle"), clip)
+        var show_cnt: usize = 4
+        if self.model.browser_show_more { show_cnt = 7 }
+        var bi: usize = 0
+        for bi < show_cnt {
+            br := damage.rect(fx, self.win_rect.y + 92 + i32(bi) * 44, fw, 36)
+            sel := self.model.browser_selected[bi]
+            var bcol = pal.line
+            if sel { bcol = pal.accent }
+            draw_solid(&mut self.frame, br, pal.card, bcol, render.rgba(0, 0, 0, 0), 10.0, 1.5, clip)
+            bname := self.model.browsers.get(bi).name.clone()
+            db := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &bname, f64(br.x + 12), f64(br.y + 10), f64(fw - 100), 0, text.body_style(12.5 * s, pal.text, true), clip)
+            var st_s = "Elegir"
+            if sel { st_s = "✓ Elegido" }
+            ds := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &st_s, f64(br.right() - 88), f64(br.y + 10), 76.0, 2, text.body_style(11.5 * s, pal.accent_text, sel), clip)
+            bi = bi + 1
+        }
+        return
+    }
+
+    if st == b5_model.STEP_STORE {
+        draw_step_header(self, &b5_model.ftl(&"step-apps-name"), &b5_model.ftl(&"step-apps-subtitle"), clip)
+        if self.model.network.is_empty() {
+            gate_r := damage.rect(fx, self.win_rect.y + 110, fw, 120)
+            draw_solid(&mut self.frame, gate_r, pal.card, pal.line, pal.hi, 14.0, 1.0, clip)
+            dg0 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.display, &"Sin conexión a internet", f64(gate_r.x + 20), f64(gate_r.y + 24), f64(gate_r.w - 40), 1, text.display_style(18.0 * s, pal.text), clip)
+            btn_w := damage.rect(gate_r.x + (gate_r.w - 190) / 2, gate_r.y + 64, 190, 36)
+            draw_solid(&mut self.frame, btn_w, pal.accent, render.rgba(255, 255, 255, 45), pal.hi, 10.0, 1.0, clip)
+            dg1 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"Conectarse a una red", f64(btn_w.x), f64(btn_w.y + 10), f64(btn_w.w), 1, text.body_style(12.5 * s, render.rgb(255, 255, 255), true), clip)
+        } else {
+            cols := b5_model.mock_store_collections()
+            var ci: usize = 0
+            for ci < 3 {
+                cr := damage.rect(fx, self.win_rect.y + 96 + i32(ci) * 64, fw, 54)
+                sel := self.model.store_selected[ci]
+                var bcol = pal.line
+                if sel { bcol = pal.accent }
+                draw_solid(&mut self.frame, cr, pal.card, bcol, render.rgba(0, 0, 0, 0), 12.0, 1.5, clip)
+                dc0 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &cols.get(ci).name, f64(cr.x + 14), f64(cr.y + 10), f64(fw - 110), 0, text.body_style(13.0 * s, pal.text, true), clip)
+                dc1 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &cols.get(ci).desc, f64(cr.x + 14), f64(cr.y + 30), f64(fw - 110), 0, text.body_style(11.5 * s, pal.muted, false), clip)
+                var tag = "+ Añadir"
+                if sel { tag = "✓ Añadida" }
+                dt := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &tag, f64(cr.right() - 96), f64(cr.y + 18), 84.0, 2, text.body_style(12.0 * s, pal.accent_text, sel), clip)
+                ci = ci + 1
+            }
+        }
+        return
+    }
+
+    if st == b5_model.STEP_PRIVACY {
+        draw_step_header(self, &b5_model.ftl(&"step-privacy-name"), &b5_model.ftl(&"step-privacy-subtitle"), clip)
+        p_names := [5]string{
+            "Actualizaciones automáticas",
+            "Telemetría opcional",
+            "Cifrado de almacenamiento",
+            "Permisos por aplicación (ADR 0012)",
+            "Protección de ejecución y aislamiento",
+        }
+        p_vals := [5]bool{self.model.updates, self.model.telemetry, self.model.encryption, self.model.permissions_idx == 0, self.model.isolation}
+        var pi: usize = 0
+        for pi < 5 {
+            pr := damage.rect(fx, self.win_rect.y + 96 + i32(pi) * 52, fw, 42)
+            draw_solid(&mut self.frame, pr, pal.card, pal.line, render.rgba(0, 0, 0, 0), 12.0, 1.0, clip)
+            dp := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &p_names[pi], f64(pr.x + 14), f64(pr.y + 13), f64(fw - 80), 0, text.body_style(12.5 * s, pal.text, false), clip)
+            draw_toggle(&mut self.frame, damage.rect(pr.right() - 56, pr.y + 8, 44, 26), p_vals[pi], pal, clip)
+            pi = pi + 1
+        }
+        return
+    }
+
+    // STEP_DONE
+    badge := damage.rect(self.content_rect.x + (self.content_rect.w - 64) / 2 + x_off, self.win_rect.y + 44, 64, 64)
+    draw_solid(&mut self.frame, badge, self.th.semantic.success, pal.hi, pal.hi, 32.0, 1.0, clip)
+    ic := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_CHECK, badge.x + 16, badge.y + 16, 32.0 * s, 3.0, render.rgb(255, 255, 255), clip)
+    dd0 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.display, &b5_model.ftl(&"step-done-name"), f64(self.content_rect.x + x_off), f64(badge.bottom() + 18), f64(self.content_rect.w), 1, text.display_style(28.0 * s, pal.text), clip)
+    dd1 := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &b5_model.ftl(&"done-subtitle"), f64(self.content_rect.x + x_off), f64(badge.bottom() + 54), f64(self.content_rect.w), 1, text.body_style(13.0 * s, pal.muted, false), clip)
+
+    sum_card := damage.rect(fx, badge.bottom() + 90, fw, 170)
+    draw_solid(&mut self.frame, sum_card, pal.card, pal.line, pal.hi, 14.0, 1.0, clip)
+    rows := [4]string{
+        "Usuario: " + self.model.user_name.clone() + " (@" + self.model.username.clone() + ")",
+        "Red: " + if_str(!self.model.network.is_empty(), &self.model.network, &"Sin conexión"),
+        "Navegadores elegidos: " + self.model.selected_browser_count().to_string(),
+        "Cifrado: " + if_str(self.model.encryption, &"Activado", &"Desactivado"),
+    }
+    var ri: usize = 0
+    for ri < 4 {
+        dr := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &rows[ri], f64(sum_card.x + 16), f64(sum_card.y + 18 + i32(ri) * 34), f64(sum_card.w - 32), 0, text.body_style(12.5 * s, pal.text, false), clip)
+        ri = ri + 1
+    }
+}
+
+fn if_str(cond bool, a &string, b &string) string {
+    if cond { return a.clone() }
+    return b.clone()
+}
+
+pub fn SceneB5.render_damaged(&mut self) u32 {
+    if self.damage.is_empty() { return 0 }
+    n := self.damage.len()
+    var i: usize = 0
+    for i < n {
+        r := self.damage.at(i)
+        self.draw_tile(r)
+        i = i + 1
+    }
+    self.frames_rendered = self.frames_rendered + 1
+    return u32(n)
+}
+
+pub fn SceneB5.on_pointer_move(&mut self, x i32, y i32) bool {
+    return false
+}
+
+pub fn SceneB5.on_pointer_down(&mut self, x i32, y i32) bool {
+    return false
+}
+
+pub fn SceneB5.on_pointer_up(&mut self, x i32, y i32) i32 {
+    if self.model.step > 0 && pt_in(self.btn_back_rect, x, y) {
+        self.go_to_step(self.model.step - 1)
+        return HIT_BTN_BACK
+    }
+    if self.model.can_skip() && pt_in(self.btn_skip_rect, x, y) {
+        self.model.skip_current()
+        self.sync_theme()
+        self.damage.add(self.win_rect, self.width, self.height)
+        return HIT_BTN_SKIP
+    }
+    if pt_in(self.btn_next_rect, x, y) && self.model.can_continue() {
+        if self.model.step + 1 < b5_model.STEP_COUNT {
+            self.go_to_step(self.model.step + 1)
+        } else {
+            self.model.completed = true
+        }
+        return HIT_BTN_NEXT
+    }
+    var si: i32 = 0
+    for si < b5_model.STEP_COUNT {
+        if si <= self.model.highest_step && pt_in(step_rect_for(self.win_rect, si, self.scale), x, y) {
+            self.go_to_step(si)
+            return HIT_SIDEBAR_BASE + si
+        }
+        si = si + 1
+    }
+
+    // Step-specific interactive controls
+    s := f64(self.scale)
+    fx := self.content_rect.x + i32(28.0 * s)
+    fw := self.content_rect.w - i32(56.0 * s)
+    st := self.model.step
+
+    if st == b5_model.STEP_LANGUAGE {
+        var ri: i32 = 0
+        for ri < 3 {
+            rr := damage.rect(fx, self.win_rect.y + i32(96.0 * s) + ri * 46, fw, 38)
+            if pt_in(rr, x, y) {
+                if ri == 0 { self.model.lang_idx = (self.model.lang_idx + 1) % 5 } else if ri == 1 { self.model.region_idx = (self.model.region_idx + 1) % 8 } else { self.model.kbd_idx = (self.model.kbd_idx + 1) % 5 }
+                self.damage.add(self.content_rect, self.width, self.height)
+                return HIT_LANG_SEL_BASE + ri
+            }
+            ri = ri + 1
+        }
+        seg_r := damage.rect(fx, self.win_rect.y + 242, 236, 36)
+        if pt_in(seg_r, x, y) {
+            self.model.time_24h = x < seg_r.x + seg_r.w / 2
+            self.damage.add(self.content_rect, self.width, self.height)
+            return HIT_LANG_SEG
+        }
+    } else if st == b5_model.STEP_APPEARANCE {
+        left_w := (fw - 18) / 2
+        mr := damage.rect(fx, self.win_rect.y + 92, left_w, 34)
+        if pt_in(mr, x, y) {
+            mw3 := (mr.w - 6) / 3
+            if mw3 > 0 {
+                idx := (x - mr.x - 3) / mw3
+                if idx >= 0 && idx < 3 {
+                    self.model.mode_idx = idx
+                    self.sync_theme()
+                    return HIT_APP_MODE_BASE + idx
+                }
+            }
+        }
+        var ai: u32 = 0
+        for ai < 6 {
+            ar := damage.rect(fx + i32(ai) * 40, self.win_rect.y + 142, 30, 30)
+            if pt_in(ar, x, y) {
+                self.model.accent_idx = ai
+                self.sync_theme()
+                return HIT_APP_ACCENT_BASE + i32(ai)
+            }
+            ai = ai + 1
+        }
+        var wi: i32 = 0
+        for wi < 4 {
+            wr := damage.rect(fx + wi * 68, self.win_rect.y + 188, 60, 38)
+            if pt_in(wr, x, y) {
+                self.model.wallpaper_idx = wi
+                self.damage.add(self.content_rect, self.width, self.height)
+                return HIT_APP_WP_BASE + wi
+            }
+            wi = wi + 1
+        }
+        sr := damage.rect(fx, self.win_rect.y + 242, left_w, 28)
+        if pt_in(sr, x, y) && sr.w > 0 {
+            var tr = ((x - sr.x) * 100) / sr.w
+            if tr < 0 { tr = 0 }
+            if tr > 100 { tr = 100 }
+            self.model.transparency = u32((tr / 5) * 5)
+            self.sync_theme()
+            return HIT_APP_SLIDER
+        }
+        var di: i32 = 0
+        for di < 3 {
+            dr := damage.rect(fx, self.win_rect.y + 286 + di * 42, left_w, 34)
+            if pt_in(dr, x, y) {
+                self.model.dock_style = di
+                self.damage.add(self.content_rect, self.width, self.height)
+                return HIT_APP_DOCK_BASE + di
+            }
+            di = di + 1
+        }
+    } else if st == b5_model.STEP_USER {
+        left_w := fw - 190
+        var fi: i32 = 0
+        for fi < 4 {
+            fr := damage.rect(fx, self.win_rect.y + 92 + fi * 54, left_w, 34)
+            if pt_in(fr, x, y) {
+                self.focused_field = fi
+                self.damage.add(self.content_rect, self.width, self.height)
+                return HIT_USER_FIELD_BASE + fi
+            }
+            fi = fi + 1
+        }
+        tg_r := damage.rect(fx + left_w - 44, self.win_rect.y + 324, 44, 26)
+        if pt_in(tg_r, x, y) {
+            self.model.auto_login = !self.model.auto_login
+            self.damage.add(self.content_rect, self.width, self.height)
+            return HIT_USER_AUTOLOGIN
+        }
+    } else if st == b5_model.STEP_WIFI {
+        tg_r := damage.rect(fx + fw - 44, self.win_rect.y + 94, 44, 26)
+        if pt_in(tg_r, x, y) {
+            self.model.wifi_on = !self.model.wifi_on
+            if !self.model.wifi_on { self.model.network = "" }
+            self.damage.add(self.content_rect, self.width, self.height)
+            self.damage.add(self.sidebar_rect, self.width, self.height)
+            return HIT_WIFI_TOGGLE
+        }
+        if self.model.wifi_on {
+            nets := b5_model.mock_wifi_networks()
+            var ni: usize = 0
+            for ni < nets.len() {
+                nr := damage.rect(fx, self.win_rect.y + 134 + i32(ni) * 44, fw, 36)
+                if pt_in(nr, x, y) {
+                    if self.model.network.eq(&nets.get(ni).ssid) {
+                        self.model.network = ""
+                    } else {
+                        self.model.network = nets.get(ni).ssid.clone()
+                    }
+                    self.damage.add(self.content_rect, self.width, self.height)
+                    self.damage.add(self.sidebar_rect, self.width, self.height)
+                    return HIT_WIFI_NET_BASE + i32(ni)
+                }
+                ni = ni + 1
+            }
+        }
+    } else if st == b5_model.STEP_BROWSER {
+        var show_cnt: usize = 4
+        if self.model.browser_show_more { show_cnt = 7 }
+        var bi: usize = 0
+        for bi < show_cnt {
+            br := damage.rect(fx, self.win_rect.y + 92 + i32(bi) * 44, fw, 36)
+            if pt_in(br, x, y) {
+                self.model.browser_selected[bi] = !self.model.browser_selected[bi]
+                self.damage.add(self.content_rect, self.width, self.height)
+                return HIT_BROWSER_BASE + i32(bi)
+            }
+            bi = bi + 1
+        }
+    } else if st == b5_model.STEP_STORE {
+        if self.model.network.is_empty() {
+            gate_r := damage.rect(fx, self.win_rect.y + 110, fw, 120)
+            btn_w := damage.rect(gate_r.x + (gate_r.w - 190) / 2, gate_r.y + 64, 190, 36)
+            if pt_in(btn_w, x, y) {
+                self.go_to_step(b5_model.STEP_WIFI)
+                return HIT_STORE_GO_WIFI
+            }
+        } else {
+            var ci: usize = 0
+            for ci < 3 {
+                cr := damage.rect(fx, self.win_rect.y + 96 + i32(ci) * 64, fw, 54)
+                if pt_in(cr, x, y) {
+                    self.model.store_selected[ci] = !self.model.store_selected[ci]
+                    self.damage.add(self.content_rect, self.width, self.height)
+                    self.damage.add(self.sidebar_rect, self.width, self.height)
+                    return HIT_STORE_COL_BASE + i32(ci)
+                }
+                ci = ci + 1
+            }
+        }
+    } else if st == b5_model.STEP_PRIVACY {
+        var pi: usize = 0
+        for pi < 5 {
+            pr := damage.rect(fx, self.win_rect.y + 96 + i32(pi) * 52, fw, 42)
+            if pt_in(pr, x, y) {
+                if pi == 0 { self.model.updates = !self.model.updates } else if pi == 1 { self.model.telemetry = !self.model.telemetry } else if pi == 2 { self.model.encryption = !self.model.encryption } else if pi == 3 {
+                    if self.model.permissions_idx == 0 { self.model.permissions_idx = 1 } else { self.model.permissions_idx = 0 }
+                } else { self.model.isolation = !self.model.isolation }
+                self.damage.add(self.content_rect, self.width, self.height)
+                return HIT_PRIV_BASE + i32(pi)
+            }
+            pi = pi + 1
+        }
+    }
+    return HIT_NONE
+}
+
+pub fn SceneB5.on_key_input(&mut self, keycode i64, chars &string) bool {
+    if keycode == 36 || keycode == 76 {
+        // Enter advances if valid
+        if self.model.can_continue() && self.model.step + 1 < b5_model.STEP_COUNT {
+            self.go_to_step(self.model.step + 1)
+            return true
+        }
+        return false
+    }
+    if keycode == 48 {
+        // Tab cycles fields on StepUser
+        if self.model.step == b5_model.STEP_USER {
+            self.focused_field = (self.focused_field + 1) % 4
+            self.damage.add(self.content_rect, self.width, self.height)
+            return true
+        }
+    }
+    if self.model.step == b5_model.STEP_USER && self.focused_field >= 0 && self.focused_field <= 3 {
+        if keycode == 51 {
+            // Backspace
+            if self.focused_field == 0 && !self.model.user_name.is_empty() {
+                nv := self.model.user_name.copy_range(0, self.model.user_name.len() - 1)
+                self.model.set_name(&nv)
+            } else if self.focused_field == 1 && !self.model.username.is_empty() {
+                self.model.username = self.model.username.copy_range(0, self.model.username.len() - 1)
+                self.model.username_manual = true
+            } else if self.focused_field == 2 && !self.model.pw.is_empty() {
+                self.model.pw = self.model.pw.copy_range(0, self.model.pw.len() - 1)
+            } else if self.focused_field == 3 && !self.model.pw2.is_empty() {
+                self.model.pw2 = self.model.pw2.copy_range(0, self.model.pw2.len() - 1)
+            }
+            self.damage.add(self.content_rect, self.width, self.height)
+            self.damage.add(self.footer_rect, self.width, self.height)
+            return true
+        }
+        if !chars.is_empty() && chars.bytes()[0] >= 32 {
+            if self.focused_field == 0 {
+                nv := self.model.user_name.clone() + chars.clone()
+                self.model.set_name(&nv)
+            } else if self.focused_field == 1 {
+                self.model.username = self.model.username.clone() + chars.clone()
+                self.model.username_manual = true
+            } else if self.focused_field == 2 {
+                self.model.pw = self.model.pw.clone() + chars.clone()
+            } else if self.focused_field == 3 {
+                self.model.pw2 = self.model.pw2.clone() + chars.clone()
+            }
+            self.damage.add(self.content_rect, self.width, self.height)
+            self.damage.add(self.footer_rect, self.width, self.height)
+            return true
+        }
+    }
+    return false
+}
+
+pub fn SceneB5.snapshot_png(&self, path &string) Result<string, i32> {
+    return png.write_bgra_png(path, self.frame.pixels.as_slice(), u32(self.width), u32(self.height))
+}

@@ -12,7 +12,7 @@ cp "$cairn/damage.tarn" "$cairn/render.tarn" "$cairn/png.tarn" \
    "$cairn/theme.tarn" "$cairn/layout.tarn" \
    "$cairn/objc.tarn" "$cairn/surface_macos.tarn" "$cairn/surface_linux.tarn" \
    "$cairn/scene_b1.tarn" "$cairn/scene_b2.tarn" "$cairn/scene_b3.tarn" \
-   "$cairn/scene_app.tarn" "$cairn/native.tarn" "$build/source/backend/"
+   "$cairn/scene_app.tarn" "$cairn/b5_model.tarn" "$cairn/scene_b5.tarn" "$cairn/native.tarn" "$build/source/backend/"
 cp "$cairn/devtools_off.tarn" "$build/source/backend/devtools.tarn"
 cp "$root/core/session.tarn" "$build/source/core/session.tarn"
 cp "$root/examples/cairn_b1_rects/main.tarn" "$build/source/main.tarn"

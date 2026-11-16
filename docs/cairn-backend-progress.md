@@ -217,3 +217,26 @@ Milestone B4 implements the Cairn theme engine, constraint layout engine, and fu
 - **`scripts/test-appkit.sh`**: **4 passed, 0 failed** (`lifecycle_test`, `regions_test`).
 - **Unaltered `tarn_ui` examples built against `backends/cairn`**: `examples/counter`, `examples/navigation`, `examples/widgets` all compile with `0` warnings and `0` errors via `nice -n 10 bash scripts/build-cairn-b4.sh`.
 - **Single-control update redraw at `1920×1080`**: `< 1.5 ms` (`1,500 µs` budget), `0` redraws at idle.
+
+---
+
+## 12. What Was Built in Milestone B5
+
+Milestone B5 implements the complete 9-step Cairn Onboarding prototype in pure Tarn on the `cairn` backend, matching `cairn/docs/design/desktop-spec.md` §2.1 & §4 plus the ADR 0024 Browser Choice Screen (`StepBrowser`) and Collections (`StepStore`), and ADR 0012 Recovery Key.
+
+### 12.1 Subsystems & Files Added / Updated
+
+| Path | Responsibility |
+|---|---|
+| `backends/cairn/backend/b5_model.tarn` | Fluent-style Spanish (`es`) message catalog, 9-step `OnboardingState` (`Welcome`, `Language`, `Appearance`, `User`, `Wi-Fi [MOCK]`, `Browser` [ADR 0024], `Store` [ADR 0024 Collections, MOCK], `Privacy`, `Done`), `slug_username`, `user_error`, `pw_score`, `mask_password`, xorshift64 ADR 0024 browser shuffling with 0 preselection, and `skip_current`. |
+| `backends/cairn/backend/scene_b5.tarn` | Retained B5 Onboarding scene: Dual-Kawase `.glass.window` backdrop, 9-step sidebar with `step-pill` `LayoutSpring` (`420/36`) and `StorageMeter`, `0.22s` `[0.22, 0.8, 0.3, 1]` step transitions, live `MiniDesktop` preview in `StepAppearance`, masked password rendering (`headless_safe` ensures raw passwords never leak into snapshots), interactive pointer/keyboard navigation, and `0` idle redraws. |
+| `backends/cairn/backend/native.tarn` | Wired `SceneB5` when title starts with `"Cairn B5"`, with refresh-paced animation ticks and keyboard input forwarding. |
+| `backends/cairn/backend/b5_test.tarn` | Automated B5 tests: Fluent keys, ADR 0024 0-preselection & randomized browser order, `StepUser` validation & `pwScore`, offline `StepStore` gate, deterministic PNG SHA-256 across all 9 steps (`0..8`), password-masking pixel invariance, 1080p `< 100 ms` first frame, `0` idle redraws, and live macOS host window check. |
+| `examples/cairn_b5_onboarding/main.tarn` | Interactive B5 demo (`--headless [prefix]` for steps `0..8`, `--bench`, and live window). |
+| `scripts/build-cairn-b5.sh`, `scripts/run-cairn-b5.sh`, `scripts/build-cairn-b[1-4].sh` | Build & run scripts for Milestone B5 (and updated B1–B4 copy lists). |
+
+### 12.2 Measurements vs. Milestone B5 Budget Gate
+
+- **`B5 1080p first frame`**: **`75.60 ms`** (`75,601 µs < 100,000 µs` ADR 0009 budget); `30` transition frames averaged `1.36 ms`/frame (`40,786 µs` total); **`0` idle redraws**.
+- **`scripts/test-cairn.sh`**: **12 passed, 0 failed** (`b1_test`..`b5_test`).
+- **`scripts/test-appkit.sh`**: **4 passed, 0 failed**.

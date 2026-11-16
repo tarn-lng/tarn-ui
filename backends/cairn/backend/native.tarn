@@ -9,6 +9,7 @@ import "backend/objc"
 import "backend/scene_b1"
 import "backend/scene_b2"
 import "backend/scene_b3"
+import "backend/scene_b5"
 import "backend/scene_app"
 import "backend/surface_macos"
 
@@ -110,6 +111,8 @@ pub struct Native {
     pub use_b2 bool
     pub scene_b3 Vec<scene_b3.SceneB3>
     pub use_b3 bool
+    pub scene_b5 Vec<scene_b5.SceneB5>
+    pub use_b5 bool
     pub scene_app Vec<scene_app.SceneApp>
     pub use_app bool
     pub last_anim_ns u64
@@ -288,6 +291,9 @@ pub fn abi() u32 { return 14 }
 pub fn Native.native_window(&self) *mut u8 { return self.window }
 pub fn Native.first_frame_nanos(&self) u64 { return self.first_frame_ns }
 pub fn Native.frames_rendered(&self) u64 {
+    if self.use_b5 && !self.scene_b5.is_empty() {
+        return self.scene_b5.get(0).frames_rendered
+    }
     if self.use_app && !self.scene_app.is_empty() {
         return self.scene_app.get(0).frames_rendered
     }
@@ -381,12 +387,20 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
     is_b1 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B1")
     is_b2 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B2")
     is_b3 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B3")
-    is_app := !is_b1 && !is_b2 && !is_b3
+    is_b5 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B5")
+    is_app := !is_b1 && !is_b2 && !is_b3 && !is_b5
     var scene = scene_b1.SceneB1.new(1, 1, 1)
     var sb2_vec: Vec<scene_b2.SceneB2> = Vec.new()
     var sb3_vec: Vec<scene_b3.SceneB3> = Vec.new()
+    var sb5_vec: Vec<scene_b5.SceneB5> = Vec.new()
     var app_vec: Vec<scene_app.SceneApp> = Vec.new()
-    if is_app {
+    if is_b5 {
+        var sb5 = scene_b5.SceneB5.new(w, h, 1, t0, false)
+        blitted5 := surf.present_damaged(sb5.frame.pixels.as_slice(), w, h, sb5.frame.stride, &sb5.damage)
+        sb5.damage.clear()
+        sb5_vec.push(sb5)
+        scene.damage.clear()
+    } else if is_app {
         var sapp = scene_app.SceneApp.new(w, h, 1, title, heading)
         blitted_a := surf.present_damaged(sapp.frame.pixels.as_slice(), w, h, sapp.frame.stride, &sapp.damage)
         sapp.damage.clear()
@@ -434,6 +448,8 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
         use_b2: is_b2,
         scene_b3: sb3_vec,
         use_b3: is_b3,
+        scene_b5: sb5_vec,
+        use_b5: is_b5,
         scene_app: app_vec,
         use_app: is_app,
         last_anim_ns: t1,
@@ -481,6 +497,20 @@ fn Native.writable(&self) i32 {
 
 // Re-renders only damaged tiles and presents to the host surface if anything changed.
 pub fn Native.flush_damage(&mut self) u32 {
+    if self.use_b5 && !self.scene_b5.is_empty() {
+        sb5 := self.scene_b5.get_mut(0)
+        if sb5.damage.is_empty() { return 0 }
+        tiles5 := sb5.render_damaged()
+        blitted5 := self.surface.present_damaged(
+            sb5.frame.pixels.as_slice(),
+            self.width,
+            self.height,
+            sb5.frame.stride,
+            &sb5.damage
+        )
+        sb5.damage.clear()
+        return tiles5
+    }
     if self.use_app && !self.scene_app.is_empty() {
         sapp := self.scene_app.get_mut(0)
         if sapp.damage.is_empty() { return 0 }
@@ -578,6 +608,15 @@ fn Native.dispatch_app_event(&mut self, ev &scene_app.AppInputEvent) {
 }
 
 pub fn Native.inject_click_at(&mut self, x i32, y i32) u32 {
+    if self.use_b5 && !self.scene_b5.is_empty() {
+        down5 := self.scene_b5.get_mut(0).on_pointer_down(x, y)
+        act5 := self.scene_b5.get_mut(0).on_pointer_up(x, y)
+        tiles5 := self.flush_damage()
+        if act5 != scene_b5.HIT_NONE {
+            enqueue(self.block, 1001 + act5, objc.nil())
+        }
+        return tiles5
+    }
     if self.use_app && !self.scene_app.is_empty() {
         down_a := self.scene_app.get_mut(0).on_pointer_down(x, y)
         self.flush_damage()
@@ -708,7 +747,8 @@ pub fn Native.iterate(&mut self) {
         objc.objc_autoreleasePoolPop(self.pool)
         self.pool = objc.objc_autoreleasePoolPush()
     }
-    animating := self.use_b3 && !self.scene_b3.is_empty() && self.scene_b3.get(0).has_active_animations()
+    animating := (self.use_b3 && !self.scene_b3.is_empty() && self.scene_b3.get(0).has_active_animations()) ||
+        (self.use_b5 && !self.scene_b5.is_empty() && self.scene_b5.get(0).has_active_animations())
     var until_date = objc.send(objc.class(&"NSDate"), &"distantFuture")
     if animating {
         now0 := objc.monotonic_ns()
@@ -728,7 +768,11 @@ pub fn Native.iterate(&mut self) {
         if ev_type == objc.EVENT_MOUSE_MOVED || ev_type == objc.EVENT_LEFT_MOUSE_DRAGGED {
             match parse_event_point(event, self.height) {
                 Some(pt) => {
-                    if self.use_app && !self.scene_app.is_empty() {
+                    if self.use_b5 && !self.scene_b5.is_empty() {
+                        if self.scene_b5.get_mut(0).on_pointer_move(pt[0], pt[1]) {
+                            self.flush_damage()
+                        }
+                    } else if self.use_app && !self.scene_app.is_empty() {
                         if self.scene_app.get_mut(0).on_pointer_move(pt[0], pt[1]) {
                             self.flush_damage()
                         }
@@ -750,7 +794,11 @@ pub fn Native.iterate(&mut self) {
         } else if ev_type == objc.EVENT_LEFT_MOUSE_DOWN {
             match parse_event_point(event, self.height) {
                 Some(pt) => {
-                    if self.use_app && !self.scene_app.is_empty() {
+                    if self.use_b5 && !self.scene_b5.is_empty() {
+                        if self.scene_b5.get_mut(0).on_pointer_down(pt[0], pt[1]) {
+                            self.flush_damage()
+                        }
+                    } else if self.use_app && !self.scene_app.is_empty() {
                         if self.scene_app.get_mut(0).on_pointer_down(pt[0], pt[1]) {
                             self.flush_damage()
                         }
@@ -772,7 +820,14 @@ pub fn Native.iterate(&mut self) {
         } else if ev_type == objc.EVENT_LEFT_MOUSE_UP {
             match parse_event_point(event, self.height) {
                 Some(pt) => {
-                    if self.use_app && !self.scene_app.is_empty() {
+                    if self.use_b5 && !self.scene_b5.is_empty() {
+                        act5 := self.scene_b5.get_mut(0).on_pointer_up(pt[0], pt[1])
+                        self.last_anim_ns = objc.monotonic_ns()
+                        self.flush_damage()
+                        if self.scene_b5.get(0).model.completed {
+                            enqueue(self.block, 1099, objc.nil())
+                        }
+                    } else if self.use_app && !self.scene_app.is_empty() {
                         ev := self.scene_app.get_mut(0).on_pointer_up(pt[0], pt[1])
                         self.flush_damage()
                         self.dispatch_app_event(&ev)
@@ -809,6 +864,13 @@ pub fn Native.iterate(&mut self) {
                 enqueue(self.block, 1000 + i32(self.escape_action), objc.nil())
                 return
             }
+            if self.use_b5 && !self.scene_b5.is_empty() {
+                key_chars5 := objc.text_of(objc.send(event, &"characters"))
+                if self.scene_b5.get_mut(0).on_key_input(i64(keycode), &key_chars5) {
+                    self.last_anim_ns = objc.monotonic_ns()
+                    self.flush_damage()
+                }
+            }
             if self.use_app && !self.scene_app.is_empty() {
                 key_chars := objc.text_of(objc.send(event, &"characters"))
                 ev := self.scene_app.get_mut(0).on_key_input(i64(keycode), &key_chars)
@@ -822,6 +884,16 @@ pub fn Native.iterate(&mut self) {
         objc.tell(application, &"updateWindows")
     }
 
+    if self.use_b5 && !self.scene_b5.is_empty() && self.scene_b5.get(0).has_active_animations() {
+        now5 := objc.monotonic_ns()
+        var dt5 = f64(now5 - self.last_anim_ns) / 1000000000.0
+        if dt5 < 0.001 { dt5 = f64(self.surface.frame_interval_ns) / 1000000000.0 }
+        if dt5 > 0.05 { dt5 = 0.05 }
+        self.last_anim_ns = now5
+        if self.scene_b5.get_mut(0).step_animations(dt5) {
+            self.flush_damage()
+        }
+    }
     if self.use_b3 && !self.scene_b3.is_empty() && self.scene_b3.get(0).has_active_animations() {
         now := objc.monotonic_ns()
         var dt_s = f64(now - self.last_anim_ns) / 1000000000.0
@@ -1607,6 +1679,12 @@ pub fn Native.snapshot_png(&mut self, path &string) i32 {
         Err(failure) => { return failure }
     }
     self.flush_damage()
+    if self.use_b5 && !self.scene_b5.is_empty() {
+        return match self.scene_b5.get(0).snapshot_png(path) {
+            Ok(_) => 0
+            Err(code) => code
+        }
+    }
     if self.use_app && !self.scene_app.is_empty() {
         return match self.scene_app.get(0).snapshot_png(path) {
             Ok(_) => 0

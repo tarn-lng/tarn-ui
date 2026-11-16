@@ -1,0 +1,122 @@
+// Demo `examples/cairn_b5_onboarding`:
+// Milestone B5 of the third `tarn_ui` backend (`backends/cairn/`):
+// Full 9-step Cairn Onboarding Prototype in pure Tarn (`Welcome`, `Language`,
+// `Appearance` with live `MiniDesktop`, `User` with `pwScore` & ADR 0012 Recovery Key,
+// `Wi-Fi` [MOCK], `Browser` ADR 0024, `Store` Collections [MOCK], `Privacy`, `Done`).
+//
+// Usage:
+//   cairn_b5_onboarding                     # Interactive macOS host window
+//   cairn_b5_onboarding --headless [prefix] # Deterministic PNG snapshots for steps 0..8
+//   cairn_b5_onboarding --bench             # First frame + step transition + idle check
+import "os"
+import "core/session"
+import "backend/objc"
+import "backend/b5_model"
+import "backend/scene_b5"
+
+fn settle(sc &mut scene_b5.SceneB5) {
+    var i: i32 = 0
+    for i < 36 {
+        ch := sc.step_animations(0.016)
+        rd := sc.render_damaged()
+        sc.damage.clear()
+        i = i + 1
+    }
+}
+
+fn run_headless(prefix &string) i32 {
+    var sc = scene_b5.SceneB5.new(960, 600, 1, 424242, true)
+    sc.damage.clear()
+    sc.model.set_name(&"Sofía Navarro")
+    sc.model.pw = "MiClaveSegura!9"
+    sc.model.pw2 = "MiClaveSegura!9"
+    sc.model.network = "Hogar-Fibra [MOCK]"
+
+    var st: i32 = 0
+    for st < b5_model.STEP_COUNT {
+        if st > 0 { sc.go_to_step(st) }
+        settle(&mut sc)
+        path := prefix.clone() + "-step" + st.to_string() + ".png"
+        h := match sc.snapshot_png(&path) {
+            Ok(hash) => hash
+            Err(c) => {
+                print("snapshot step " + st.to_string() + " error: " + c.to_string())
+                return 1
+            }
+        }
+        print("  step=" + st.to_string() + " (" + b5_model.step_name(st) + "): sha256=" + h)
+        st = st + 1
+    }
+    print("  idle_redraws_after_settle: " + sc.render_damaged().to_string())
+    return 0
+}
+
+fn run_bench() i32 {
+    var sc = scene_b5.SceneB5.new(1920, 1080, 1, 424242, true)
+    first_us := sc.first_frame_ns / 1000
+    sc.damage.clear()
+    sc.go_to_step(1)
+    c0 := objc.thread_cpu_ns()
+    var i: i32 = 0
+    var max_us: u64 = 0
+    for i < 30 {
+        f0 := objc.thread_cpu_ns()
+        ch := sc.step_animations(0.016667)
+        rd := sc.render_damaged()
+        sc.damage.clear()
+        f1 := objc.thread_cpu_ns()
+        dt := (f1 - f0) / 1000
+        if rd > 0 && dt > max_us { max_us = dt }
+        i = i + 1
+    }
+    c1 := objc.thread_cpu_ns()
+    print("B5 1080p first_frame_us=" + first_us.to_string() + " step_anim_max_cpu_us=" + max_us.to_string() + " total_30f_us=" + ((c1 - c0) / 1000).to_string())
+    return 0
+}
+
+fn main() {
+    argv := match os.args() {
+        Ok(list) => list
+        Err(_) => Vec.new()
+    }
+    if argv.len() >= 2 {
+        arg1 := argv.get(1)
+        if arg1.eq(&"--headless") {
+            var prefix = "/tmp/cairn-b5"
+            if argv.len() >= 3 { prefix = argv.get(2).clone() }
+            code := run_headless(&prefix)
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+        if arg1.eq(&"--bench") {
+            code := run_bench()
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+    }
+
+    unsafe {
+        match session.run("Cairn B5 · Onboarding", "Bienvenido a Cairn", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.set_escape_action(99)
+            for {
+                action := try ui.next_action()
+                match action {
+                    session.Action.Closed => { return Ok(()) }
+                    session.Action.Activate(id) => {
+                        if id == 99 {
+                            try ui.request_close()
+                        }
+                        try ui.complete_event()
+                    }
+                    _ => {}
+                }
+            }
+        }) {
+            Ok(_) => {}
+            Err(error) => {
+                print(error.message())
+                os.exit(1)
+            }
+        }
+    }
+}

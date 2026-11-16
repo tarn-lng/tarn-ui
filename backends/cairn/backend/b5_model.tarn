@@ -1,0 +1,427 @@
+// Pure-Tarn Onboarding Model, Fluent Catalog (`es`) & Validation (`b5_model.tarn`) — Milestone B5:
+// Implements all 9 onboarding steps from `cairn/docs/design/desktop-spec.md` §2.1 & §4,
+// including the ADR 0024 Browser Choice Screen (`StepBrowser`, zero preselection, randomized order)
+// and ADR 0024 Collections (`StepStore`), plus ADR 0012 Recovery Key & `pwScore` validation.
+// Note: Wi-Fi networks and Store collections/apps use clearly marked `[MOCK]` data.
+import "string"
+
+pub const STEP_COUNT i32 = 9
+
+pub const STEP_WELCOME i32 = 0
+pub const STEP_LANGUAGE i32 = 1
+pub const STEP_APPEARANCE i32 = 2
+pub const STEP_USER i32 = 3
+pub const STEP_WIFI i32 = 4
+pub const STEP_BROWSER i32 = 5 // ADR 0024: Browser Choice Screen
+pub const STEP_STORE i32 = 6
+pub const STEP_PRIVACY i32 = 7
+pub const STEP_DONE i32 = 8
+
+// ---- Fluent-style Message Catalog (`es` Spanish, `desktop-spec.md` §4) ----
+
+pub fn ftl(key &string) string {
+    if key.eq(&"brand-name") { return "Cairn" }
+    if key.eq(&"brand-slogan") { return "Tu sistema. Tus reglas." }
+    if key.eq(&"common-back") { return "Atrás" }
+    if key.eq(&"common-skip") { return "Omitir" }
+    if key.eq(&"common-continue") { return "Continuar" }
+    if key.eq(&"common-cancel") { return "Cancelar" }
+    if key.eq(&"common-ready") { return "Listo" }
+    if key.eq(&"common-on") { return "Activado" }
+    if key.eq(&"common-off") { return "Desactivado" }
+    if key.eq(&"common-pending") { return "Pendiente" }
+    if key.eq(&"common-defined") { return "Definida" }
+    if key.eq(&"common-none") { return "Ninguna" }
+
+    if key.eq(&"step-welcome-name") { return "Bienvenida" }
+    if key.eq(&"step-language-name") { return "Idioma y región" }
+    if key.eq(&"step-appearance-name") { return "Apariencia" }
+    if key.eq(&"step-user-name") { return "Tu cuenta" }
+    if key.eq(&"step-wifi-name") { return "Red Wi-Fi" }
+    if key.eq(&"step-browser-name") { return "Navegador" }
+    if key.eq(&"step-apps-name") { return "Aplicaciones" }
+    if key.eq(&"step-privacy-name") { return "Privacidad y seguridad" }
+    if key.eq(&"step-done-name") { return "Todo está listo" }
+
+    if key.eq(&"welcome-heading") { return "Bienvenido a Cairn" }
+    if key.eq(&"welcome-body") { return "Cairn es un sistema operativo experimental construido desde cero sobre un microkernel escrito en Tarn, con seguridad de memoria desde la base. En unos minutos tendrás un escritorio hecho a tu medida." }
+    if key.eq(&"welcome-chip-kernel") { return "Microkernel en Tarn" }
+    if key.eq(&"welcome-chip-memory") { return "Memoria segura" }
+    if key.eq(&"welcome-chip-custom") { return "A tu manera" }
+    if key.eq(&"welcome-cta-start") { return "Comenzar" }
+
+    if key.eq(&"step-language-subtitle") { return "Elige cómo te habla Cairn" }
+    if key.eq(&"step-appearance-subtitle") { return "Dale tu estilo al escritorio" }
+    if key.eq(&"step-user-subtitle") { return "Crea tu usuario" }
+    if key.eq(&"step-wifi-subtitle") { return "Conéctate a internet" }
+    if key.eq(&"step-browser-subtitle") { return "Elige tu navegador web (ADR 0024)" }
+    if key.eq(&"step-apps-subtitle") { return "Elige qué colecciones instalar" }
+    if key.eq(&"step-privacy-subtitle") { return "Tú decides qué comparte tu sistema" }
+    if key.eq(&"done-subtitle") { return "Cairn Desktop está configurado a tu gusto." }
+    if key.eq(&"done-cta-enter") { return "Entrar a Cairn" }
+    return key.clone()
+}
+
+pub fn ftl_progress(step i32) string {
+    return "Paso " + (step + 1).to_string() + " de " + STEP_COUNT.to_string()
+}
+
+pub fn step_name(step i32) string {
+    if step == STEP_WELCOME { return ftl(&"step-welcome-name") }
+    if step == STEP_LANGUAGE { return ftl(&"step-language-name") }
+    if step == STEP_APPEARANCE { return ftl(&"step-appearance-name") }
+    if step == STEP_USER { return ftl(&"step-user-name") }
+    if step == STEP_WIFI { return ftl(&"step-wifi-name") }
+    if step == STEP_BROWSER { return ftl(&"step-browser-name") }
+    if step == STEP_STORE { return ftl(&"step-apps-name") }
+    if step == STEP_PRIVACY { return ftl(&"step-privacy-name") }
+    return ftl(&"step-done-name")
+}
+
+// ---- Mocked Data (`[MOCK]`) ----
+
+pub struct WifiNetwork {
+    pub ssid string
+    pub secured bool
+    pub bars i32
+}
+
+pub fn mock_wifi_networks() Vec<WifiNetwork> {
+    var list: Vec<WifiNetwork> = Vec.new()
+    list.push(WifiNetwork { ssid: "Hogar-Fibra [MOCK]", secured: true, bars: 4 })
+    list.push(WifiNetwork { ssid: "Casa_5G [MOCK]", secured: true, bars: 3 })
+    list.push(WifiNetwork { ssid: "Oficina Wi-Fi [MOCK]", secured: true, bars: 3 })
+    list.push(WifiNetwork { ssid: "Café Montaña [MOCK]", secured: false, bars: 2 })
+    list.push(WifiNetwork { ssid: "Invitados [MOCK]", secured: false, bars: 1 })
+    return list
+}
+
+pub struct BrowserChoice {
+    pub id string
+    pub name string
+    pub desc string
+    pub extended bool
+}
+
+pub fn browser_catalog_shuffled(seed u64) Vec<BrowserChoice> {
+    var base: Vec<BrowserChoice> = Vec.new()
+    base.push(BrowserChoice { id: "chrome", name: "Google Chrome", desc: "Rápido y compatible con estándares web.", extended: false })
+    base.push(BrowserChoice { id: "firefox", name: "Mozilla Firefox", desc: "Código abierto enfocado en privacidad.", extended: false })
+    base.push(BrowserChoice { id: "brave", name: "Brave", desc: "Bloqueo de rastreadores integrado.", extended: false })
+    base.push(BrowserChoice { id: "edge", name: "Microsoft Edge", desc: "Motor Chromium con herramientas integradas.", extended: false })
+    base.push(BrowserChoice { id: "vivaldi", name: "Vivaldi", desc: "Personalización avanzada de pestañas.", extended: true })
+    base.push(BrowserChoice { id: "opera", name: "Opera", desc: "Espacios de trabajo y barra lateral.", extended: true })
+    base.push(BrowserChoice { id: "chromium", name: "Chromium", desc: "Base abierta sin servicios propietarios.", extended: true })
+
+    // Fisher-Yates shuffle on primary 4 (0..4) per ADR 0024 using overflow-free xorshift64
+    var s = seed
+    if s == 0 { s = 123456789 }
+    var i: usize = 3
+    for i > 0 {
+        s = s ^ (s << 13)
+        s = s ^ (s >> 7)
+        s = s ^ (s << 17)
+        j := usize((s >> 32) % u64(i + 1))
+        if j != i {
+            tmp := base.as_slice()[i].id.clone()
+            tn := base.as_slice()[i].name.clone()
+            td := base.as_slice()[i].desc.clone()
+            te := base.as_slice()[i].extended
+            base.as_mut_slice()[i] = BrowserChoice {
+                id: base.as_slice()[j].id.clone(),
+                name: base.as_slice()[j].name.clone(),
+                desc: base.as_slice()[j].desc.clone(),
+                extended: base.as_slice()[j].extended,
+            }
+            base.as_mut_slice()[j] = BrowserChoice { id: tmp, name: tn, desc: td, extended: te }
+        }
+        i = i - 1
+    }
+    return base
+}
+
+pub struct StoreCollection {
+    pub id string
+    pub name string
+    pub desc string
+    pub gb_tenths u32
+}
+
+pub fn mock_store_collections() Vec<StoreCollection> {
+    var list: Vec<StoreCollection> = Vec.new()
+    list.push(StoreCollection { id: "cairn.office", name: "Ofimática [MOCK]", desc: "WordCraft, GridCraft, DeckCraft (1.8 GB)", gb_tenths: 18 })
+    list.push(StoreCollection { id: "cairn.creative", name: "Diseño y creación [MOCK]", desc: "PhotoCraft, VectorCraft, FilmCraft (2.4 GB)", gb_tenths: 24 })
+    list.push(StoreCollection { id: "cairn.dev", name: "Desarrollo [MOCK]", desc: "Tarn Studio, Git, Contenedores (1.2 GB)", gb_tenths: 12 })
+    return list
+}
+
+// ---- Validation Helpers (`StepUser`) ----
+
+pub fn slug_username(name &string) string {
+    var out: Vec<u8> = Vec.new()
+    bytes := name.bytes()
+    var i: usize = 0
+    for i < bytes.len() && out.len() < 20 {
+        b := bytes[i]
+        if b == 32 && !out.is_empty() { break }
+        if b >= 65 && b <= 90 {
+            // ASCII uppercase -> lowercase
+            out.push(b + 32)
+        } else if (b >= 97 && b <= 122) || (b >= 48 && b <= 57) {
+            out.push(b)
+        }
+        i = i + 1
+    }
+    return string.from_utf8(out.as_slice()).unwrap_or("")
+}
+
+fn is_reserved_user(u &string) bool {
+    return u.eq(&"root") || u.eq(&"admin") || u.eq(&"administrador") ||
+        u.eq(&"cairn") || u.eq(&"system") || u.eq(&"sistema")
+}
+
+pub fn user_error(u &string) string {
+    if u.len() < 3 { return "Mínimo 3 caracteres." }
+    if u.len() > 24 { return "Máximo 24 caracteres." }
+    bytes := u.bytes()
+    b0 := bytes[0]
+    if b0 < 97 || b0 > 122 { return "Debe iniciar con una letra minúscula." }
+    var i: usize = 0
+    for i < bytes.len() {
+        b := bytes[i]
+        ok := (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 46 || b == 95 || b == 45
+        if !ok { return "Solo letras minúsculas, dígitos, '.', '_' o '-'." }
+        i = i + 1
+    }
+    if is_reserved_user(u) { return "Nombre reservado del sistema." }
+    return ""
+}
+
+pub fn pw_score(pw &string) i32 {
+    if pw.len() < 8 { return 0 }
+    var score: i32 = 1
+    if pw.len() >= 12 { score = score + 1 }
+    var has_lo = false
+    var has_up = false
+    var has_dig = false
+    var has_sym = false
+    for b in pw.bytes() {
+        if b >= 97 && b <= 122 { has_lo = true } else if b >= 65 && b <= 90 { has_up = true } else if b >= 48 && b <= 57 { has_dig = true } else { has_sym = true }
+    }
+    if has_lo && has_up { score = score + 1 }
+    if has_dig && has_sym { score = score + 1 }
+    return score
+}
+
+pub fn pw_score_label(score i32) string {
+    if score == 0 { return "Demasiado corta" }
+    if score == 1 { return "Débil" }
+    if score == 2 { return "Aceptable" }
+    if score == 3 { return "Buena" }
+    return "Fuerte"
+}
+
+pub fn mask_password(pw &string) string {
+    var out = ""
+    var i: usize = 0
+    for i < pw.len() {
+        out = out + "•"
+        i = i + 1
+    }
+    return out
+}
+
+// ---- Onboarding Model ----
+
+pub struct OnboardingState {
+    pub step i32
+    pub highest_step i32
+    pub completed bool
+
+    // Step 1: Language
+    pub lang_idx i32
+    pub region_idx i32
+    pub kbd_idx i32
+    pub time_24h bool
+
+    // Step 2: Appearance
+    pub mode_idx i32        // 0=Claro, 1=Oscuro, 2=Automático
+    pub accent_idx u32      // 0..5
+    pub wallpaper_idx i32   // 0..3
+    pub transparency u32    // 0..100
+    pub dock_style i32      // 0=flotante, 1=barra, 2=lateral
+
+    // Step 3: User
+    pub user_name string
+    pub username string
+    pub username_manual bool
+    pub pw string
+    pub pw2 string
+    pub show_pw bool
+    pub auto_login bool
+    pub avatar_color_idx u32
+    pub recovery_ack bool
+
+    // Step 4: Wi-Fi [MOCK]
+    pub wifi_on bool
+    pub network string
+    pub wifi_asking string
+    pub wifi_pw string
+    pub wifi_err string
+
+    // Step 5: Browser Choice (ADR 0024)
+    pub browsers Vec<BrowserChoice>
+    pub browser_selected [7]bool
+    pub browser_show_more bool
+
+    // Step 6: Store Collections [MOCK]
+    pub store_selected [3]bool
+
+    // Step 7: Privacy
+    pub updates bool
+    pub channel_preview bool
+    pub telemetry bool
+    pub encryption bool
+    pub permissions_idx i32 // 0=siempre, 1=una-vez, 2=permitir
+    pub isolation bool
+}
+
+pub fn OnboardingState.new(shuffle_seed u64) OnboardingState {
+    return OnboardingState {
+        step: STEP_WELCOME,
+        highest_step: STEP_WELCOME,
+        completed: false,
+        lang_idx: 0,
+        region_idx: 0,
+        kbd_idx: 0,
+        time_24h: true,
+        mode_idx: 1,
+        accent_idx: 0,
+        wallpaper_idx: 0,
+        transparency: 45,
+        dock_style: 0,
+        user_name: "",
+        username: "",
+        username_manual: false,
+        pw: "",
+        pw2: "",
+        show_pw: false,
+        auto_login: false,
+        avatar_color_idx: 0,
+        recovery_ack: true,
+        wifi_on: true,
+        network: "",
+        wifi_asking: "",
+        wifi_pw: "",
+        wifi_err: "",
+        browsers: browser_catalog_shuffled(shuffle_seed),
+        browser_selected: [7]bool{false, false, false, false, false, false, false},
+        browser_show_more: false,
+        store_selected: [3]bool{true, true, false},
+        updates: true,
+        channel_preview: false,
+        telemetry: false,
+        encryption: true,
+        permissions_idx: 0,
+        isolation: true,
+    }
+}
+
+pub fn OnboardingState.is_dark(&self) bool {
+    return self.mode_idx != 0
+}
+
+pub fn OnboardingState.user_valid(&self) bool {
+    if self.user_name.len() < 2 { return false }
+    if !user_error(&self.username).is_empty() { return false }
+    if self.pw.len() < 8 || !self.pw.eq(&self.pw2) { return false }
+    return true
+}
+
+pub fn OnboardingState.can_continue(&self) bool {
+    if self.step == STEP_USER { return self.user_valid() }
+    return true
+}
+
+pub fn OnboardingState.can_skip(&self) bool {
+    return self.step != STEP_WELCOME && self.step != STEP_USER && self.step != STEP_DONE
+}
+
+pub fn OnboardingState.missing_user_hint(&self) string {
+    var parts = ""
+    if self.user_name.len() < 2 { parts = "tu nombre" }
+    if !user_error(&self.username).is_empty() {
+        if !parts.is_empty() { parts = parts + ", " }
+        parts = parts + "un usuario válido"
+    }
+    if self.pw.len() < 8 || !self.pw.eq(&self.pw2) {
+        if !parts.is_empty() { parts = parts + ", " }
+        parts = parts + "una contraseña"
+    }
+    if parts.is_empty() { return "" }
+    return "Para continuar falta: " + parts + "."
+}
+
+pub fn OnboardingState.set_name(&mut self, v &string) {
+    self.user_name = v.clone()
+    if !self.username_manual {
+        self.username = slug_username(v)
+    }
+}
+
+pub fn OnboardingState.storage_tenths_gb(&self) u32 {
+    var total: u32 = 52 // 5.2 GB base
+    if self.network.is_empty() { return total }
+    cols := mock_store_collections()
+    var i: usize = 0
+    for i < 3 {
+        if self.store_selected[i] { total = total + cols.get(i).gb_tenths }
+        i = i + 1
+    }
+    return total
+}
+
+pub fn OnboardingState.selected_browser_count(&self) i32 {
+    var c: i32 = 0
+    var i: usize = 0
+    for i < 7 {
+        if self.browser_selected[i] { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+pub fn OnboardingState.skip_current(&mut self) {
+    if !self.can_skip() { return }
+    if self.step == STEP_LANGUAGE {
+        self.lang_idx = 0
+        self.region_idx = 0
+        self.kbd_idx = 0
+        self.time_24h = true
+    } else if self.step == STEP_APPEARANCE {
+        self.mode_idx = 1
+        self.accent_idx = 0
+        self.wallpaper_idx = 0
+        self.transparency = 45
+        self.dock_style = 0
+    } else if self.step == STEP_WIFI {
+        self.wifi_on = true
+        self.network = ""
+        self.wifi_asking = ""
+        self.wifi_pw = ""
+        self.wifi_err = ""
+    } else if self.step == STEP_BROWSER {
+        self.browser_selected = [7]bool{false, false, false, false, false, false, false}
+    } else if self.step == STEP_STORE {
+        self.store_selected = [3]bool{false, false, false}
+    } else if self.step == STEP_PRIVACY {
+        self.updates = true
+        self.channel_preview = false
+        self.telemetry = false
+        self.encryption = true
+        self.permissions_idx = 0
+        self.isolation = true
+    }
+    self.step = self.step + 1
+    if self.step > self.highest_step { self.highest_step = self.step }
+}

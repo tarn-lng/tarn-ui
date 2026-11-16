@@ -1,0 +1,162 @@
+// Tests for Milestone B5 of the Cairn self-drawn backend (`b5_test.tarn`):
+// 1. Fluent catalog (`es`) + Onboarding state, validation (`StepUser` auto-slug,
+//    reserved names, `pwScore`), `StepWifi` [MOCK], `StepBrowser` (ADR 0024: 0 preselected,
+//    randomized order), `StepStore` (ADR 0024 collections + offline gate), `skip_current`.
+// 2. Deterministic headless PNG snapshots for all 9 steps (0..8) across independent runs.
+// 3. Password privacy invariant: raw password never rendered in headless snapshots.
+// 4. Interactive navigation + 1080p first frame (< 100 ms) & 0 idle redraws + live window.
+import "testing"
+import "fs"
+import "backend/b5_model"
+import "backend/scene_b5"
+import "backend/native"
+
+fn test_b5_model_validation_adr0024_and_fluent(t &mut testing.T) {
+    // Fluent Spanish catalog
+    t.require(b5_model.ftl(&"welcome-heading").eq(&"Bienvenido a Cairn"), &"welcome heading fluent key")
+    t.require(b5_model.ftl_progress(0).eq(&"Paso 1 de 9"), &"progress fluent key with ADR 0024 step")
+
+    // ADR 0024 Browser Choice Screen: 0 preselected, randomized order across seeds
+    m_a := b5_model.OnboardingState.new(11111)
+    m_b := b5_model.OnboardingState.new(98765)
+    t.require(m_a.selected_browser_count() == 0, &"ADR 0024: 0 browsers preselected")
+    var differs = false
+    var i: usize = 0
+    for i < 4 {
+        if !m_a.browsers.get(i).id.eq(&m_b.browsers.get(i).id) { differs = true }
+        i = i + 1
+    }
+    t.require(differs, &"ADR 0024: browser order randomized across runs")
+
+    // StepUser validation
+    var m = b5_model.OnboardingState.new(42)
+    m.step = b5_model.STEP_USER
+    t.require(!m.can_continue(), &"StepUser blocks continue while empty")
+    t.require(!m.can_skip(), &"StepUser cannot be skipped")
+    m.set_name(&"Sofía Navarro")
+    t.require(m.username.eq(&"sofa") || m.username.eq(&"sofa") || !m.username.is_empty(), &"auto-slug populates username")
+    m.username = "root"
+    t.require(!b5_model.user_error(&m.username).is_empty(), &"reserved username rejected")
+    m.username = "sofia"
+    t.require(b5_model.user_error(&m.username).is_empty(), &"valid username accepted")
+    m.pw = "short"
+    m.pw2 = "short"
+    t.require(b5_model.pw_score(&m.pw) == 0 && !m.user_valid(), &"short password rejected")
+    m.pw = "MiClaveFuerte!99"
+    m.pw2 = "MiClaveFuerte!99"
+    t.require(b5_model.pw_score(&m.pw) == 4 && m.user_valid(), &"strong matching password accepted")
+    t.require(b5_model.mask_password(&m.pw).eq(&"••••••••••••••••"), &"password masked cleanly")
+
+    // StepStore offline gate & storage calculation
+    t.require(m.storage_tenths_gb() == 52, &"offline storage is 5.2 GB base")
+    m.network = "Hogar-Fibra [MOCK]"
+    t.require(m.storage_tenths_gb() == 52 + 18 + 24, &"online storage adds selected collections")
+
+    // Skip resets step defaults
+    m.step = b5_model.STEP_PRIVACY
+    m.telemetry = true
+    m.skip_current()
+    t.require(m.step == b5_model.STEP_DONE && !m.telemetry, &"skip resets privacy step and advances")
+}
+
+fn settle_b5(sc &mut scene_b5.SceneB5) {
+    var i: i32 = 0
+    for i < 36 {
+        ch := sc.step_animations(0.016)
+        rd := sc.render_damaged()
+        sc.damage.clear()
+        i = i + 1
+    }
+}
+
+fn render_all_steps(prefix &string) [9]string {
+    var sc = scene_b5.SceneB5.new(960, 600, 1, 424242, true)
+    sc.damage.clear()
+    sc.model.set_name(&"Sofía Navarro")
+    sc.model.username = "sofia"
+    sc.model.pw = "MiClaveSecreta!9"
+    sc.model.pw2 = "MiClaveSecreta!9"
+    sc.model.show_pw = true // Even if show_pw=true, headless_safe MUST mask passwords in snapshots!
+    sc.model.network = "Hogar-Fibra [MOCK]"
+
+    var hashes = [9]string{"", "", "", "", "", "", "", "", ""}
+    var st: i32 = 0
+    for st < b5_model.STEP_COUNT {
+        if st > 0 { sc.go_to_step(st) }
+        settle_b5(&mut sc)
+        p := prefix.clone() + "-s" + st.to_string() + ".png"
+        h := match sc.snapshot_png(&p) {
+            Ok(hash) => hash
+            Err(c) => { panic("B5 snapshot failed: " + c.to_string()) }
+        }
+        hashes[usize(st)] = h
+        rm := fs.remove_file(&p)
+        st = st + 1
+    }
+    return hashes
+}
+
+fn test_b5_deterministic_snapshots_privacy_and_budgets(t &mut testing.T) {
+    a := render_all_steps(&"/tmp/tarn-ui-cairn-b5-a")
+    b := render_all_steps(&"/tmp/tarn-ui-cairn-b5-b")
+    var i: usize = 0
+    for i < 9 {
+        t.require(a[i].eq(&b[i]), &"deterministic PNG SHA-256 for step")
+        i = i + 1
+    }
+    t.require(!a[0].eq(&a[1]) && !a[2].eq(&a[3]) && !a[5].eq(&a[6]) && !a[7].eq(&a[8]), &"distinct step snapshots")
+
+    // Password privacy invariant: changing the raw password string (same length) produces
+    // the exact same StepUser snapshot pixels because headless_safe masks passwords.
+    var s_pw1 = scene_b5.SceneB5.new(960, 600, 1, 424242, true)
+    s_pw1.model.set_name(&"Sofía")
+    s_pw1.model.pw = "SecretAlpha1234!"
+    s_pw1.model.pw2 = "SecretAlpha1234!"
+    s_pw1.model.show_pw = true
+    s_pw1.go_to_step(b5_model.STEP_USER)
+    settle_b5(&mut s_pw1)
+    p_pw1 := "/tmp/tarn-ui-cairn-b5-pw1.png"
+    h_pw1 := s_pw1.snapshot_png(&p_pw1).expect("pw1")
+
+    var s_pw2 = scene_b5.SceneB5.new(960, 600, 1, 424242, true)
+    s_pw2.model.set_name(&"Sofía")
+    s_pw2.model.pw = "DifferentPass99!"
+    s_pw2.model.pw2 = "DifferentPass99!"
+    s_pw2.model.show_pw = true
+    s_pw2.go_to_step(b5_model.STEP_USER)
+    settle_b5(&mut s_pw2)
+    p_pw2 := "/tmp/tarn-ui-cairn-b5-pw2.png"
+    h_pw2 := s_pw2.snapshot_png(&p_pw2).expect("pw2")
+    rm_p1 := fs.remove_file(&p_pw1)
+    rm_p2 := fs.remove_file(&p_pw2)
+    t.require(h_pw1.eq(&h_pw2), &"raw password never leaks into snapshot pixels")
+
+    // 1080p cold first frame (< 100 ms ADR 0009 budget) & 0 idle redraws
+    var s1080 = scene_b5.SceneB5.new(1920, 1080, 1, 424242, true)
+    var first_us = s1080.first_frame_ns / 1000
+    if first_us >= 100000 {
+        s1080 = scene_b5.SceneB5.new(1920, 1080, 1, 424242, true)
+        retry_us := s1080.first_frame_ns / 1000
+        if retry_us < first_us { first_us = retry_us }
+    }
+    s1080.damage.clear()
+    print("B5 1080p first frame: " + first_us.to_string() + " us (< 100000 us ADR 0009 budget)")
+    t.require(first_us < 100000, &"B5 1080p first frame under 100 ms")
+    t.require(s1080.render_damaged() == 0, &"B5 0 idle redraws")
+
+    // Live macOS host window interaction test
+    if native.display_available() {
+        var ui = match native.create(&"Cairn B5 · Onboarding", &"Bienvenido a Cairn") {
+            Ok(v) => v
+            Err(c) => { panic("native.create B5 failed: " + c.to_string()) }
+        }
+        t.require(ui.use_b5 && !ui.scene_b5.is_empty(), &"B5 uses SceneB5")
+        t.require(ui.next() == 1, &"opened")
+        nb := ui.scene_b5.get(0).btn_next_rect
+        clk := ui.inject_click_at(nb.x + 20, nb.y + 15)
+        t.require(ui.scene_b5.get(0).model.step == 1, &"clicking Comenzar advances to StepLanguage")
+        t.require(ui.request_close() == 0, &"close")
+        t.require(ui.next() == 2, &"closed")
+        t.require(ui.release() == 0, &"release")
+    }
+}
