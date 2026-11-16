@@ -1,0 +1,942 @@
+// Cairn self-drawn B2 Scene (`scene_b2.tarn`) — Milestone B2:
+// - Renders the onboarding Welcome screen (`SetupWindow` + `Sidebar` + `StepWelcome`)
+//   text and icons over the B1 `Wallpaper("lago")` and `.glass.window` card, plus
+//   the interactive `BrandSheet` modal (`Identidad de marca · provisional` from
+//   `desktop-spec.md` §2.2 / `App.jsx`).
+// - Uses `text.tarn` (`Bricolage Grotesque` + `Onest` OFL TrueType fonts, GPOS
+//   kerning, tabular numerals `tnum`, balanced headings, UAX #14 paragraph layout,
+//   baseline alignment, and 4× subpixel glyph atlas) and `icons.tarn` (Lucide
+//   vector icons + `CairnMark` / `CairnIcon` / `CairnLogo` / `AppIcon`).
+// - Tracks cold font-load, text layout, and glyph/icon rasterization timings
+//   against the Milestone B2 performance budget gate.
+import "backend/damage"
+import "backend/render"
+import "backend/text"
+import "backend/icons"
+import "backend/png"
+import "backend/objc"
+
+pub const ITEM_NONE i32 = -1
+pub const ITEM_BTN_COMENZAR i32 = 0
+pub const ITEM_BTN_ATRAS i32 = 1
+pub const ITEM_BTN_MARCA i32 = 2
+pub const ITEM_BTN_SIDE_BRAND i32 = 3
+pub const ITEM_BTN_SIDE_RESET i32 = 4
+
+pub struct SceneB2 {
+    pub width i32
+    pub height i32
+    pub scale i32
+    pub palette render.ThemePalette
+    pub fonts text.FontPair
+    pub atlas text.GlyphAtlas
+    pub wallpaper render.Canvas
+    pub window_base render.Canvas
+    pub window_base_valid bool
+    pub frame render.Canvas
+    pub damage damage.DamageRegion
+    pub win_shadow render.NineSliceShadow
+    pub btn_shadow render.NineSliceShadow
+    pub pop_shadow render.NineSliceShadow
+    pub win_bounds damage.Rect
+    pub btn_comenzar_bounds damage.Rect
+    pub btn_atras_bounds damage.Rect
+    pub btn_marca_bounds damage.Rect
+    pub btn_side_brand_bounds damage.Rect
+    pub btn_side_reset_bounds damage.Rect
+    pub hovered_id i32
+    pub pressed_id i32
+    pub accent_index u32
+    pub brand_open bool
+    pub frames_rendered u64
+    pub tiles_rendered u64
+    pub font_load_ns u64
+    pub text_layout_ns u64
+    pub text_raster_ns u64
+    pub first_frame_ns u64
+}
+
+fn accent_hex_by_index(idx u32) u32 {
+    m := idx % 6
+    if m == 0 { return 0x5457d6 } // indigo
+    if m == 1 { return 0x7c4ddb } // violeta
+    if m == 2 { return 0x2f6fe0 } // azul
+    if m == 3 { return 0x0f8f8a } // turquesa
+    if m == 4 { return 0xd1408a } // rosa
+    return 0xc9601a               // cobre
+}
+
+pub fn SceneB2.new(width i32, height i32, scale i32) SceneB2 {
+    t_start := objc.monotonic_ns()
+    var s = scale
+    if s < 1 { s = 1 }
+    pal := render.theme_palette(true, 0x5457d6, 45)
+
+    // 1. Load Bricolage Grotesque & Onest TrueType fonts in pure Tarn
+    t_f0 := objc.monotonic_ns()
+    fonts := match text.load_cairn_fonts() {
+        Ok(fp) => fp
+        Err(code) => { panic("Failed to load Cairn fonts: " + code.to_string()) }
+    }
+    t_f1 := objc.monotonic_ns()
+
+    // 1024x1024 8-bit coverage shelf-packed glyph & icon atlas
+    atlas := text.GlyphAtlas.new(1024, 1024)
+
+    var wp = render.Canvas.new(width, height, s)
+    wp.render_wallpaper_lago()
+    win_base := render.Canvas.new(width, height, s)
+    frame := render.Canvas.new(width, height, s)
+
+    win_sh := render.NineSliceShadow.precompute(
+        26.0 * f64(s),
+        28.0 * f64(s),
+        12 * s,
+        0,
+        render.rgba(8, 10, 40, 178)
+    )
+    btn_sh := render.NineSliceShadow.precompute(
+        16.0 * f64(s),
+        10.0 * f64(s),
+        5 * s,
+        0,
+        pal.accent.with_alpha(150)
+    )
+    pop_sh := render.NineSliceShadow.precompute(
+        22.0 * f64(s),
+        24.0 * f64(s),
+        10 * s,
+        0,
+        render.rgba(8, 10, 40, 165)
+    )
+
+    // SetupWindow geometry (`max-w-[1120px] max-h-[720px]`, scaled to viewport)
+    win_w := (width * 90) / 100
+    win_h := (height * 88) / 100
+    win_x := (width - win_w) / 2
+    win_y := (height - win_h) / 2
+    win_rect := damage.rect(win_x, win_y, win_w, win_h)
+
+    side_w := (win_w * 27) / 100
+    main_x := win_x + side_w
+    main_w := win_w - side_w
+    footer_h := 52 * s
+    footer_y := win_y + win_h - footer_h
+
+    // Interactive buttons on the Welcome screen:
+    // 1. Primary CTA `#btn-comenzar` ("Comenzar" + ArrowRight) centered in the hero area
+    cta_w := 168 * s
+    cta_h := 46 * s
+    cta_x := main_x + (main_w - cta_w) / 2
+    cta_y := footer_y - 68 * s
+    cta_rect := damage.rect(cta_x, cta_y, cta_w, cta_h)
+
+    // 2. Footer left `#btn-atras` ("Atrás" + ArrowLeft)
+    pad_m := 28 * s
+    atras_w := 104 * s
+    atras_h := 36 * s
+    atras_y := footer_y + (footer_h - atras_h) / 2
+    atras_rect := damage.rect(main_x + pad_m, atras_y, atras_w, atras_h)
+
+    // 3. Footer right `#btn-marca-footer` ("Identidad de marca" + Shapes)
+    marca_w := 172 * s
+    marca_rect := damage.rect(win_x + win_w - pad_m - marca_w, atras_y, marca_w, atras_h)
+
+    // 4. Sidebar toolbar icon buttons (`#btn-marca`, `#btn-reiniciar`)
+    tb_y := win_y + 42 * s
+    tb_sz := 28 * s
+    s_reset_rect := damage.rect(win_x + side_w - 16 * s - tb_sz, tb_y, tb_sz, tb_sz)
+    s_brand_rect := damage.rect(s_reset_rect.x - 4 * s - tb_sz, tb_y, tb_sz, tb_sz)
+
+    var dmg = damage.DamageRegion.new()
+    dmg.add_full(width, height)
+
+    var scene = SceneB2 {
+        width: width,
+        height: height,
+        scale: s,
+        palette: pal,
+        fonts: fonts,
+        atlas: atlas,
+        wallpaper: wp,
+        window_base: win_base,
+        window_base_valid: false,
+        frame: frame,
+        damage: dmg,
+        win_shadow: win_sh,
+        btn_shadow: btn_sh,
+        pop_shadow: pop_sh,
+        win_bounds: win_rect,
+        btn_comenzar_bounds: cta_rect,
+        btn_atras_bounds: atras_rect,
+        btn_marca_bounds: marca_rect,
+        btn_side_brand_bounds: s_brand_rect,
+        btn_side_reset_bounds: s_reset_rect,
+        hovered_id: ITEM_NONE,
+        pressed_id: ITEM_NONE,
+        accent_index: 0,
+        brand_open: false,
+        frames_rendered: 0,
+        tiles_rendered: 0,
+        font_load_ns: t_f1 - t_f0,
+        text_layout_ns: 0,
+        text_raster_ns: 0,
+        first_frame_ns: 0,
+    }
+    scene.render_damaged()
+    t_end := objc.monotonic_ns()
+    scene.first_frame_ns = t_end - t_start
+    return scene
+}
+
+fn SceneB2.item_damage_bounds(&self, id i32) damage.Rect {
+    pad := 20 * self.scale
+    if id == ITEM_BTN_COMENZAR {
+        return damage.rect(self.btn_comenzar_bounds.x - pad, self.btn_comenzar_bounds.y - pad, self.btn_comenzar_bounds.w + pad * 2, self.btn_comenzar_bounds.h + pad * 2)
+    }
+    if id == ITEM_BTN_ATRAS {
+        return damage.rect(self.btn_atras_bounds.x - 4, self.btn_atras_bounds.y - 4, self.btn_atras_bounds.w + 8, self.btn_atras_bounds.h + 8)
+    }
+    if id == ITEM_BTN_MARCA {
+        return damage.rect(self.btn_marca_bounds.x - 4, self.btn_marca_bounds.y - 4, self.btn_marca_bounds.w + 8, self.btn_marca_bounds.h + 8)
+    }
+    if id == ITEM_BTN_SIDE_BRAND {
+        return damage.rect(self.btn_side_brand_bounds.x - 4, self.btn_side_brand_bounds.y - 4, self.btn_side_brand_bounds.w + 8, self.btn_side_brand_bounds.h + 8)
+    }
+    if id == ITEM_BTN_SIDE_RESET {
+        return damage.rect(self.btn_side_reset_bounds.x - 4, self.btn_side_reset_bounds.y - 4, self.btn_side_reset_bounds.w + 8, self.btn_side_reset_bounds.h + 8)
+    }
+    return damage.rect(0, 0, 0, 0)
+}
+
+pub fn SceneB2.hit_test(&self, px i32, py i32) i32 {
+    if self.btn_comenzar_bounds.contains_point(px, py) { return ITEM_BTN_COMENZAR }
+    if self.btn_atras_bounds.contains_point(px, py) { return ITEM_BTN_ATRAS }
+    if self.btn_marca_bounds.contains_point(px, py) { return ITEM_BTN_MARCA }
+    if self.btn_side_brand_bounds.contains_point(px, py) { return ITEM_BTN_SIDE_BRAND }
+    if self.btn_side_reset_bounds.contains_point(px, py) { return ITEM_BTN_SIDE_RESET }
+    return ITEM_NONE
+}
+
+pub fn SceneB2.on_pointer_move(&mut self, px i32, py i32) bool {
+    hit := self.hit_test(px, py)
+    if hit == self.hovered_id {
+        return false
+    }
+    if self.hovered_id != ITEM_NONE {
+        self.damage.add(self.item_damage_bounds(self.hovered_id), self.width, self.height)
+    }
+    if hit != ITEM_NONE {
+        self.damage.add(self.item_damage_bounds(hit), self.width, self.height)
+    }
+    self.hovered_id = hit
+    return true
+}
+
+pub fn SceneB2.on_pointer_down(&mut self, px i32, py i32) bool {
+    moved := self.on_pointer_move(px, py)
+    hit := self.hit_test(px, py)
+    if hit == self.pressed_id { return moved }
+    if self.pressed_id != ITEM_NONE {
+        self.damage.add(self.item_damage_bounds(self.pressed_id), self.width, self.height)
+    }
+    if hit != ITEM_NONE {
+        self.damage.add(self.item_damage_bounds(hit), self.width, self.height)
+    }
+    self.pressed_id = hit
+    return true
+}
+
+pub fn SceneB2.on_pointer_up(&mut self, px i32, py i32) i32 {
+    hit := self.hit_test(px, py)
+    prev_pressed := self.pressed_id
+    self.pressed_id = ITEM_NONE
+    if prev_pressed != ITEM_NONE {
+        self.damage.add(self.item_damage_bounds(prev_pressed), self.width, self.height)
+    }
+    if hit != ITEM_NONE && hit == prev_pressed {
+        if hit == ITEM_BTN_COMENZAR {
+            // Cycle accent color token and re-render glass window typography & icons
+            self.accent_index = (self.accent_index + 1) % 6
+            hex := accent_hex_by_index(self.accent_index)
+            self.palette = render.theme_palette(self.palette.dark, hex, self.palette.transparency)
+            self.btn_shadow.color = self.palette.accent.with_alpha(150)
+            self.window_base_valid = false
+            self.damage.add(self.win_bounds, self.width, self.height)
+        } else if hit == ITEM_BTN_ATRAS || hit == ITEM_BTN_SIDE_RESET {
+            // Toggle dark / light theme palette
+            self.palette = render.theme_palette(!self.palette.dark, accent_hex_by_index(self.accent_index), self.palette.transparency)
+            self.window_base_valid = false
+            self.damage.add(self.win_bounds, self.width, self.height)
+        } else if hit == ITEM_BTN_MARCA || hit == ITEM_BTN_SIDE_BRAND {
+            // Toggle BrandSheet modal view
+            self.brand_open = !self.brand_open
+            self.window_base_valid = false
+            self.damage.add(self.win_bounds, self.width, self.height)
+        }
+        return hit
+    }
+    return ITEM_NONE
+}
+
+fn step_name_by_index(idx usize) string {
+    if idx == 0 { return "Bienvenida" }
+    if idx == 1 { return "Idioma y región" }
+    if idx == 2 { return "Apariencia" }
+    if idx == 3 { return "Tu cuenta" }
+    if idx == 4 { return "Red Wi‑Fi" }
+    if idx == 5 { return "Aplicaciones" }
+    if idx == 6 { return "Privacidad y seguridad" }
+    return "Todo está listo"
+}
+
+// Draws a rounded `.chip` pill containing a leading Lucide icon + Onest label.
+fn draw_feature_chip(canvas &mut render.Canvas, atlas &mut text.GlyphAtlas, body_font &text.Font,
+    pal &render.ThemePalette, icon_id u32, label &string, x i32, y i32, h i32, scale f64, clip damage.Rect) i32 {
+    lbl_style := text.body_style(12.5 * scale, pal.text, true)
+    run := text.shape_text(body_font, label, lbl_style)
+    pad_x := i32(12.0 * scale)
+    ico_sz := 14.0 * scale
+    gap := i32(7.0 * scale)
+    chip_w := pad_x * 2 + i32(ico_sz) + gap + i32(run.width + 1.0)
+    chip_rect := damage.rect(x, y, chip_w, h)
+    canvas.draw_rrect(chip_rect, render.RRectStyle {
+        radii: render.uniform_radii(f64(h) * 0.5),
+        fill_top: pal.card,
+        fill_bottom: pal.card,
+        border_color: pal.line,
+        border_width: 1.0,
+        inner_hi: pal.hi,
+    }, clip)
+    iy := y + (h - i32(ico_sz)) / 2
+    ic_drawn := icons.draw_icon(canvas, atlas, icon_id, x + pad_x, iy, ico_sz, 2.0, pal.accent_text, clip)
+    ty := f64(y) + (f64(h) - 12.5 * scale) * 0.5 - 1.0 * scale
+    tx := f64(x + pad_x + i32(ico_sz) + gap)
+    tx_drawn := text.draw_shaped_run(canvas, atlas, body_font, &run, tx, ty, lbl_style, clip)
+    return chip_w
+}
+
+// Renders the complete `BrandSheet` view (`desktop-spec.md` §2.2 / `App.jsx` lines 1217-1293)
+// inside `win_bounds` when `brand_open` is active.
+fn SceneB2.draw_brand_sheet_content(&mut self, full damage.Rect) {
+    s := f64(self.scale)
+    wb := self.win_bounds
+    pad := 24 * self.scale
+    inner_x := wb.x + pad
+    inner_w := wb.w - pad * 2
+
+    // Header bar (`Identidad de marca · provisional`)
+    hdr_h := 48 * self.scale
+    self.window_base.draw_rrect(damage.rect(wb.x + 1, wb.y + hdr_h, wb.w - 2, 1 * self.scale),
+        render.solid_rrect(0.0, self.palette.line, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0)), full)
+    hdr_bold := text.body_style(14.0 * s, self.palette.text, true)
+    hdr_muted := text.body_style(14.0 * s, self.palette.muted, false)
+    w_hdr := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Identidad de marca", f64(inner_x), f64(wb.y + 15 * self.scale), 300.0 * s, 0, hdr_bold, full)
+    w_hdr2 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &" · provisional", f64(inner_x) + w_hdr, f64(wb.y + 15 * self.scale), 200.0 * s, 0, hdr_muted, full)
+
+    // Hero row: CairnIcon(88) + "Cairn OS" + "Tu sistema. Tus reglas." + Spanish description
+    hero_y := wb.y + hdr_h + 16 * self.scale
+    icons.draw_cairn_icon(&mut self.window_base, f64(inner_x), f64(hero_y), 88.0 * s, full)
+
+    hx := f64(inner_x + 106 * self.scale)
+    hw := f64(inner_w - 106 * self.scale)
+    h2_style := text.display_style(30.0 * s, self.palette.text)
+    w_h2 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.display,
+        &"Cairn OS", hx, f64(hero_y - 2 * self.scale), hw, 0, h2_style, full)
+    sub_style := text.body_style(14.5 * s, self.palette.accent_text, true)
+    w_sub := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Tu sistema. Tus reglas.", hx, f64(hero_y + 32 * self.scale), hw, 0, sub_style, full)
+    desc_style := text.body_style(12.5 * s, self.palette.muted, false)
+    desc_h := text.draw_paragraph(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Un cairn es un montón de piedras que marca el camino en la montaña. El símbolo apila tres: base, equilibrio y cima, con un punto de luz de sol sobre la última.",
+        hx, f64(hero_y + 54 * self.scale), hw, 0, desc_style, full)
+
+    // Section 1: Símbolo (3 tiles: Sobre claro, Sobre oscuro, Sobre el wallpaper) + Logotipo (2 tiles)
+    sec1_y := hero_y + 104 * self.scale
+    sec_style := text.body_style(12.5 * s, self.palette.text, true)
+    cap_style := text.body_style(11.5 * s, self.palette.muted, false)
+    w_s1 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Símbolo y logotipo", f64(inner_x), f64(sec1_y), 300.0 * s, 0, sec_style, full)
+
+    tile_y := sec1_y + 20 * self.scale
+    tile_h := 74 * self.scale
+    tile_gap := 10 * self.scale
+    tile_w := (inner_w - tile_gap * 3) / 4
+
+    // Tile 0: Sobre claro (#f4eefc)
+    t0_rect := damage.rect(inner_x, tile_y, tile_w, tile_h)
+    self.window_base.draw_rrect(t0_rect, render.solid_rrect(14.0 * s, render.hex_rgb(0xf4eefc), self.palette.line, render.rgba(255, 255, 255, 180)), full)
+    icons.draw_cairn_mark(&mut self.window_base, f64(t0_rect.x + (tile_w - 48 * self.scale) / 2), f64(tile_y + 13 * self.scale), 48.0 * s, full)
+    w_c0 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body, &"Sobre claro", f64(t0_rect.x), f64(tile_y + tile_h + 4 * self.scale), f64(tile_w), 0, cap_style, full)
+
+    // Tile 1: Sobre oscuro (#14163f)
+    t1_rect := damage.rect(inner_x + tile_w + tile_gap, tile_y, tile_w, tile_h)
+    self.window_base.draw_rrect(t1_rect, render.solid_rrect(14.0 * s, render.hex_rgb(0x14163f), self.palette.line, render.rgba(255, 255, 255, 40)), full)
+    icons.draw_cairn_mark(&mut self.window_base, f64(t1_rect.x + (tile_w - 48 * self.scale) / 2), f64(tile_y + 13 * self.scale), 48.0 * s, full)
+    w_c1 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body, &"Sobre oscuro", f64(t1_rect.x), f64(tile_y + tile_h + 4 * self.scale), f64(tile_w), 0, cap_style, full)
+
+    // Tile 2: Horizontal, claro (`CairnLogo` lockup)
+    t2_rect := damage.rect(inner_x + (tile_w + tile_gap) * 2, tile_y, tile_w, tile_h)
+    self.window_base.draw_rrect(t2_rect, render.solid_rrect(14.0 * s, render.hex_rgb(0xf4eefc), self.palette.line, render.rgba(255, 255, 255, 180)), full)
+    lw0 := icons.draw_cairn_logo(&mut self.window_base, &mut self.atlas, &self.fonts.display,
+        f64(t2_rect.x + 14 * self.scale), f64(tile_y + 23 * self.scale), 28.0 * s, 16.0 * s, 9.5 * s,
+        render.hex_rgb(0x14163f), render.rgba(20, 22, 63, 160), full)
+    w_c2 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body, &"Horizontal, claro", f64(t2_rect.x), f64(tile_y + tile_h + 4 * self.scale), f64(tile_w), 0, cap_style, full)
+
+    // Tile 3: Horizontal, oscuro (`CairnLogo` lockup)
+    t3_rect := damage.rect(inner_x + (tile_w + tile_gap) * 3, tile_y, tile_w, tile_h)
+    self.window_base.draw_rrect(t3_rect, render.solid_rrect(14.0 * s, render.hex_rgb(0x14163f), self.palette.line, render.rgba(255, 255, 255, 40)), full)
+    lw1 := icons.draw_cairn_logo(&mut self.window_base, &mut self.atlas, &self.fonts.display,
+        f64(t3_rect.x + 14 * self.scale), f64(tile_y + 23 * self.scale), 28.0 * s, 16.0 * s, 9.5 * s,
+        render.rgb(255, 255, 255), render.rgba(255, 255, 255, 160), full)
+    w_c3 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body, &"Horizontal, oscuro", f64(t3_rect.x), f64(tile_y + tile_h + 4 * self.scale), f64(tile_w), 0, cap_style, full)
+
+    // Section 2: Icono a distintos tamaños (96, 64, 40, 28, 18 px) + Color (5 BRAND swatches)
+    sec2_y := tile_y + tile_h + 26 * self.scale
+    half_w := (inner_w - 16 * self.scale) / 2
+    w_s2 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Icono a distintos tamaños", f64(inner_x), f64(sec2_y), f64(half_w), 0, sec_style, full)
+    sizes := [5]i32{64, 48, 36, 26, 18}
+    var sx_cur = inner_x
+    num_style := text. TextStyle {
+        font_id: 0,
+        size_px: 10.5 * s,
+        line_height: 1.0,
+        tracking_em: 0.0,
+        color: self.palette.muted,
+        bold: false,
+        tabular_nums: true,
+        balance: false,
+    }
+    var si: usize = 0
+    for si < 5 {
+        sz := sizes[si] * self.scale
+        iy := sec2_y + 20 * self.scale + (64 * self.scale - sz)
+        icons.draw_cairn_icon(&mut self.window_base, f64(sx_cur), f64(iy), f64(sz), full)
+        lbl := sizes[si].to_string()
+        w_n := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+            &lbl, f64(sx_cur), f64(sec2_y + 88 * self.scale), f64(sz), 1, num_style, full)
+        sx_cur = sx_cur + sz + 14 * self.scale
+        si = si + 1
+    }
+
+    col_x := inner_x + half_w + 16 * self.scale
+    w_s3 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Color de marca", f64(col_x), f64(sec2_y), f64(half_w), 0, sec_style, full)
+    sw_w := (half_w - 8 * self.scale * 4) / 5
+    sw_h := 44 * self.scale
+    sw_y := sec2_y + 22 * self.scale
+    brand_hexes := [5]u32{0x14163f, 0x5457d6, 0xb8bcff, 0xf4eefc, 0xffb877}
+    brand_names := [5]string{"Noche", "Índigo", "Lavanda", "Niebla", "Sol"}
+    var bi: usize = 0
+    for bi < 5 {
+        bx := col_x + i32(bi) * (sw_w + 8 * self.scale)
+        self.window_base.draw_rrect(damage.rect(bx, sw_y, sw_w, sw_h),
+            render.solid_rrect(10.0 * s, render.hex_rgb(brand_hexes[bi]), self.palette.line, render.rgba(255, 255, 255, 60)), full)
+        w_bn := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+            &brand_names[bi], f64(bx), f64(sw_y + sw_h + 5 * self.scale), f64(sw_w), 0, cap_style, full)
+        bi = bi + 1
+    }
+}
+
+fn SceneB2.ensure_window_base(&mut self) {
+    if self.window_base_valid { return }
+    full := damage.rect(0, 0, self.width, self.height)
+    self.window_base.blit_from(&self.wallpaper, full)
+
+    s := f64(self.scale)
+    wb := self.win_bounds
+    self.window_base.draw_shadow_9slice(wb, &self.win_shadow, full)
+
+    win_top := render.color_mix(self.palette.surface, 92, render.rgb(255, 255, 255).with_alpha(self.palette.surface.a))
+    self.window_base.draw_rrect(wb, render.RRectStyle {
+        radii: render.uniform_radii(26.0 * s),
+        fill_top: win_top,
+        fill_bottom: self.palette.surface,
+        border_color: self.palette.edge,
+        border_width: 1.0,
+        inner_hi: self.palette.hi,
+    }, full)
+
+    if self.brand_open {
+        self.draw_brand_sheet_content(full)
+        self.window_base_valid = true
+        return
+    }
+
+    // ---- 1. Left Onboarding Sidebar (`Sidebar` in `App.jsx` lines 895-948) ----
+    side_w := (wb.w * 27) / 100
+    side_rect := damage.rect(wb.x + 1, wb.y + 1, side_w, wb.h - 2)
+    self.window_base.draw_rrect(side_rect, render.RRectStyle {
+        radii: render.Radii { tl: 25.0 * s, tr: 0.0, br: 0.0, bl: 25.0 * s },
+        fill_top: self.palette.side,
+        fill_bottom: self.palette.side,
+        border_color: render.rgba(0, 0, 0, 0),
+        border_width: 0.0,
+        inner_hi: render.rgba(0, 0, 0, 0),
+    }, full)
+    // Sidebar 1px right hairline border
+    self.window_base.draw_rrect(damage.rect(wb.x + side_w, wb.y + 1, 1 * self.scale, wb.h - 2),
+        render.solid_rrect(0.0, self.palette.line, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0)), full)
+
+    // Traffic lights (`#ff5f57`, `#febc2e`, `#28c840`, 12x12px)
+    tl_x := wb.x + 18 * self.scale
+    tl_y := wb.y + 18 * self.scale
+    tl_sz := 12 * self.scale
+    tl_gap := 20 * self.scale
+    tl_border := render.rgba(0, 0, 0, 56)
+    self.window_base.draw_rrect(damage.rect(tl_x, tl_y, tl_sz, tl_sz), render.solid_rrect(6.0 * s, render.hex_rgb(0xff5f57), tl_border, render.rgba(0, 0, 0, 0)), full)
+    self.window_base.draw_rrect(damage.rect(tl_x + tl_gap, tl_y, tl_sz, tl_sz), render.solid_rrect(6.0 * s, render.hex_rgb(0xfebc2e), tl_border, render.rgba(0, 0, 0, 0)), full)
+    self.window_base.draw_rrect(damage.rect(tl_x + tl_gap * 2, tl_y, tl_sz, tl_sz), render.solid_rrect(6.0 * s, render.hex_rgb(0x28c840), tl_border, render.rgba(0, 0, 0, 0)), full)
+
+    // `CairnLogo` (`CairnMark(28)` + baseline-aligned `CAIRN OS`)
+    logo_w := icons.draw_cairn_logo(&mut self.window_base, &mut self.atlas, &self.fonts.display,
+        f64(tl_x), f64(wb.y + 42 * self.scale), 28.0 * s, 14.5 * s, 9.5 * s,
+        self.palette.text, self.palette.muted, full)
+
+    // `"PASO 1 DE 8"` uppercase tracking header with tabular numerals
+    paso_style := text.TextStyle {
+        font_id: 0,
+        size_px: 11.0 * s,
+        line_height: 1.2,
+        tracking_em: 0.12,
+        color: self.palette.muted,
+        bold: true,
+        tabular_nums: true,
+        balance: false,
+    }
+    w_paso := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"PASO 1 DE 8", f64(tl_x), f64(wb.y + 84 * self.scale), f64(side_w - 32 * self.scale), 0, paso_style, full)
+
+    // 8 onboarding steps list
+    var step_y = wb.y + 106 * self.scale
+    step_h := 31 * self.scale
+    var si: usize = 0
+    for si < 8 {
+        row_rect := damage.rect(wb.x + 12 * self.scale, step_y, side_w - 24 * self.scale, step_h)
+        is_current := si == 0
+        if is_current {
+            self.window_base.draw_rrect(row_rect, render.RRectStyle {
+                radii: render.uniform_radii(11.0 * s),
+                fill_top: self.palette.accent_soft,
+                fill_bottom: self.palette.accent_soft,
+                border_color: render.rgba(0, 0, 0, 0),
+                border_width: 0.0,
+                inner_hi: render.rgba(0, 0, 0, 0),
+            }, full)
+        }
+        badge_sz := 22 * self.scale
+        badge_x := row_rect.x + 9 * self.scale
+        badge_y := row_rect.y + (step_h - badge_sz) / 2
+        badge_rect := damage.rect(badge_x, badge_y, badge_sz, badge_sz)
+        var badge_fill = render.rgba(0, 0, 0, 0)
+        var badge_border = self.palette.line_strong
+        var badge_num_col = self.palette.muted
+        if is_current {
+            badge_fill = self.palette.accent
+            badge_border = self.palette.accent
+            badge_num_col = render.rgb(255, 255, 255)
+        }
+        self.window_base.draw_rrect(badge_rect, render.RRectStyle {
+            radii: render.uniform_radii(11.0 * s),
+            fill_top: badge_fill,
+            fill_bottom: badge_fill,
+            border_color: badge_border,
+            border_width: 1.5,
+            inner_hi: render.rgba(0, 0, 0, 0),
+        }, full)
+        num_str := (si + 1).to_string()
+        num_st := text.TextStyle {
+            font_id: 0,
+            size_px: 11.0 * s,
+            line_height: 1.0,
+            tracking_em: 0.0,
+            color: badge_num_col,
+            bold: true,
+            tabular_nums: true,
+            balance: false,
+        }
+        w_bnum := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+            &num_str, f64(badge_x), f64(badge_y + 4 * self.scale), f64(badge_sz), 1, num_st, full)
+
+        var sname_col = self.palette.muted
+        if is_current { sname_col = self.palette.text }
+        sname_st := text.body_style(12.5 * s, sname_col, is_current)
+        sname := step_name_by_index(si)
+        w_sname := text.draw_text_truncated(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+            &sname, f64(badge_x + badge_sz + 10 * self.scale), f64(row_rect.y + 7 * self.scale),
+            f64(row_rect.w - badge_sz - 24 * self.scale), 0, sname_st, full)
+
+        step_y = step_y + step_h + 2 * self.scale
+        si = si + 1
+    }
+
+    // Sidebar bottom `StorageMeter` contextual card (`Espacio total estimado` `5.2 GB`)
+    sm_h := 120 * self.scale
+    sm_rect := damage.rect(wb.x + 14 * self.scale, wb.bottom() - 14 * self.scale - sm_h, side_w - 28 * self.scale, sm_h)
+    self.window_base.draw_rrect(sm_rect, render.RRectStyle {
+        radii: render.uniform_radii(16.0 * s),
+        fill_top: self.palette.card,
+        fill_bottom: self.palette.card,
+        border_color: self.palette.line,
+        border_width: 1.0,
+        inner_hi: self.palette.hi,
+    }, full)
+    sm_pad := 12 * self.scale
+    sm_x := sm_rect.x + sm_pad
+    sm_w := sm_rect.w - sm_pad * 2
+    sm_lbl_st := text.body_style(11.5 * s, self.palette.muted, true)
+    w_sm1 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Espacio estimado", f64(sm_x), f64(sm_rect.y + 12 * self.scale), f64(sm_w), 0, sm_lbl_st, full)
+    gb_st := text.TextStyle {
+        font_id: 1,
+        size_px: 17.5 * s,
+        line_height: 1.0,
+        tracking_em: -0.02,
+        color: self.palette.text,
+        bold: false,
+        tabular_nums: true,
+        balance: false,
+    }
+    w_sm2 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.display,
+        &"5.2 GB", f64(sm_x), f64(sm_rect.y + 8 * self.scale), f64(sm_w), 2, gb_st, full)
+
+    // StorageMeter progress bar (`h-2 rounded-full`)
+    bar_rect := damage.rect(sm_x, sm_rect.y + 34 * self.scale, sm_w, 7 * self.scale)
+    self.window_base.draw_rrect(bar_rect, render.solid_rrect(3.5 * s, self.palette.track, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0)), full)
+    fill_bar := damage.rect(sm_x, sm_rect.y + 34 * self.scale, (sm_w * 42) / 100, 7 * self.scale)
+    self.window_base.draw_rrect(fill_bar, render.solid_rrect(3.5 * s, self.palette.accent, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0)), full)
+
+    // Legend row: dot + "Sistema base" + "5.2 GB"
+    dot_y := sm_rect.y + 52 * self.scale
+    self.window_base.draw_rrect(damage.rect(sm_x, dot_y + 3 * self.scale, 7 * self.scale, 7 * self.scale),
+        render.solid_rrect(3.5 * s, self.palette.accent, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0)), full)
+    leg_st := text.body_style(11.5 * s, self.palette.text, false)
+    leg_num_st := text.TextStyle {
+        font_id: 0,
+        size_px: 11.5 * s,
+        line_height: 1.2,
+        tracking_em: 0.0,
+        color: self.palette.muted,
+        bold: false,
+        tabular_nums: true,
+        balance: false,
+    }
+    w_leg1 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Sistema base", f64(sm_x + 12 * self.scale), f64(dot_y), f64(sm_w - 12 * self.scale), 0, leg_st, full)
+    w_leg2 := text.draw_text_line(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"5.2 GB", f64(sm_x), f64(dot_y), f64(sm_w), 2, leg_num_st, full)
+
+    note_st := text.body_style(10.5 * s, self.palette.muted, false)
+    h_note := text.draw_paragraph(&mut self.window_base, &mut self.atlas, &self.fonts.body,
+        &"Sin conexión: no se instalarán aplicaciones adicionales.",
+        f64(sm_x), f64(sm_rect.y + 72 * self.scale), f64(sm_w), 0, note_st, full)
+
+    // ---- 2. Right Main Content Area (`StepWelcome` in `App.jsx` lines 370-392) ----
+    main_x := wb.x + side_w
+    main_w := wb.w - side_w
+    footer_h := 52 * self.scale
+    footer_y := wb.bottom() - footer_h
+
+    // Footer top hairline border
+    self.window_base.draw_rrect(damage.rect(main_x + 1, footer_y, main_w - 2, 1 * self.scale),
+        render.solid_rrect(0.0, self.palette.line, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0)), full)
+
+    // Centered `104x104` rounded card (`borderRadius: 30`) with `CairnMark(size=62)`
+    mark_card_sz := 96 * self.scale
+    mark_card_x := main_x + (main_w - mark_card_sz) / 2
+    mark_card_y := wb.y + 42 * self.scale
+    mark_card_rect := damage.rect(mark_card_x, mark_card_y, mark_card_sz, mark_card_sz)
+    self.window_base.draw_rrect(mark_card_rect, render.RRectStyle {
+        radii: render.uniform_radii(28.0 * s),
+        fill_top: self.palette.card,
+        fill_bottom: self.palette.card,
+        border_color: self.palette.line,
+        border_width: 1.0,
+        inner_hi: self.palette.hi,
+    }, full)
+    mark_sz := 58.0 * s
+    icons.draw_cairn_mark(&mut self.window_base,
+        f64(mark_card_x) + (f64(mark_card_sz) - mark_sz) * 0.5,
+        f64(mark_card_y) + (f64(mark_card_sz) - mark_sz) * 0.5,
+        mark_sz, full)
+
+    // Measure text layout vs rasterization times on the Welcome screen hero text
+    t_lay0 := objc.monotonic_ns()
+    h1_style := text.display_style(38.0 * s, self.palette.text)
+    slogan_style := text.TextStyle {
+        font_id: 1,
+        size_px: 20.0 * s,
+        line_height: 1.2,
+        tracking_em: -0.01,
+        color: self.palette.accent_text,
+        bold: false,
+        tabular_nums: false,
+        balance: false,
+    }
+    body_para_style := text.body_style(14.0 * s, self.palette.muted, false)
+    para_max_w := 460.0 * s
+    h1_run := text.shape_text(&self.fonts.display, &"Bienvenido a Cairn", h1_style)
+    slogan_run := text.shape_text(&self.fonts.display, &"Tu sistema. Tus reglas.", slogan_style)
+    para_layout := text.layout_paragraph(&self.fonts.body,
+        &"Cairn es un sistema operativo experimental construido desde cero sobre un microkernel escrito en Tarn, con seguridad de memoria desde la base. En unos minutos tendrás un escritorio hecho a tu medida.",
+        para_max_w, body_para_style)
+    t_lay1 := objc.monotonic_ns()
+
+    // Draw shaped & laid-out hero typography
+    t_ras0 := objc.monotonic_ns()
+    h1_y := f64(mark_card_y + mark_card_sz + 20 * self.scale)
+    h1_x := f64(main_x) + (f64(main_w) - h1_run.width) * 0.5
+    d_h1 := text.draw_shaped_run(&mut self.window_base, &mut self.atlas, &self.fonts.display, &h1_run, h1_x, h1_y, h1_style, full)
+
+    slogan_y := h1_y + 44.0 * s
+    slogan_x := f64(main_x) + (f64(main_w) - slogan_run.width) * 0.5
+    d_sl := text.draw_shaped_run(&mut self.window_base, &mut self.atlas, &self.fonts.display, &slogan_run, slogan_x, slogan_y, slogan_style, full)
+
+    para_y := slogan_y + 34.0 * s
+    para_x := f64(main_x) + (f64(main_w) - para_max_w) * 0.5
+    d_pa := text.draw_paragraph_layout(&mut self.window_base, &mut self.atlas, &self.fonts.body, &para_layout, para_x, para_y, para_max_w, 1, body_para_style, full)
+
+    // 3 feature `.chip` capsules with Lucide vector icons (`Box`, `ShieldCheck`, `Palette`)
+    chip_h := 30 * self.scale
+    chip_y := i32(para_y + para_layout.total_height + 16.0 * s)
+    chip_gap := 8 * self.scale
+    // Estimate total width of the 3 chips to center the row
+    c1_lbl := "Microkernel en Tarn"
+    c2_lbl := "Memoria segura"
+    c3_lbl := "A tu manera"
+    ch_st := text.body_style(12.5 * s, self.palette.text, true)
+    r_c1 := text.shape_text(&self.fonts.body, &c1_lbl, ch_st)
+    r_c2 := text.shape_text(&self.fonts.body, &c2_lbl, ch_st)
+    r_c3 := text.shape_text(&self.fonts.body, &c3_lbl, ch_st)
+    pad_ch := i32(12.0 * s) * 2 + i32(14.0 * s) + i32(7.0 * s)
+    total_chips_w := (pad_ch + i32(r_c1.width + 1.0)) + (pad_ch + i32(r_c2.width + 1.0)) + (pad_ch + i32(r_c3.width + 1.0)) + chip_gap * 2
+    var cx_chip = main_x + (main_w - total_chips_w) / 2
+    w_ch1 := draw_feature_chip(&mut self.window_base, &mut self.atlas, &self.fonts.body, &self.palette, icons.ICON_BOX, &c1_lbl, cx_chip, chip_y, chip_h, s, full)
+    cx_chip = cx_chip + w_ch1 + chip_gap
+    w_ch2 := draw_feature_chip(&mut self.window_base, &mut self.atlas, &self.fonts.body, &self.palette, icons.ICON_SHIELD_CHECK, &c2_lbl, cx_chip, chip_y, chip_h, s, full)
+    cx_chip = cx_chip + w_ch2 + chip_gap
+    w_ch3 := draw_feature_chip(&mut self.window_base, &mut self.atlas, &self.fonts.body, &self.palette, icons.ICON_PALETTE, &c3_lbl, cx_chip, chip_y, chip_h, s, full)
+    t_ras1 := objc.monotonic_ns()
+
+    if self.text_layout_ns == 0 {
+        self.text_layout_ns = t_lay1 - t_lay0
+        self.text_raster_ns = t_ras1 - t_ras0
+    }
+
+    self.window_base_valid = true
+}
+
+fn SceneB2.draw_icon_button(&mut self, id i32, bounds damage.Rect, icon_id u32, clip damage.Rect) {
+    if !bounds.intersects(&clip) { return }
+    s := f64(self.scale)
+    hovered := self.hovered_id == id
+    pressed := self.pressed_id == id
+    if hovered || pressed || (id == ITEM_BTN_SIDE_BRAND && self.brand_open) {
+        var fill = self.palette.card_hover
+        if id == ITEM_BTN_SIDE_BRAND && self.brand_open { fill = self.palette.accent_soft }
+        self.frame.draw_rrect(bounds, render.RRectStyle {
+            radii: render.uniform_radii(9.0 * s),
+            fill_top: fill,
+            fill_bottom: fill,
+            border_color: render.rgba(0, 0, 0, 0),
+            border_width: 0.0,
+            inner_hi: render.rgba(0, 0, 0, 0),
+        }, clip)
+    }
+    var col = self.palette.muted
+    if hovered || (id == ITEM_BTN_SIDE_BRAND && self.brand_open) { col = self.palette.text }
+    ico_sz := 15.0 * s
+    ix := bounds.x + (bounds.w - i32(ico_sz)) / 2
+    iy := bounds.y + (bounds.h - i32(ico_sz)) / 2
+    drawn := icons.draw_icon(&mut self.frame, &mut self.atlas, icon_id, ix, iy, ico_sz, 2.0, col, clip)
+}
+
+fn SceneB2.draw_tile(&mut self, clip damage.Rect) {
+    self.ensure_window_base()
+    self.frame.blit_from(&self.window_base, clip)
+
+    s := f64(self.scale)
+
+    // Sidebar toolbar icon buttons (`Shapes` brand identity, `RotateCcw` theme/reset)
+    if !self.brand_open {
+        self.draw_icon_button(ITEM_BTN_SIDE_BRAND, self.btn_side_brand_bounds, icons.ICON_SHAPES, clip)
+        self.draw_icon_button(ITEM_BTN_SIDE_RESET, self.btn_side_reset_bounds, icons.ICON_ROTATE_CCW, clip)
+    }
+
+    // Primary CTA `#btn-comenzar` ("Comenzar" + ArrowRight)
+    cta_pad := 18 * self.scale
+    cta_outer := damage.rect(self.btn_comenzar_bounds.x - cta_pad, self.btn_comenzar_bounds.y - cta_pad,
+        self.btn_comenzar_bounds.w + cta_pad * 2, self.btn_comenzar_bounds.h + cta_pad * 2)
+    if !self.brand_open && cta_outer.intersects(&clip) {
+        hovered := self.hovered_id == ITEM_BTN_COMENZAR
+        pressed := self.pressed_id == ITEM_BTN_COMENZAR
+        var r = self.btn_comenzar_bounds
+        if pressed {
+            r = damage.rect(r.x + 2 * self.scale, r.y + 1 * self.scale, r.w - 4 * self.scale, r.h - 2 * self.scale)
+        }
+        self.frame.draw_shadow_9slice(r, &self.btn_shadow, clip)
+        var fill = self.palette.accent
+        if hovered {
+            fill = render.color_mix(self.palette.accent, 86, render.rgb(255, 255, 255))
+        }
+        self.frame.draw_rrect(r, render.RRectStyle {
+            radii: render.uniform_radii(15.0 * s),
+            fill_top: render.color_mix(fill, 90, render.rgb(255, 255, 255)),
+            fill_bottom: fill,
+            border_color: fill,
+            border_width: 1.0,
+            inner_hi: render.rgba(255, 255, 255, 64),
+        }, clip)
+        btn_st := text.body_style(14.5 * s, render.rgb(255, 255, 255), true)
+        run := text.shape_text(&self.fonts.body, &"Comenzar", btn_st)
+        ico_sz := 17.0 * s
+        gap := 8.0 * s
+        total_w := run.width + gap + ico_sz
+        tx := f64(r.x) + (f64(r.w) - total_w) * 0.5
+        ty := f64(r.y) + (f64(r.h) - 14.5 * s) * 0.5 - 1.0 * s
+        d_txt := text.draw_shaped_run(&mut self.frame, &mut self.atlas, &self.fonts.body, &run, tx, ty, btn_st, clip)
+        d_ico := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_ARROW_RIGHT,
+            i32(tx + run.width + gap), r.y + (r.h - i32(ico_sz)) / 2, ico_sz, 2.2, render.rgb(255, 255, 255), clip)
+    }
+
+    // Footer left `#btn-atras` ("Atrás" + ArrowLeft)
+    if self.btn_atras_bounds.intersects(&clip) {
+        hovered := self.hovered_id == ITEM_BTN_ATRAS
+        pressed := self.pressed_id == ITEM_BTN_ATRAS
+        var r = self.btn_atras_bounds
+        if pressed {
+            r = damage.rect(r.x + 1 * self.scale, r.y + 1 * self.scale, r.w - 2 * self.scale, r.h - 2 * self.scale)
+        }
+        var fill = self.palette.card
+        if hovered { fill = self.palette.card_hover }
+        self.frame.draw_rrect(r, render.RRectStyle {
+            radii: render.uniform_radii(12.0 * s),
+            fill_top: fill,
+            fill_bottom: fill,
+            border_color: self.palette.line,
+            border_width: 1.0,
+            inner_hi: self.palette.hi,
+        }, clip)
+        btn_st := text.body_style(13.0 * s, self.palette.text, true)
+        run := text.shape_text(&self.fonts.body, &"Atrás", btn_st)
+        ico_sz := 15.0 * s
+        gap := 6.0 * s
+        total_w := ico_sz + gap + run.width
+        ix := f64(r.x) + (f64(r.w) - total_w) * 0.5
+        d_ico := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_ARROW_LEFT,
+            i32(ix), r.y + (r.h - i32(ico_sz)) / 2, ico_sz, 2.0, self.palette.muted, clip)
+        ty := f64(r.y) + (f64(r.h) - 13.0 * s) * 0.5 - 1.0 * s
+        d_txt := text.draw_shaped_run(&mut self.frame, &mut self.atlas, &self.fonts.body, &run, ix + ico_sz + gap, ty, btn_st, clip)
+    }
+
+    // Footer right `#btn-marca` ("Identidad de marca" / "Volver a bienvenida")
+    if self.btn_marca_bounds.intersects(&clip) {
+        hovered := self.hovered_id == ITEM_BTN_MARCA
+        pressed := self.pressed_id == ITEM_BTN_MARCA
+        var r = self.btn_marca_bounds
+        if pressed {
+            r = damage.rect(r.x + 1 * self.scale, r.y + 1 * self.scale, r.w - 2 * self.scale, r.h - 2 * self.scale)
+        }
+        var fill = self.palette.card
+        if hovered { fill = self.palette.card_hover }
+        self.frame.draw_rrect(r, render.RRectStyle {
+            radii: render.uniform_radii(12.0 * s),
+            fill_top: fill,
+            fill_bottom: fill,
+            border_color: self.palette.line,
+            border_width: 1.0,
+            inner_hi: self.palette.hi,
+        }, clip)
+        var lbl = "Identidad de marca"
+        if self.brand_open { lbl = "Volver a bienvenida" }
+        btn_st := text.body_style(12.5 * s, self.palette.text, true)
+        run := text.shape_text(&self.fonts.body, &lbl, btn_st)
+        ico_sz := 14.0 * s
+        gap := 6.0 * s
+        total_w := ico_sz + gap + run.width
+        ix := f64(r.x) + (f64(r.w) - total_w) * 0.5
+        d_ico := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_SHAPES,
+            i32(ix), r.y + (r.h - i32(ico_sz)) / 2, ico_sz, 2.0, self.palette.accent_text, clip)
+        ty := f64(r.y) + (f64(r.h) - 12.5 * s) * 0.5 - 1.0 * s
+        d_txt := text.draw_shaped_run(&mut self.frame, &mut self.atlas, &self.fonts.body, &run, ix + ico_sz + gap, ty, btn_st, clip)
+    }
+}
+
+pub fn SceneB2.render_damaged(&mut self) u32 {
+    if self.damage.is_empty() {
+        return 0
+    }
+    n := self.damage.len()
+    var i: usize = 0
+    for i < n {
+        r := self.damage.at(i)
+        self.draw_tile(r)
+        i = i + 1
+    }
+    self.frames_rendered = self.frames_rendered + 1
+    self.tiles_rendered = self.tiles_rendered + u64(n)
+    return u32(n)
+}
+
+// Benchmarks drawing >= 1,000 cached glyphs + Lucide icons from `self.atlas` after warm-up.
+// Returns `[min_elapsed_us, new_atlas_rasterizations_during_hot_loop, glyphs_drawn]`.
+pub fn SceneB2.bench_cached_1000_glyphs(&mut self) [3]u64 {
+    s := f64(self.scale)
+    st_body := text.body_style(13.0 * s, self.palette.text, false)
+    st_disp := text.display_style(18.0 * s, self.palette.accent_text)
+    line_es := "Bienvenido a Cairn OS · Microkernel en Tarn · Memoria segura · Diseño ágil y rápido 0123456789"
+    run_es := text.shape_text(&self.fonts.body, &line_es, st_body)
+    run_hd := text.shape_text(&self.fonts.display, &"Tu sistema. Tus reglas. Paso 1 de 8", st_disp)
+    clip := damage.rect(0, 0, self.width, self.height)
+
+    // Warm up the glyph & icon atlas for all subpixel phases used by the benchmark lines
+    var warm: i32 = 0
+    for warm < 12 {
+        ox := 24.0 + f64(warm % 4) * 0.25
+        oy := 24.0 + f64(warm * 18)
+        d0 := text.draw_shaped_run(&mut self.frame, &mut self.atlas, &self.fonts.body, &run_es, ox, oy, st_body, clip)
+        d1 := text.draw_shaped_run(&mut self.frame, &mut self.atlas, &self.fonts.display, &run_hd, ox, oy + 16.0, st_disp, clip)
+        i0 := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_BOX, 24 + warm * 20, 300, 14.0 * s, 2.0, self.palette.accent_text, clip)
+        i1 := icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_SHIELD_CHECK, 24 + warm * 20, 320, 14.0 * s, 2.0, self.palette.accent_text, clip)
+        warm = warm + 1
+    }
+
+    ras_before := self.atlas.rasterized_count
+    var min_us: u64 = 999999999
+    var glyphs_drawn: u32 = 0
+    var rep: u32 = 0
+    for rep < 5 {
+        glyphs_drawn = 0
+        t0 := objc.monotonic_ns()
+        var row: i32 = 0
+        for row < 10 {
+            ox := 24.0 + f64(row % 4) * 0.25
+            oy := 24.0 + f64(row * 18)
+            glyphs_drawn = glyphs_drawn + text.draw_shaped_run(&mut self.frame, &mut self.atlas, &self.fonts.body, &run_es, ox, oy, st_body, clip)
+            glyphs_drawn = glyphs_drawn + text.draw_shaped_run(&mut self.frame, &mut self.atlas, &self.fonts.display, &run_hd, ox, oy + 16.0, st_disp, clip)
+            glyphs_drawn = glyphs_drawn + icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_BOX, 24 + row * 20, 300, 14.0 * s, 2.0, self.palette.accent_text, clip)
+            glyphs_drawn = glyphs_drawn + icons.draw_icon(&mut self.frame, &mut self.atlas, icons.ICON_SHIELD_CHECK, 24 + row * 20, 320, 14.0 * s, 2.0, self.palette.accent_text, clip)
+            row = row + 1
+        }
+        t1 := objc.monotonic_ns()
+        dt := (t1 - t0) / 1000
+        if dt < min_us { min_us = dt }
+        rep = rep + 1
+    }
+    ras_after := self.atlas.rasterized_count
+
+    // Restore the clean Welcome scene frame after benchmarking
+    self.frame.blit_from(&self.window_base, clip)
+    self.damage.add_full(self.width, self.height)
+    restored := self.render_damaged()
+    self.damage.clear()
+
+    return [3]u64{min_us, ras_after - ras_before, u64(glyphs_drawn)}
+}
+
+pub fn SceneB2.snapshot_png(&self, path &string) Result<string, i32> {
+    return png.write_bgra_png(path, self.frame.pixels.as_slice(), u32(self.width), u32(self.height))
+}

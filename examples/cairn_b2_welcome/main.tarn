@@ -1,0 +1,176 @@
+// Demo `examples/cairn_b2_welcome`:
+// Milestone B2 of the third `tarn_ui` backend (`backends/cairn/`):
+// Pure-Tarn TrueType/OpenType text engine (`Bricolage Grotesque` + `Onest`),
+// Lucide vector icons, and Cairn brand marks rendered over the B1 procedural
+// `Wallpaper("lago")` and `.glass.window` card.
+//
+// Usage:
+//   cairn_b2_welcome                         # Opens interactive macOS host window (Welcome screen)
+//   cairn_b2_welcome --brand                 # Opens interactive macOS host window on BrandSheet
+//   cairn_b2_welcome --headless [out.png]    # Renders Welcome screen headlessly, writes PNG, prints SHA-256 & timings
+//   cairn_b2_welcome --headless-brand [png]  # Renders BrandSheet screen headlessly, writes PNG, prints SHA-256
+//   cairn_b2_welcome --bench                 # Runs B2 budget benchmarks + live macOS host window check
+import "os"
+import "core/session"
+import "backend/objc"
+import "backend/scene_b2"
+import "backend/native"
+
+fn run_headless(out_path &string, brand_mode bool) i32 {
+    var scene = scene_b2.SceneB2.new(960, 600, 1)
+    font_load_us := scene.font_load_ns / 1000
+    layout_us := scene.text_layout_ns / 1000
+    raster_us := scene.text_raster_ns / 1000
+    first_us := scene.first_frame_ns / 1000
+    scene.damage.clear()
+
+    if brand_mode {
+        mx := scene.btn_marca_bounds.x + 10
+        my := scene.btn_marca_bounds.y + 10
+        down := scene.on_pointer_down(mx, my)
+        up := scene.on_pointer_up(mx, my)
+        redrawn := scene.render_damaged()
+        scene.damage.clear()
+    }
+
+    idle_redraws := scene.render_damaged()
+
+    hash := match scene.snapshot_png(out_path) {
+        Ok(h) => h
+        Err(code) => {
+            print("snapshot_png error: " + code.to_string())
+            return 1
+        }
+    }
+
+    bench := scene.bench_cached_1000_glyphs()
+    cached_1000_us := bench[0]
+    new_allocs := bench[1]
+    glyphs_count := bench[2]
+
+    // Measure single-button hover damage redraw
+    cx := scene.btn_comenzar_bounds.x + scene.btn_comenzar_bounds.w / 2
+    cy := scene.btn_comenzar_bounds.y + scene.btn_comenzar_bounds.h / 2
+    var min_hover_us: u64 = 999999999
+    var iter: u32 = 0
+    for iter < 6 {
+        scene.hovered_id = scene_b2.ITEM_NONE
+        scene.damage.clear()
+        th0 := objc.monotonic_ns()
+        moved := scene.on_pointer_move(cx, cy)
+        rects := scene.render_damaged()
+        scene.damage.clear()
+        th1 := objc.monotonic_ns()
+        dt := (th1 - th0) / 1000
+        if dt < min_hover_us && rects > 0 { min_hover_us = dt }
+        iter = iter + 1
+    }
+
+    print("cairn_b2_welcome headless snapshot:")
+    print("  path: " + out_path.clone())
+    print("  sha256: " + hash)
+    print("  cold_font_load_us: " + font_load_us.to_string())
+    print("  text_layout_us: " + layout_us.to_string())
+    print("  cold_glyph_icon_raster_us: " + raster_us.to_string())
+    print("  960x600_cold_first_frame_us: " + first_us.to_string() + " (budget < 80000 us)")
+    print("  cached_" + glyphs_count.to_string() + "_glyphs_draw_us: " + cached_1000_us.to_string() + " (budget < 1000 us, new_atlas_allocs=" + new_allocs.to_string() + ")")
+    print("  cta_hover_damage_min_us: " + min_hover_us.to_string() + " (budget < 1500 us)")
+    print("  idle_redraws: " + idle_redraws.to_string())
+    return 0
+}
+
+fn run_bench() i32 {
+    status := run_headless(&"/tmp/cairn-b2-welcome-snapshot.png", false)
+    if status != 0 { return status }
+    status_brand := run_headless(&"/tmp/cairn-b2-brand-snapshot.png", true)
+    if status_brand != 0 { return status_brand }
+    if !native.display_available() {
+        print("  host_window: skipped (no window server)")
+        return 0
+    }
+    var ui = match native.create(&"Cairn B2 · Bienvenida a Cairn", &"Bienvenido a Cairn") {
+        Ok(v) => v
+        Err(code) => {
+            print("native.create error: " + code.to_string())
+            return 1
+        }
+    }
+    win_first_us := ui.first_frame_nanos() / 1000
+    ev := ui.next()
+    presents0 := ui.presents_count()
+
+    d_idle := ui.inject_pointer_move(8, 8)
+    presents_idle := ui.presents_count() - presents0
+
+    cta_x := ui.scene_b2.get(0).btn_comenzar_bounds.x + ui.scene_b2.get(0).btn_comenzar_bounds.w / 2
+    cta_y := ui.scene_b2.get(0).btn_comenzar_bounds.y + ui.scene_b2.get(0).btn_comenzar_bounds.h / 2
+    th0 := objc.monotonic_ns()
+    d_hover := ui.inject_pointer_move(cta_x, cta_y)
+    th1 := objc.monotonic_ns()
+    win_hover_us := (th1 - th0) / 1000
+
+    closed := ui.request_close()
+    rel := ui.release()
+    print("  macos_window_first_frame_us: " + win_first_us.to_string() + " (budget < 80000 us)")
+    print("  macos_window_hover_redraw_us: " + win_hover_us.to_string() + " (dirty_rects=" + d_hover.to_string() + ")")
+    print("  macos_window_idle_presents: " + presents_idle.to_string() + " (dirty_rects=" + d_idle.to_string() + ")")
+    return 0
+}
+
+fn main() {
+    argv := match os.args() {
+        Ok(list) => list
+        Err(_) => Vec.new()
+    }
+    var heading = "Bienvenido a Cairn"
+    if argv.len() >= 2 {
+        arg1 := argv.get(1)
+        if arg1.eq(&"--headless") {
+            var out = "/tmp/cairn-b2-welcome.png"
+            if argv.len() >= 3 { out = argv.get(2).clone() }
+            code := run_headless(&out, false)
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+        if arg1.eq(&"--headless-brand") {
+            var out_b = "/tmp/cairn-b2-brand.png"
+            if argv.len() >= 3 { out_b = argv.get(2).clone() }
+            code_b := run_headless(&out_b, true)
+            if code_b != 0 { os.exit(u8(code_b)) }
+            return
+        }
+        if arg1.eq(&"--bench") {
+            code := run_bench()
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+        if arg1.eq(&"--brand") {
+            heading = "Identidad de marca"
+        }
+    }
+
+    unsafe {
+        match session.run("Cairn B2 · Bienvenida a Cairn", heading, fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.set_escape_action(99)
+            for {
+                action := try ui.next_action()
+                match action {
+                    session.Action.Closed => { return Ok(()) }
+                    session.Action.Activate(id) => {
+                        if id == 99 {
+                            try ui.request_close()
+                        }
+                        try ui.complete_event()
+                    }
+                    _ => {}
+                }
+            }
+        }) {
+            Ok(_) => {}
+            Err(error) => {
+                print(error.message())
+                os.exit(1)
+            }
+        }
+    }
+}

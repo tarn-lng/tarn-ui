@@ -7,6 +7,7 @@ import "ffi"
 import "collections"
 import "backend/objc"
 import "backend/scene_b1"
+import "backend/scene_b2"
 import "backend/surface_macos"
 
 const OPENED usize = 0
@@ -96,6 +97,8 @@ pub struct Native {
     pool *mut u8
     pub surface surface_macos.MacSurface
     pub scene scene_b1.SceneB1
+    pub scene_b2 Vec<scene_b2.SceneB2>
+    pub use_b2 bool
     title string
     heading string
     counter_enabled bool
@@ -270,7 +273,12 @@ pub fn abi() u32 { return 14 }
 
 pub fn Native.native_window(&self) *mut u8 { return self.window }
 pub fn Native.first_frame_nanos(&self) u64 { return self.first_frame_ns }
-pub fn Native.frames_rendered(&self) u64 { return self.scene.frames_rendered }
+pub fn Native.frames_rendered(&self) u64 {
+    if self.use_b2 && !self.scene_b2.is_empty() {
+        return self.scene_b2.get(0).frames_rendered
+    }
+    return self.scene.frames_rendered
+}
 pub fn Native.presents_count(&self) u64 { return self.surface.presents }
 
 pub fn display_available() bool { return objc.main_thread() && objc.load_frameworks() }
@@ -350,9 +358,26 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
     }
 
     t0 := objc.monotonic_ns()
-    var scene = scene_b1.SceneB1.new(w, h, 1)
-    blitted := surf.present_damaged(scene.frame.pixels.as_slice(), w, h, scene.frame.stride, &scene.damage)
-    scene.damage.clear()
+    is_b2 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B2")
+    var scene = scene_b1.SceneB1.new(1, 1, 1)
+    var sb2_vec: Vec<scene_b2.SceneB2> = Vec.new()
+    if is_b2 {
+        var sb2 = scene_b2.SceneB2.new(w, h, 1)
+        if heading.eq(&"Identidad de marca") {
+            sb2.brand_open = true
+            sb2.window_base_valid = false
+            sb2.damage.add_full(w, h)
+            redrawn := sb2.render_damaged()
+        }
+        blitted2 := surf.present_damaged(sb2.frame.pixels.as_slice(), w, h, sb2.frame.stride, &sb2.damage)
+        sb2.damage.clear()
+        sb2_vec.push(sb2)
+        scene.damage.clear()
+    } else {
+        scene = scene_b1.SceneB1.new(w, h, 1)
+        blitted := surf.present_damaged(scene.frame.pixels.as_slice(), w, h, scene.frame.stride, &scene.damage)
+        scene.damage.clear()
+    }
     t1 := objc.monotonic_ns()
 
     objc.tell1(window, &"makeKeyAndOrderFront:", objc.nil())
@@ -368,6 +393,8 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
         pool: pool,
         surface: surf,
         scene: scene,
+        scene_b2: sb2_vec,
+        use_b2: is_b2,
         title: title.clone(),
         heading: heading.clone(),
         counter_enabled: false,
@@ -412,6 +439,20 @@ fn Native.writable(&self) i32 {
 
 // Re-renders only damaged tiles and presents to the host surface if anything changed.
 pub fn Native.flush_damage(&mut self) u32 {
+    if self.use_b2 && !self.scene_b2.is_empty() {
+        sb2 := self.scene_b2.get_mut(0)
+        if sb2.damage.is_empty() { return 0 }
+        tiles2 := sb2.render_damaged()
+        blitted2 := self.surface.present_damaged(
+            sb2.frame.pixels.as_slice(),
+            self.width,
+            self.height,
+            sb2.frame.stride,
+            &sb2.damage
+        )
+        sb2.damage.clear()
+        return tiles2
+    }
     if self.scene.damage.is_empty() { return 0 }
     tiles := self.scene.render_damaged()
     blitted := self.surface.present_damaged(
@@ -428,14 +469,30 @@ pub fn Native.flush_damage(&mut self) u32 {
 // Synthetic pointer move injection (in window-local top-left coordinates) for
 // deterministic hover damage benchmarking and testing without OS Accessibility permissions.
 pub fn Native.inject_pointer_move(&mut self, x i32, y i32) u32 {
+    if self.use_b2 && !self.scene_b2.is_empty() {
+        if self.scene_b2.get_mut(0).on_pointer_move(x, y) {
+            return self.flush_damage()
+        }
+        return 0
+    }
     if self.scene.on_pointer_move(x, y) {
         return self.flush_damage()
     }
     return 0
 }
 
-// Synthetic click injection on a B1 card/button or keyed widget.
+// Synthetic click injection on a B1/B2 card/button or keyed widget.
 pub fn Native.inject_click_at(&mut self, x i32, y i32) u32 {
+    if self.use_b2 && !self.scene_b2.is_empty() {
+        down2 := self.scene_b2.get_mut(0).on_pointer_down(x, y)
+        self.flush_damage()
+        act2 := self.scene_b2.get_mut(0).on_pointer_up(x, y)
+        tiles2 := self.flush_damage()
+        if act2 != scene_b2.ITEM_NONE {
+            enqueue(self.block, 1001 + act2, objc.nil())
+        }
+        return tiles2
+    }
     down := self.scene.on_pointer_down(x, y)
     self.flush_damage()
     act := self.scene.on_pointer_up(x, y)
@@ -546,7 +603,11 @@ pub fn Native.iterate(&mut self) {
     if ev_type == objc.EVENT_MOUSE_MOVED || ev_type == objc.EVENT_LEFT_MOUSE_DRAGGED {
         match parse_event_point(event, self.height) {
             Some(pt) => {
-                if self.scene.on_pointer_move(pt[0], pt[1]) {
+                if self.use_b2 && !self.scene_b2.is_empty() {
+                    if self.scene_b2.get_mut(0).on_pointer_move(pt[0], pt[1]) {
+                        self.flush_damage()
+                    }
+                } else if self.scene.on_pointer_move(pt[0], pt[1]) {
                     self.flush_damage()
                 }
             }
@@ -555,7 +616,11 @@ pub fn Native.iterate(&mut self) {
     } else if ev_type == objc.EVENT_LEFT_MOUSE_DOWN {
         match parse_event_point(event, self.height) {
             Some(pt) => {
-                if self.scene.on_pointer_down(pt[0], pt[1]) {
+                if self.use_b2 && !self.scene_b2.is_empty() {
+                    if self.scene_b2.get_mut(0).on_pointer_down(pt[0], pt[1]) {
+                        self.flush_damage()
+                    }
+                } else if self.scene.on_pointer_down(pt[0], pt[1]) {
                     self.flush_damage()
                 }
             }
@@ -564,13 +629,21 @@ pub fn Native.iterate(&mut self) {
     } else if ev_type == objc.EVENT_LEFT_MOUSE_UP {
         match parse_event_point(event, self.height) {
             Some(pt) => {
-                act := self.scene.on_pointer_up(pt[0], pt[1])
-                self.flush_damage()
-                if act != scene_b1.CARD_NONE {
-                    if self.counter_enabled && act == scene_b1.CARD_BTN_PRIMARY {
-                        enqueue(self.block, 3, objc.nil())
-                    } else {
-                        enqueue(self.block, 1001 + act, objc.nil())
+                if self.use_b2 && !self.scene_b2.is_empty() {
+                    act2 := self.scene_b2.get_mut(0).on_pointer_up(pt[0], pt[1])
+                    self.flush_damage()
+                    if act2 != scene_b2.ITEM_NONE {
+                        enqueue(self.block, 1001 + act2, objc.nil())
+                    }
+                } else {
+                    act := self.scene.on_pointer_up(pt[0], pt[1])
+                    self.flush_damage()
+                    if act != scene_b1.CARD_NONE {
+                        if self.counter_enabled && act == scene_b1.CARD_BTN_PRIMARY {
+                            enqueue(self.block, 3, objc.nil())
+                        } else {
+                            enqueue(self.block, 1001 + act, objc.nil())
+                        }
                     }
                 }
             }
@@ -1236,6 +1309,12 @@ pub fn Native.snapshot_png(&mut self, path &string) i32 {
         Err(failure) => { return failure }
     }
     self.flush_damage()
+    if self.use_b2 && !self.scene_b2.is_empty() {
+        return match self.scene_b2.get(0).snapshot_png(path) {
+            Ok(_) => 0
+            Err(code) => code
+        }
+    }
     return match self.scene.snapshot_png(path) {
         Ok(_) => 0
         Err(code) => code

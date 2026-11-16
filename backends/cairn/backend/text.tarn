@@ -1,0 +1,1514 @@
+// Pure-Tarn TrueType/OpenType Text Engine (`text.tarn`) — Milestone B2:
+// - TrueType/OpenType `.ttf` parser (`cmap` Format 4, `head`, `hhea`, `maxp`,
+//   `hmtx`, `loca`, `glyf` simple + composite glyphs, and `GPOS` LookupType 2 /
+//   LookupType 9 Extension PairPos Format 1 & Format 2 kerning).
+// - Analytical signed-area scanline coverage rasterizer with 4× horizontal
+//   subpixel positioning (`phase` 0..3) and shelf-packed glyph atlas cache.
+// - UTF-8 decoding (including Spanish accents `á é í ó ú ñ ü ¡ ¿ « » · –`),
+//   kerning + tabular numerals (`tnum`), UAX #14 word/char line breaking,
+//   balanced headings (`text-wrap: balance`), ellipsis truncation, and
+//   baseline-aligned compositing onto `render.Canvas`.
+import "fs"
+import "ffi"
+import "collections"
+import "backend/damage"
+import "backend/render"
+
+// ---- Binary big-endian readers ----
+fn u16_be(data &[]u8, at usize) u32 {
+    return (u32(data[at]) << 8) | u32(data[at + 1])
+}
+
+fn i16_be(data &[]u8, at usize) i32 {
+    v := (i32(data[at]) << 8) | i32(data[at + 1])
+    if v >= 32768 { return v - 65536 }
+    return v
+}
+
+fn u32_be(data &[]u8, at usize) u32 {
+    return (u32(data[at]) << 24) | (u32(data[at + 1]) << 16) | (u32(data[at + 2]) << 8) | u32(data[at + 3])
+}
+
+fn tag_eq(data &[]u8, at usize, a u8, b u8, c u8, d u8) bool {
+    return data[at] == a && data[at + 1] == b && data[at + 2] == c && data[at + 3] == d
+}
+
+fn popcount16(v u32) usize {
+    var x = v & 65535
+    var c: usize = 0
+    for x != 0 {
+        c = c + usize(x & 1)
+        x = x >> 1
+    }
+    return c
+}
+
+// ---- Font Table & GPOS Kerning Structures ----
+copy struct PairPosSubtable {
+    offset usize
+    format u32
+    cov_offset usize
+    vf1 u32
+    vf2 u32
+    rec_bytes usize
+    class1_offset usize
+    class2_offset usize
+    c1_count u32
+    c2_count u32
+}
+
+pub struct Font {
+    pub data Vec<u8>
+    pub units_per_em i32
+    pub ascent i32
+    pub descent i32
+    pub line_gap i32
+    pub loca_format i32
+    pub num_glyphs u32
+    pub num_hmetrics u32
+    pub cmap_sub_off usize
+    pub cmap_seg_count usize
+    pub hmtx_off usize
+    pub loca_off usize
+    pub glyf_off usize
+    pub pair_subtables Vec<PairPosSubtable>
+    pub digit_advance i32
+}
+
+// Loads and parses a TrueType `.ttf` font file from disk in pure Tarn.
+pub fn Font.load(path &string) Result<Font, i32> {
+    bytes := match fs.read(path) {
+        Ok(b) => b
+        Err(_) => { return Err(5) }
+    }
+    s := bytes.as_slice()
+    if s.len() < 12 { return Err(1) }
+    num_tables := usize(u16_be(s, 4))
+    if s.len() < 12 + num_tables * 16 { return Err(1) }
+
+    var head_off: usize = 0
+    var hhea_off: usize = 0
+    var maxp_off: usize = 0
+    var cmap_off: usize = 0
+    var hmtx_off: usize = 0
+    var loca_off: usize = 0
+    var glyf_off: usize = 0
+    var gpos_off: usize = 0
+
+    var i: usize = 0
+    for i < num_tables {
+        rec := 12 + i * 16
+        toff := usize(u32_be(s, rec + 8))
+        if tag_eq(s, rec, 104, 101, 97, 100) {
+            head_off = toff
+        } else if tag_eq(s, rec, 104, 104, 101, 97) {
+            hhea_off = toff
+        } else if tag_eq(s, rec, 109, 97, 120, 112) {
+            maxp_off = toff
+        } else if tag_eq(s, rec, 99, 109, 97, 112) {
+            cmap_off = toff
+        } else if tag_eq(s, rec, 104, 109, 116, 120) {
+            hmtx_off = toff
+        } else if tag_eq(s, rec, 108, 111, 99, 97) {
+            loca_off = toff
+        } else if tag_eq(s, rec, 103, 108, 121, 102) {
+            glyf_off = toff
+        } else if tag_eq(s, rec, 71, 80, 79, 83) {
+            gpos_off = toff
+        }
+        i = i + 1
+    }
+
+    if head_off == 0 || hhea_off == 0 || maxp_off == 0 || cmap_off == 0 || hmtx_off == 0 || loca_off == 0 || glyf_off == 0 {
+        return Err(1)
+    }
+
+    upm := i32(u16_be(s, head_off + 18))
+    loca_fmt := i16_be(s, head_off + 50)
+    asc := i16_be(s, hhea_off + 4)
+    desc := i16_be(s, hhea_off + 6)
+    lgap := i16_be(s, hhea_off + 8)
+    nhm := u16_be(s, hhea_off + 34)
+    nglyphs := u16_be(s, maxp_off + 4)
+
+    // Locate cmap Format 4 subtable
+    nsub := usize(u16_be(s, cmap_off + 2))
+    var cmap_sub: usize = 0
+    var c_i: usize = 0
+    for c_i < nsub {
+        soff := cmap_off + usize(u32_be(s, cmap_off + 4 + c_i * 8 + 4))
+        if u16_be(s, soff) == 4 {
+            cmap_sub = soff
+            break
+        }
+        c_i = c_i + 1
+    }
+    if cmap_sub == 0 { return Err(1) }
+    seg_count := usize(u16_be(s, cmap_sub + 6)) / 2
+
+    // Parse GPOS PairPos subtables (LookupType 2 and LookupType 9 Extension -> Type 2)
+    var pair_subs: Vec<PairPosSubtable> = Vec.new()
+    if gpos_off != 0 {
+        l_list_off := gpos_off + usize(u16_be(s, gpos_off + 8))
+        l_cnt := usize(u16_be(s, l_list_off))
+        var li: usize = 0
+        for li < l_cnt {
+            loff := l_list_off + usize(u16_be(s, l_list_off + 2 + li * 2))
+            ltype := u16_be(s, loff)
+            sub_cnt := usize(u16_be(s, loff + 4))
+            var si: usize = 0
+            for si < sub_cnt {
+                soff := loff + usize(u16_be(s, loff + 6 + si * 2))
+                var real_off = soff
+                var real_type = ltype
+                if ltype == 9 {
+                    real_type = u16_be(s, soff + 2)
+                    real_off = soff + usize(u32_be(s, soff + 4))
+                }
+                if real_type == 2 {
+                    fmt := u16_be(s, real_off)
+                    cov_off := real_off + usize(u16_be(s, real_off + 2))
+                    vf1 := u16_be(s, real_off + 4)
+                    vf2 := u16_be(s, real_off + 6)
+                    rec_b := (popcount16(vf1) + popcount16(vf2)) * 2
+                    if fmt == 1 {
+                        pair_subs.push(PairPosSubtable {
+                            offset: real_off,
+                            format: 1,
+                            cov_offset: cov_off,
+                            vf1: vf1,
+                            vf2: vf2,
+                            rec_bytes: rec_b,
+                            class1_offset: 0,
+                            class2_offset: 0,
+                            c1_count: 0,
+                            c2_count: 0,
+                        })
+                    } else if fmt == 2 {
+                        c1_off := real_off + usize(u16_be(s, real_off + 8))
+                        c2_off := real_off + usize(u16_be(s, real_off + 10))
+                        c1_n := u16_be(s, real_off + 12)
+                        c2_n := u16_be(s, real_off + 14)
+                        pair_subs.push(PairPosSubtable {
+                            offset: real_off,
+                            format: 2,
+                            cov_offset: cov_off,
+                            vf1: vf1,
+                            vf2: vf2,
+                            rec_bytes: rec_b,
+                            class1_offset: c1_off,
+                            class2_offset: c2_off,
+                            c1_count: c1_n,
+                            c2_count: c2_n,
+                        })
+                    }
+                }
+                si = si + 1
+            }
+            li = li + 1
+        }
+    }
+
+    var font = Font {
+        data: bytes,
+        units_per_em: upm,
+        ascent: asc,
+        descent: desc,
+        line_gap: lgap,
+        loca_format: loca_fmt,
+        num_glyphs: nglyphs,
+        num_hmetrics: nhm,
+        cmap_sub_off: cmap_sub,
+        cmap_seg_count: seg_count,
+        hmtx_off: hmtx_off,
+        loca_off: loca_off,
+        glyf_off: glyf_off,
+        pair_subtables: pair_subs,
+        digit_advance: 600,
+    }
+    // Compute tabular numeral advance (`tnum`) as the max advance across '0'..'9'.
+    var max_d: i32 = 0
+    var d_cp: u32 = 48
+    for d_cp <= 57 {
+        gid := font.glyph_index(d_cp)
+        adv := font.advance_width(gid)
+        if adv > max_d { max_d = adv }
+        d_cp = d_cp + 1
+    }
+    if max_d > 0 { font.digit_advance = max_d }
+    return Ok(font)
+}
+
+// Maps a Unicode codepoint to a glyph ID via `cmap` Format 4 binary search.
+pub fn Font.glyph_index(&self, codepoint u32) u32 {
+    var cp = codepoint
+    if cp == 8209 { cp = 45 } // Map U+2011 non-breaking hyphen (`‑` in "Wi‑Fi") to ASCII '-'
+    if cp > 65535 { return 0 }
+    s := self.data.as_slice()
+    sub := self.cmap_sub_off
+    seg_cnt := self.cmap_seg_count
+    end_base := sub + 14
+    start_base := end_base + seg_cnt * 2 + 2
+    delta_base := start_base + seg_cnt * 2
+    range_base := delta_base + seg_cnt * 2
+
+    var lo: usize = 0
+    var hi = seg_cnt
+    for lo < hi {
+        mid := lo + (hi - lo) / 2
+        end_c := u16_be(s, end_base + mid * 2)
+        if end_c < cp {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo >= seg_cnt { return 0 }
+    start_c := u16_be(s, start_base + lo * 2)
+    if cp < start_c { return 0 }
+    delta := i16_be(s, delta_base + lo * 2)
+    roff := usize(u16_be(s, range_base + lo * 2))
+    if roff == 0 {
+        return u32((i32(cp) + delta) & 65535)
+    }
+    glyph_addr := range_base + lo * 2 + roff + usize(cp - start_c) * 2
+    if glyph_addr + 2 > s.len() { return 0 }
+    gid := u16_be(s, glyph_addr)
+    if gid == 0 { return 0 }
+    return u32((i32(gid) + delta) & 65535)
+}
+
+pub fn Font.advance_width(&self, gid u32) i32 {
+    if self.num_hmetrics == 0 { return self.units_per_em / 2 }
+    s := self.data.as_slice()
+    var idx = gid
+    if idx >= self.num_hmetrics { idx = self.num_hmetrics - 1 }
+    return i32(u16_be(s, self.hmtx_off + usize(idx) * 4))
+}
+
+// OpenType Coverage table lookup (Format 1 and Format 2). Returns Some(coverage_index).
+fn coverage_index(s &[]u8, cov_off usize, gid u32) Option<usize> {
+    fmt := u16_be(s, cov_off)
+    if fmt == 1 {
+        cnt := usize(u16_be(s, cov_off + 2))
+        var lo: usize = 0
+        var hi = cnt
+        for lo < hi {
+            mid := lo + (hi - lo) / 2
+            g := u16_be(s, cov_off + 4 + mid * 2)
+            if g < gid {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if lo < cnt && u16_be(s, cov_off + 4 + lo * 2) == gid {
+            return Some(lo)
+        }
+        return None
+    }
+    if fmt == 2 {
+        rcnt := usize(u16_be(s, cov_off + 2))
+        var lo: usize = 0
+        var hi = rcnt
+        for lo < hi {
+            mid := lo + (hi - lo) / 2
+            end_g := u16_be(s, cov_off + 4 + mid * 6 + 2)
+            if end_g < gid {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if lo < rcnt {
+            rec := cov_off + 4 + lo * 6
+            start_g := u16_be(s, rec)
+            end_g := u16_be(s, rec + 2)
+            if gid >= start_g && gid <= end_g {
+                start_cov := usize(u16_be(s, rec + 4))
+                return Some(start_cov + usize(gid - start_g))
+            }
+        }
+    }
+    return None
+}
+
+// OpenType ClassDef table lookup (Format 1 and Format 2).
+fn class_of_glyph(s &[]u8, cdef_off usize, gid u32) u32 {
+    fmt := u16_be(s, cdef_off)
+    if fmt == 1 {
+        start_g := u16_be(s, cdef_off + 2)
+        cnt := u16_be(s, cdef_off + 4)
+        if gid >= start_g && gid < start_g + cnt {
+            return u16_be(s, cdef_off + 6 + usize(gid - start_g) * 2)
+        }
+        return 0
+    }
+    if fmt == 2 {
+        rcnt := usize(u16_be(s, cdef_off + 2))
+        var lo: usize = 0
+        var hi = rcnt
+        for lo < hi {
+            mid := lo + (hi - lo) / 2
+            end_g := u16_be(s, cdef_off + 4 + mid * 6 + 2)
+            if end_g < gid {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        if lo < rcnt {
+            rec := cdef_off + 4 + lo * 6
+            start_g := u16_be(s, rec)
+            end_g := u16_be(s, rec + 2)
+            if gid >= start_g && gid <= end_g {
+                return u16_be(s, rec + 4)
+            }
+        }
+    }
+    return 0
+}
+
+fn read_x_advance_from_value_record(s &[]u8, val_off usize, vf1 u32) i32 {
+    if (vf1 & 4) == 0 { return 0 }
+    // XPlacement (1) and YPlacement (2) precede XAdvance (4)
+    var off = val_off
+    if (vf1 & 1) != 0 { off = off + 2 }
+    if (vf1 & 2) != 0 { off = off + 2 }
+    return i16_be(s, off)
+}
+
+// Queries GPOS PairAdjustment kerning in font design units for pair `(left_gid, right_gid)`.
+pub fn Font.kern_advance(&self, left_gid u32, right_gid u32) i32 {
+    if left_gid == 0 || right_gid == 0 { return 0 }
+    s := self.data.as_slice()
+    subs := self.pair_subtables.as_slice()
+    var total_kern: i32 = 0
+    var i: usize = 0
+    for i < subs.len() {
+        sub := subs[i]
+        match coverage_index(s, sub.cov_offset, left_gid) {
+            Some(cov_idx) => {
+                if sub.format == 1 {
+                    ps_cnt := usize(u16_be(s, sub.offset + 8))
+                    if cov_idx < ps_cnt {
+                        ps_off := sub.offset + usize(u16_be(s, sub.offset + 10 + cov_idx * 2))
+                        pv_cnt := usize(u16_be(s, ps_off))
+                        stride := 2 + sub.rec_bytes
+                        var lo: usize = 0
+                        var hi = pv_cnt
+                        for lo < hi {
+                            mid := lo + (hi - lo) / 2
+                            g2 := u16_be(s, ps_off + 2 + mid * stride)
+                            if g2 < right_gid {
+                                lo = mid + 1
+                            } else {
+                                hi = mid
+                            }
+                        }
+                        if lo < pv_cnt {
+                            rec_off := ps_off + 2 + lo * stride
+                            if u16_be(s, rec_off) == right_gid {
+                                xadv := read_x_advance_from_value_record(s, rec_off + 2, sub.vf1)
+                                total_kern = total_kern + xadv
+                            }
+                        }
+                    }
+                } else if sub.format == 2 {
+                    c1 := class_of_glyph(s, sub.class1_offset, left_gid)
+                    c2 := class_of_glyph(s, sub.class2_offset, right_gid)
+                    if c1 < sub.c1_count && c2 < sub.c2_count {
+                        rec_off := sub.offset + 16 + usize(c1 * sub.c2_count + c2) * sub.rec_bytes
+                        xadv := read_x_advance_from_value_record(s, rec_off, sub.vf1)
+                        total_kern = total_kern + xadv
+                    }
+                }
+            }
+            None => {}
+        }
+        i = i + 1
+    }
+    return total_kern
+}
+
+// ---- TrueType `glyf` Outline Extraction (Simple + Composite Glyphs) ----
+pub copy struct EdgeSegment {
+    pub x0 f64
+    pub y0 f64
+    pub x1 f64
+    pub y1 f64
+}
+
+copy struct ContourPt {
+    x f64
+    y f64
+    on_curve bool
+}
+
+fn push_quad_bezier(edges &mut Vec<EdgeSegment>, x0 f64, y0 f64, cx f64, cy f64, x1 f64, y1 f64) {
+    // Subdivide quadratic curve into 4 linear segments (accurate to < 0.05px at UI sizes).
+    var px = x0
+    var py = y0
+    var step: i32 = 1
+    for step <= 4 {
+        t := f64(step) * 0.25
+        mt := 1.0 - t
+        nx := mt * mt * x0 + 2.0 * mt * t * cx + t * t * x1
+        ny := mt * mt * y0 + 2.0 * mt * t * cy + t * t * y1
+        if (ny - py).abs() > 0.0001 {
+            edges.push(EdgeSegment { x0: px, y0: py, x1: nx, y1: ny })
+        }
+        px = nx
+        py = ny
+        step = step + 1
+    }
+}
+
+fn emit_contour_edges(edges &mut Vec<EdgeSegment>, pts &[]ContourPt) {
+    n := pts.len()
+    if n < 2 { return }
+
+    // Find starting point (on-curve if first is on-curve, or midpoint if both first and last are off-curve).
+    var start_x = pts[0].x
+    var start_y = pts[0].y
+    var start_idx: usize = 1
+    if !pts[0].on_curve {
+        last := pts[n - 1]
+        if last.on_curve {
+            start_x = last.x
+            start_y = last.y
+            start_idx = 0
+        } else {
+            start_x = (last.x + pts[0].x) * 0.5
+            start_y = (last.y + pts[0].y) * 0.5
+            start_idx = 0
+        }
+    }
+
+    var cur_x = start_x
+    var cur_y = start_y
+    var i = start_idx
+    for i < n {
+        pt := pts[i]
+        if pt.on_curve {
+            if (pt.y - cur_y).abs() > 0.0001 {
+                edges.push(EdgeSegment { x0: cur_x, y0: cur_y, x1: pt.x, y1: pt.y })
+            }
+            cur_x = pt.x
+            cur_y = pt.y
+            i = i + 1
+        } else {
+            next_pt := pts[(i + 1) % n]
+            if next_pt.on_curve {
+                push_quad_bezier(edges, cur_x, cur_y, pt.x, pt.y, next_pt.x, next_pt.y)
+                cur_x = next_pt.x
+                cur_y = next_pt.y
+                i = i + 2
+            } else {
+                mid_x := (pt.x + next_pt.x) * 0.5
+                mid_y := (pt.y + next_pt.y) * 0.5
+                push_quad_bezier(edges, cur_x, cur_y, pt.x, pt.y, mid_x, mid_y)
+                cur_x = mid_x
+                cur_y = mid_y
+                i = i + 1
+            }
+        }
+    }
+    if (start_y - cur_y).abs() > 0.0001 {
+        edges.push(EdgeSegment { x0: cur_x, y0: cur_y, x1: start_x, y1: start_y })
+    }
+}
+
+fn Font.glyph_data_range(&self, gid u32) [2]usize {
+    if gid >= self.num_glyphs { return [2]usize{0, 0} }
+    s := self.data.as_slice()
+    if self.loca_format == 0 {
+        o0 := usize(u16_be(s, self.loca_off + usize(gid) * 2)) * 2
+        o1 := usize(u16_be(s, self.loca_off + usize(gid + 1) * 2)) * 2
+        return [2]usize{self.glyf_off + o0, self.glyf_off + o1}
+    }
+    o0 := usize(u32_be(s, self.loca_off + usize(gid) * 4))
+    o1 := usize(u32_be(s, self.loca_off + usize(gid + 1) * 4))
+    return [2]usize{self.glyf_off + o0, self.glyf_off + o1}
+}
+
+fn Font.append_glyph_edges(&self, gid u32, dx f64, dy f64, scale f64, asc_px f64, sub_x f64, edges &mut Vec<EdgeSegment>, depth u32) {
+    if depth > 6 { return }
+    range := self.glyph_data_range(gid)
+    goff := range[0]
+    gend := range[1]
+    if gend <= goff + 10 { return }
+    s := self.data.as_slice()
+    n_contours := i16_be(s, goff)
+
+    if n_contours > 0 {
+        nc := usize(n_contours)
+        end_pts_off := goff + 10
+        num_pts := usize(u16_be(s, end_pts_off + (nc - 1) * 2)) + 1
+        instr_len := usize(u16_be(s, end_pts_off + nc * 2))
+        flags_off := end_pts_off + nc * 2 + 2 + instr_len
+
+        var flags: Vec<u8> = Vec.with_capacity(num_pts)
+        var pos = flags_off
+        for flags.len() < num_pts && pos < gend {
+            f := s[pos]
+            pos = pos + 1
+            flags.push(f)
+            if (f & 8) != 0 && pos < gend {
+                rep := usize(s[pos])
+                pos = pos + 1
+                var r: usize = 0
+                for r < rep && flags.len() < num_pts {
+                    flags.push(f)
+                    r = r + 1
+                }
+            }
+        }
+
+        var xs: Vec<i32> = Vec.with_capacity(num_pts)
+        var cur_x: i32 = 0
+        var pi: usize = 0
+        for pi < num_pts {
+            f := flags.at(pi)
+            if (f & 2) != 0 {
+                dv := i32(s[pos])
+                pos = pos + 1
+                if (f & 16) != 0 { cur_x = cur_x + dv } else { cur_x = cur_x - dv }
+            } else if (f & 16) == 0 {
+                cur_x = cur_x + i16_be(s, pos)
+                pos = pos + 2
+            }
+            xs.push(cur_x)
+            pi = pi + 1
+        }
+
+        var ys: Vec<i32> = Vec.with_capacity(num_pts)
+        var cur_y: i32 = 0
+        pi = 0
+        for pi < num_pts {
+            f := flags.at(pi)
+            if (f & 4) != 0 {
+                dv := i32(s[pos])
+                pos = pos + 1
+                if (f & 32) != 0 { cur_y = cur_y + dv } else { cur_y = cur_y - dv }
+            } else if (f & 32) == 0 {
+                cur_y = cur_y + i16_be(s, pos)
+                pos = pos + 2
+            }
+            ys.push(cur_y)
+            pi = pi + 1
+        }
+
+        var start_pt: usize = 0
+        var ci: usize = 0
+        for ci < nc {
+            end_pt := usize(u16_be(s, end_pts_off + ci * 2))
+            if end_pt >= start_pt && end_pt < num_pts {
+                var c_pts: Vec<ContourPt> = Vec.with_capacity(end_pt - start_pt + 1)
+                var k = start_pt
+                for k <= end_pt {
+                    fx := (f64(xs.at(k)) + dx) * scale + sub_x
+                    fy := asc_px - (f64(ys.at(k)) + dy) * scale
+                    c_pts.push(ContourPt {
+                        x: fx,
+                        y: fy,
+                        on_curve: (flags.at(k) & 1) != 0,
+                    })
+                    k = k + 1
+                }
+                emit_contour_edges(edges, c_pts.as_slice())
+            }
+            start_pt = end_pt + 1
+            ci = ci + 1
+        }
+        return
+    }
+
+    if n_contours < 0 {
+        // Composite glyph (used by Spanish accented characters á é í ó ú ñ ü ¡ ¿ etc.)
+        var pos = goff + 10
+        for pos + 4 <= gend {
+            comp_flags := u16_be(s, pos)
+            child_gid := u16_be(s, pos + 2)
+            pos = pos + 4
+            var arg1: i32 = 0
+            var arg2: i32 = 0
+            if (comp_flags & 1) != 0 {
+                arg1 = i16_be(s, pos)
+                arg2 = i16_be(s, pos + 2)
+                pos = pos + 4
+            } else {
+                var a1 = i32(s[pos])
+                if a1 >= 128 { a1 = a1 - 256 }
+                var a2 = i32(s[pos + 1])
+                if a2 >= 128 { a2 = a2 - 256 }
+                arg1 = a1
+                arg2 = a2
+                pos = pos + 2
+            }
+            if (comp_flags & 8) != 0 {
+                pos = pos + 2
+            } else if (comp_flags & 64) != 0 {
+                pos = pos + 4
+            } else if (comp_flags & 128) != 0 {
+                pos = pos + 8
+            }
+            var cdx = dx
+            var cdy = dy
+            if (comp_flags & 2) != 0 {
+                cdx = cdx + f64(arg1)
+                cdy = cdy + f64(arg2)
+            }
+            self.append_glyph_edges(child_gid, cdx, cdy, scale, asc_px, sub_x, edges, depth + 1)
+            if (comp_flags & 32) == 0 { break }
+        }
+    }
+}
+
+fn sort_crossings(xs &mut []f64, dirs &mut []i32) {
+    var a: usize = 1
+    for a < xs.len() {
+        vx := xs[a]
+        vd := dirs[a]
+        var b = a
+        for b > 0 && xs[b - 1] > vx {
+            prev_x := xs[b - 1]
+            prev_d := dirs[b - 1]
+            xs[b] = prev_x
+            dirs[b] = prev_d
+            b = b - 1
+        }
+        xs[b] = vx
+        dirs[b] = vd
+        a = a + 1
+    }
+}
+
+fn add_cov_interval(cov_slice &mut []f64, w i32, xl f64, xr f64) {
+    var x_left = xl
+    var x_right = xr
+    if x_left < 0.0 { x_left = 0.0 }
+    if x_right > f64(w) { x_right = f64(w) }
+    if x_right <= x_left { return }
+    c0 := i32(x_left)
+    c1 := i32(x_right)
+    if c0 == c1 {
+        if c0 >= 0 && c0 < w {
+            cov_slice[usize(c0)] = cov_slice[usize(c0)] + (x_right - x_left) * 0.25
+        }
+    } else {
+        if c0 >= 0 && c0 < w {
+            cov_slice[usize(c0)] = cov_slice[usize(c0)] + (f64(c0 + 1) - x_left) * 0.25
+        }
+        var mid = c0 + 1
+        for mid < c1 {
+            if mid >= 0 && mid < w {
+                cov_slice[usize(mid)] = cov_slice[usize(mid)] + 0.25
+            }
+            mid = mid + 1
+        }
+        if c1 >= 0 && c1 < w {
+            cov_slice[usize(c1)] = cov_slice[usize(c1)] + (x_right - f64(c1)) * 0.25
+        }
+    }
+}
+
+// ---- Analytical Scanline Coverage Rasterizer ----
+// Computes exact 8-bit coverage into an atlas rectangle `[atlas_x..atlas_x+w, atlas_y..atlas_y+h]`
+// using 4× vertical supersampling per pixel row and analytical horizontal trapezoidal
+// area integration (`winding != 0` / non-zero winding rule, so overlapping variable-font
+// contours in Bricolage Grotesque and Onest union cleanly without holes).
+pub fn rasterize_edges_to_atlas(edges &[]EdgeSegment, atlas &mut []u8, atlas_stride i32,
+    atlas_x i32, atlas_y i32, w i32, h i32, min_x f64, min_y f64) {
+    if w <= 0 || h <= 0 || edges.is_empty() { return }
+    var row_cov: Vec<f64> = Vec.with_capacity(usize(w + 2))
+    var py: i32 = 0
+    for py < h {
+        row_cov.clear()
+        var k: i32 = 0
+        for k <= w + 1 {
+            row_cov.push(0.0)
+            k = k + 1
+        }
+        cov_slice := row_cov.as_mut_slice()
+
+        // 4 vertical sub-scanlines per pixel row for crisp horizontal & diagonal anti-aliasing
+        var sub: i32 = 0
+        for sub < 4 {
+            sy := min_y + f64(py) + (f64(sub) + 0.5) * 0.25
+            var xs: Vec<f64> = Vec.new()
+            var dirs: Vec<i32> = Vec.new()
+            var ei: usize = 0
+            for ei < edges.len() {
+                e := edges[ei]
+                if e.y0 <= sy && e.y1 > sy {
+                    t := (sy - e.y0) / (e.y1 - e.y0)
+                    ix := e.x0 + t * (e.x1 - e.x0) - min_x
+                    xs.push(ix)
+                    dirs.push(1)
+                } else if e.y1 <= sy && e.y0 > sy {
+                    t := (sy - e.y0) / (e.y1 - e.y0)
+                    ix := e.x0 + t * (e.x1 - e.x0) - min_x
+                    xs.push(ix)
+                    dirs.push(-1)
+                }
+                ei = ei + 1
+            }
+
+            // Insertion sort on `(xs, dirs)` by `x`
+            sort_crossings(xs.as_mut_slice(), dirs.as_mut_slice())
+            xs_slice := xs.as_slice()
+            dirs_slice := dirs.as_slice()
+
+            // Non-zero winding rule integration across sorted crossings
+            var winding: i32 = 0
+            var x_enter = 0.0
+            var m: usize = 0
+            for m < xs_slice.len() {
+                cx := xs_slice[m]
+                cd := dirs_slice[m]
+                if winding == 0 {
+                    x_enter = cx
+                }
+                winding = winding + cd
+                if winding == 0 {
+                    add_cov_interval(cov_slice, w, x_enter, cx)
+                }
+                m = m + 1
+            }
+            sub = sub + 1
+        }
+
+        // Write 8-bit coverage row into the glyph atlas
+        dst_row := usize((atlas_y + py) * atlas_stride + atlas_x)
+        var px: i32 = 0
+        for px < w {
+            var v = cov_slice[usize(px)]
+            if v > 1.0 { v = 1.0 }
+            if v > 0.0 {
+                alpha := u8(v * 255.0 + 0.5)
+                if alpha > 0 {
+                    atlas[dst_row + usize(px)] = alpha
+                }
+            }
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+// ---- Shelf-Packed Glyph Atlas Cache (ADR 0009 §10) ----
+pub copy struct AtlasGlyph {
+    pub atlas_x i32
+    pub atlas_y i32
+    pub width i32
+    pub height i32
+    pub bearing_x i32
+    pub bearing_y i32
+}
+
+pub struct GlyphAtlas {
+    pub width i32
+    pub height i32
+    pub cursor_x i32
+    pub cursor_y i32
+    pub shelf_h i32
+    pub pixels Vec<u8>
+    pub cache collections.Map<u64, AtlasGlyph>
+    pub fast_keys Vec<u64>
+    pub fast_vals Vec<AtlasGlyph>
+    pub rasterized_count u64
+}
+
+pub fn GlyphAtlas.new(width i32, height i32) GlyphAtlas {
+    total := usize(width) * usize(height)
+    var pixels: Vec<u8> = Vec.with_capacity(total)
+    zero_chunk := [256]u8{
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+    }
+    for pixels.len() + 256 <= total {
+        pixels.extend_from_slice(&zero_chunk[..])
+    }
+    for pixels.len() < total { pixels.push(0) }
+    var fk: Vec<u64> = Vec.with_capacity(2048)
+    var fv: Vec<AtlasGlyph> = Vec.with_capacity(2048)
+    empty_g := AtlasGlyph { atlas_x: 0, atlas_y: 0, width: 0, height: 0, bearing_x: 0, bearing_y: 0 }
+    var si: usize = 0
+    for si < 2048 {
+        fk.push(0)
+        fv.push(empty_g)
+        si = si + 1
+    }
+    return GlyphAtlas {
+        width: width,
+        height: height,
+        cursor_x: 1,
+        cursor_y: 1,
+        shelf_h: 0,
+        pixels: pixels,
+        cache: collections.Map.new(),
+        fast_keys: fk,
+        fast_vals: fv,
+        rasterized_count: 0,
+    }
+}
+
+fn glyph_key(font_id u32, gid u32, size_q4 u32, phase u32, bold u32) u64 {
+    return (u64(font_id) << 48) | (u64(bold) << 44) | (u64(size_q4) << 24) | (u64(phase & 3) << 16) | u64(gid)
+}
+
+fn fast_slot(key u64) usize {
+    return usize((key ^ (key >> 15) ^ (key >> 23)) & 2047)
+}
+
+pub fn GlyphAtlas.get_or_rasterize(&mut self, font &Font, font_id u32, gid u32, size_px f64, phase u32, synthetic_bold bool) AtlasGlyph {
+    size_q4 := u32(size_px * 16.0 + 0.5)
+    var bold_flag: u32 = 0
+    if synthetic_bold { bold_flag = 1 }
+    key := glyph_key(font_id, gid, size_q4, phase, bold_flag)
+    slot := fast_slot(key)
+    if self.fast_keys.as_slice()[slot] == key && key != 0 {
+        return self.fast_vals.as_slice()[slot]
+    }
+    match collections.get_copy(&self.cache, &key) {
+        Some(found) => {
+            self.fast_keys.as_mut_slice()[slot] = key
+            self.fast_vals.as_mut_slice()[slot] = found
+            return found
+        }
+        None => {}
+    }
+
+    scale := size_px / f64(font.units_per_em)
+    asc_px := f64(font.ascent) * scale
+    sub_x := f64(phase & 3) * 0.25
+
+    var edges: Vec<EdgeSegment> = Vec.new()
+    font.append_glyph_edges(gid, 0.0, 0.0, scale, asc_px, sub_x, &mut edges, 0)
+    if edges.is_empty() {
+        empty := AtlasGlyph { atlas_x: 0, atlas_y: 0, width: 0, height: 0, bearing_x: 0, bearing_y: 0 }
+        prev := self.cache.insert(key, empty)
+        return empty
+    }
+
+    // Compute exact bounding box of the scaled outline edges
+    e_slice := edges.as_slice()
+    var min_x = e_slice[0].x0
+    var max_x = e_slice[0].x0
+    var min_y = e_slice[0].y0
+    var max_y = e_slice[0].y0
+    var i: usize = 0
+    for i < e_slice.len() {
+        e := e_slice[i]
+        if e.x0 < min_x { min_x = e.x0 }
+        if e.x0 > max_x { max_x = e.x0 }
+        if e.x1 < min_x { min_x = e.x1 }
+        if e.x1 > max_x { max_x = e.x1 }
+        if e.y0 < min_y { min_y = e.y0 }
+        if e.y0 > max_y { max_y = e.y0 }
+        if e.y1 < min_y { min_y = e.y1 }
+        if e.y1 > max_y { max_y = e.y1 }
+        i = i + 1
+    }
+
+    bx0 := i32(min_x.abs() + 2.0)
+    var ix0 = i32(min_x) - 1
+    if min_x < 0.0 { ix0 = 0 - bx0 }
+    var iy0 = i32(min_y) - 1
+    if min_y < 0.0 { iy0 = 0 - (i32(min_y.abs()) + 2) }
+    ix1 := i32(max_x) + 2
+    iy1 := i32(max_y) + 2
+
+    var gw = ix1 - ix0
+    if synthetic_bold { gw = gw + 1 }
+    gh := iy1 - iy0
+    if gw <= 0 || gh <= 0 || gw > 256 || gh > 256 {
+        empty := AtlasGlyph { atlas_x: 0, atlas_y: 0, width: 0, height: 0, bearing_x: 0, bearing_y: 0 }
+        prev := self.cache.insert(key, empty)
+        return empty
+    }
+
+    // Allocate shelf space in the atlas
+    if self.cursor_x + gw + 1 >= self.width {
+        self.cursor_x = 1
+        self.cursor_y = self.cursor_y + self.shelf_h + 1
+        self.shelf_h = 0
+    }
+    if self.cursor_y + gh + 1 >= self.height {
+        // Wrap to top if full
+        self.cursor_x = 1
+        self.cursor_y = 1
+        self.shelf_h = 0
+    }
+
+    ax := self.cursor_x
+    ay := self.cursor_y
+    self.cursor_x = self.cursor_x + gw + 1
+    if gh > self.shelf_h { self.shelf_h = gh }
+
+    rasterize_edges_to_atlas(e_slice, self.pixels.as_mut_slice(), self.width, ax, ay, gw, gh, f64(ix0), f64(iy0))
+
+    // Synthetic semibold/bold dilation (1px horizontal max-filter smeared by 55% for crisp weight 600/700)
+    if synthetic_bold && gw > 1 {
+        atlas_slice := self.pixels.as_mut_slice()
+        var ry: i32 = 0
+        for ry < gh {
+            row_off := usize((ay + ry) * self.width + ax)
+            var rx = gw - 1
+            for rx >= 1 {
+                c_cur := u32(atlas_slice[row_off + usize(rx)])
+                c_prev := u32(atlas_slice[row_off + usize(rx - 1)])
+                smeared := c_cur + (c_prev * 110) / 255
+                if smeared > 255 {
+                    atlas_slice[row_off + usize(rx)] = 255
+                } else {
+                    atlas_slice[row_off + usize(rx)] = u8(smeared)
+                }
+                rx = rx - 1
+            }
+            ry = ry + 1
+        }
+    }
+
+    entry := AtlasGlyph {
+        atlas_x: ax,
+        atlas_y: ay,
+        width: gw,
+        height: gh,
+        bearing_x: ix0,
+        bearing_y: iy0,
+    }
+    prev := self.cache.insert(key, entry)
+    self.fast_keys.as_mut_slice()[slot] = key
+    self.fast_vals.as_mut_slice()[slot] = entry
+    self.rasterized_count = self.rasterized_count + 1
+    return entry
+}
+
+// ---- UTF-8 Decoding, Shaping & Paragraph Layout ----
+pub fn decode_utf8(text &string) Vec<u32> {
+    bytes := text.bytes()
+    var out: Vec<u32> = Vec.with_capacity(bytes.len())
+    var i: usize = 0
+    for i < bytes.len() {
+        b0 := u32(bytes[i])
+        if b0 < 128 {
+            out.push(b0)
+            i = i + 1
+        } else if (b0 & 224) == 192 && i + 1 < bytes.len() {
+            b1 := u32(bytes[i + 1]) & 63
+            out.push(((b0 & 31) << 6) | b1)
+            i = i + 2
+        } else if (b0 & 240) == 224 && i + 2 < bytes.len() {
+            b1 := u32(bytes[i + 1]) & 63
+            b2 := u32(bytes[i + 2]) & 63
+            out.push(((b0 & 15) << 12) | (b1 << 6) | b2)
+            i = i + 3
+        } else if (b0 & 248) == 240 && i + 3 < bytes.len() {
+            b1 := u32(bytes[i + 1]) & 63
+            b2 := u32(bytes[i + 2]) & 63
+            b3 := u32(bytes[i + 3]) & 63
+            out.push(((b0 & 7) << 18) | (b1 << 12) | (b2 << 6) | b3)
+            i = i + 4
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+pub copy struct ShapedGlyph {
+    pub gid u32
+    pub codepoint u32
+    pub x f64
+    pub advance f64
+}
+
+pub struct ShapedRun {
+    pub glyphs Vec<ShapedGlyph>
+    pub width f64
+}
+
+pub copy struct TextStyle {
+    pub font_id u32        // 0 = Onest (--font-body), 1 = Bricolage Grotesque (--font-display)
+    pub size_px f64
+    pub line_height f64    // multiplier e.g. 1.05, 1.45
+    pub tracking_em f64    // letter-spacing in em, e.g. -0.02 for display, 0.22 for CAIRN logo
+    pub color render.Color
+    pub bold bool
+    pub tabular_nums bool
+    pub balance bool
+}
+
+pub fn display_style(size_px f64, color render.Color) TextStyle {
+    return TextStyle {
+        font_id: 1,
+        size_px: size_px,
+        line_height: 1.08,
+        tracking_em: -0.02,
+        color: color,
+        bold: false, // Bricolage Grotesque default master is already ExtraBold (800)
+        tabular_nums: false,
+        balance: true,
+    }
+}
+
+pub fn body_style(size_px f64, color render.Color, bold bool) TextStyle {
+    return TextStyle {
+        font_id: 0,
+        size_px: size_px,
+        line_height: 1.45,
+        tracking_em: 0.0,
+        color: color,
+        bold: bold, // Onest default master is Regular (400); bold=true applies synthetic semibold
+        tabular_nums: false,
+        balance: false,
+    }
+}
+
+// Shapes a UTF-8 string into positioned glyphs with GPOS kerning, letter-spacing,
+// and optional tabular numerals (`tnum`).
+pub fn shape_text(font &Font, text &string, style TextStyle) ShapedRun {
+    cps := decode_utf8(text)
+    n := cps.len()
+    var glyphs: Vec<ShapedGlyph> = Vec.with_capacity(n)
+    if n == 0 {
+        return ShapedRun { glyphs: glyphs, width: 0.0 }
+    }
+
+    scale := style.size_px / f64(font.units_per_em)
+    tracking_px := style.tracking_em * style.size_px
+    var bold_extra = 0.0
+    if style.bold { bold_extra = 0.45 }
+
+    var x = 0.0
+    var prev_gid: u32 = 0
+    var prev_is_digit = false
+    var i: usize = 0
+    for i < n {
+        cp := cps.at(i)
+        gid := font.glyph_index(cp)
+        is_digit := cp >= 48 && cp <= 57
+        if i > 0 && prev_gid != 0 && gid != 0 {
+            if !(style.tabular_nums && (prev_is_digit || is_digit)) {
+                kern := font.kern_advance(prev_gid, gid)
+                x = x + f64(kern) * scale
+            }
+        }
+        var adv_units = font.advance_width(gid)
+        if style.tabular_nums && is_digit {
+            adv_units = font.digit_advance
+        }
+        adv_px := f64(adv_units) * scale + tracking_px + bold_extra
+        glyphs.push(ShapedGlyph {
+            gid: gid,
+            codepoint: cp,
+            x: x,
+            advance: adv_px,
+        })
+        x = x + adv_px
+        prev_gid = gid
+        prev_is_digit = is_digit
+        i = i + 1
+    }
+    return ShapedRun { glyphs: glyphs, width: x }
+}
+
+// Blits a shaped run onto `canvas` at `(origin_x, origin_y)` (top-left of the line box)
+// with 4× horizontal subpixel phase selection and `clip` culling.
+// Zero heap allocations when glyphs are already present in `atlas`.
+pub fn draw_shaped_run(canvas &mut render.Canvas, atlas &mut GlyphAtlas, font &Font,
+    run &ShapedRun, origin_x f64, origin_y f64, style TextStyle, clip damage.Rect) u32 {
+    if style.color.a == 0 || run.glyphs.is_empty() { return 0 }
+    glyphs := run.glyphs.as_slice()
+    var drawn: u32 = 0
+    src_b := u32(style.color.b)
+    src_g := u32(style.color.g)
+    src_r := u32(style.color.r)
+    src_a := u32(style.color.a)
+    packed_opaque := src_b | (src_g << 8) | (src_r << 16) | 4278190080
+    base_y := i32(origin_y + 0.5)
+
+    // Precompute constant key components for the entire run
+    size_q4 := u32(style.size_px * 16.0 + 0.5)
+    var bold_flag: u32 = 0
+    if style.bold { bold_flag = 1 }
+    key_hi := (u64(style.font_id) << 48) | (u64(bold_flag) << 44) | (u64(size_q4) << 24)
+
+    dst_base := ffi.vec_mut(&mut canvas.pixels)
+    var dst_p32: *mut u32 = ffi.from_address(ffi.address(ffi.to_const(dst_base)))
+    var atlas_base = ffi.vec(&atlas.pixels)
+    var fk_ptr = ffi.vec(&atlas.fast_keys)
+    w_stride := usize(canvas.width)
+    a_stride := usize(atlas.width)
+    c_w := canvas.width
+    c_h := canvas.height
+
+    for g in glyphs {
+        if g.gid == 0 || g.codepoint == 32 || g.codepoint == 160 { continue }
+        gx_f := origin_x + g.x
+        ix := i32(gx_f)
+        frac := gx_f - f64(ix)
+        var phase: u32 = 0
+        if frac >= 0.125 && frac < 0.375 {
+            phase = 1
+        } else if frac >= 0.375 && frac < 0.625 {
+            phase = 2
+        } else if frac >= 0.625 && frac < 0.875 {
+            phase = 3
+        }
+
+        key := key_hi | (u64(phase) << 16) | u64(g.gid)
+        slot := fast_slot(key)
+        var ag = AtlasGlyph { atlas_x: 0, atlas_y: 0, width: 0, height: 0, bearing_x: 0, bearing_y: 0 }
+        var hit = false
+        unsafe {
+            if ffi.read(ffi.offset(fk_ptr, slot)) == key && key != 0 {
+                ag = atlas.fast_vals.as_slice()[slot]
+                hit = true
+            }
+        }
+        if !hit {
+            ag = atlas.get_or_rasterize(font, style.font_id, g.gid, style.size_px, phase, style.bold)
+            atlas_base = ffi.vec(&atlas.pixels)
+            fk_ptr = ffi.vec(&atlas.fast_keys)
+        }
+        if ag.width <= 0 || ag.height <= 0 { continue }
+
+        dst_x0 := ix + ag.bearing_x
+        dst_y0 := base_y + ag.bearing_y
+        g_rect := damage.rect(dst_x0, dst_y0, ag.width, ag.height)
+        work := g_rect.intersect(&clip).clamp(c_w, c_h)
+        if work.is_empty() { continue }
+
+        ax_off := ag.atlas_x - dst_x0
+        var atlas_row = usize(ag.atlas_y + (work.y - dst_y0)) * a_stride + usize(work.x + ax_off)
+        var dst_row = usize(work.y) * w_stride + usize(work.x)
+        row_w := usize(work.w)
+        var y = work.y
+        y_end := work.y + work.h
+        for y < y_end {
+            var col: usize = 0
+            for col < row_w {
+                var cov: u32 = 0
+                unsafe { cov = u32(ffi.read(ffi.offset(atlas_base, atlas_row + col))) }
+                if cov > 0 {
+                    var sa = cov
+                    if src_a != 255 {
+                        t_a := src_a * cov + 127
+                        sa = (t_a + 1 + (t_a >> 8)) >> 8
+                    }
+                    if sa >= 255 {
+                        unsafe { ffi.write(ffi.offset_mut(dst_p32, dst_row + col), packed_opaque) }
+                    } else if sa > 0 {
+                        inv := 255 - sa
+                        t_r := src_r * sa + 127
+                        t_g := src_g * sa + 127
+                        t_b := src_b * sa + 127
+                        sr := (t_r + 1 + (t_r >> 8)) >> 8
+                        sg := (t_g + 1 + (t_g >> 8)) >> 8
+                        sb := (t_b + 1 + (t_b >> 8)) >> 8
+                        src32 := sb | (sg << 8) | (sr << 16) | (sa << 24)
+                        unsafe {
+                            p_px := ffi.offset_mut(dst_p32, dst_row + col)
+                            d32 := ffi.read(ffi.to_const(p_px))
+                            rb := (((d32 & 16711935) * inv + 8388736) >> 8) & 16711935
+                            ga := (((d32 >> 8) & 16711935) * inv + 8388736) & 4278255360
+                            ffi.write(p_px, src32 + (rb | ga))
+                        }
+                    }
+                }
+                col = col + 1
+            }
+            atlas_row = atlas_row + a_stride
+            dst_row = dst_row + w_stride
+            y = y + 1
+        }
+        drawn = drawn + 1
+    }
+    return drawn
+}
+
+pub struct FontPair {
+    pub body Font
+    pub display Font
+}
+
+fn load_font_from_candidates(rel &string) Result<Font, i32> {
+    p0 := "fonts/" + rel.clone()
+    match Font.load(&p0) {
+        Ok(f) => { return Ok(f) }
+        Err(_) => {}
+    }
+    p1 := "backends/cairn/fonts/" + rel.clone()
+    match Font.load(&p1) {
+        Ok(f) => { return Ok(f) }
+        Err(_) => {}
+    }
+    p2 := "../backends/cairn/fonts/" + rel.clone()
+    match Font.load(&p2) {
+        Ok(f) => { return Ok(f) }
+        Err(_) => {}
+    }
+    p3 := "../../backends/cairn/fonts/" + rel.clone()
+    return Font.load(&p3)
+}
+
+// Loads the two OFL-licensed Cairn fonts (`Onest.ttf` for `--font-body` and
+// `BricolageGrotesque.ttf` for `--font-display`).
+pub fn load_cairn_fonts() Result<FontPair, i32> {
+    body := try load_font_from_candidates(&"Onest.ttf")
+    display := try load_font_from_candidates(&"BricolageGrotesque.ttf")
+    return Ok(FontPair { body: body, display: display })
+}
+
+pub fn Font.ascent_px(&self, size_px f64) f64 {
+    return f64(self.ascent) * (size_px / f64(self.units_per_em))
+}
+
+pub fn Font.descent_px(&self, size_px f64) f64 {
+    return f64(self.descent).abs() * (size_px / f64(self.units_per_em))
+}
+
+// Blits a shaped run onto `canvas` aligned to `baseline_y` (the typographic baseline).
+// Multiple runs of different font families or sizes drawn with the same `baseline_y`
+// align on their exact baseline.
+pub fn draw_shaped_run_baseline(canvas &mut render.Canvas, atlas &mut GlyphAtlas, font &Font,
+    run &ShapedRun, origin_x f64, baseline_y f64, style TextStyle, clip damage.Rect) u32 {
+    origin_y := baseline_y - font.ascent_px(style.size_px)
+    return draw_shaped_run(canvas, atlas, font, run, origin_x, origin_y, style, clip)
+}
+
+pub fn draw_text_baseline(canvas &mut render.Canvas, atlas &mut GlyphAtlas, font &Font,
+    text &string, x f64, baseline_y f64, style TextStyle, clip damage.Rect) f64 {
+    run := shape_text(font, text, style)
+    drawn := draw_shaped_run_baseline(canvas, atlas, font, &run, x, baseline_y, style, clip)
+    return run.width
+}
+
+// Convenience single-line text draw helper (align: 0 = left, 1 = center, 2 = right).
+pub fn draw_text_line(canvas &mut render.Canvas, atlas &mut GlyphAtlas, font &Font,
+    text &string, x f64, y f64, max_w f64, align u32, style TextStyle, clip damage.Rect) f64 {
+    run := shape_text(font, text, style)
+    var ox = x
+    if align == 1 {
+        ox = x + (max_w - run.width) * 0.5
+    } else if align == 2 {
+        ox = x + max_w - run.width
+    }
+    drawn := draw_shaped_run(canvas, atlas, font, &run, ox, y, style, clip)
+    return run.width
+}
+
+// Truncates a UTF-8 string with an ellipsis (`…`, U+2026) if its shaped width exceeds `max_w`.
+pub fn shape_text_truncated(font &Font, text &string, max_w f64, style TextStyle) ShapedRun {
+    full := shape_text(font, text, style)
+    if full.width <= max_w || max_w <= 0.0 {
+        return full
+    }
+    ellipsis := "…"
+    ell_run := shape_text(font, &ellipsis, style)
+    avail := max_w - ell_run.width
+    if avail <= 0.0 {
+        return ell_run
+    }
+    bytes := text.bytes()
+    var last_end: usize = 0
+    var i: usize = 0
+    for i < bytes.len() {
+        var step: usize = 1
+        b0 := bytes[i]
+        if (b0 & 224) == 192 {
+            step = 2
+        } else if (b0 & 240) == 224 {
+            step = 3
+        } else if (b0 & 248) == 240 {
+            step = 4
+        }
+        next_i := i + step
+        if next_i > bytes.len() { break }
+        sub := text.copy_range(0, next_i) + "…"
+        sub_run := shape_text(font, &sub, style)
+        if sub_run.width > max_w {
+            break
+        }
+        last_end = next_i
+        i = next_i
+    }
+    out_str := text.copy_range(0, last_end) + "…"
+    return shape_text(font, &out_str, style)
+}
+
+pub fn draw_text_truncated(canvas &mut render.Canvas, atlas &mut GlyphAtlas, font &Font,
+    text &string, x f64, y f64, max_w f64, align u32, style TextStyle, clip damage.Rect) f64 {
+    run := shape_text_truncated(font, text, max_w, style)
+    var ox = x
+    if align == 1 {
+        ox = x + (max_w - run.width) * 0.5
+    } else if align == 2 {
+        ox = x + max_w - run.width
+    }
+    drawn := draw_shaped_run(canvas, atlas, font, &run, ox, y, style, clip)
+    return run.width
+}
+
+pub struct ParagraphLayout {
+    pub lines Vec<ShapedRun>
+    pub line_height f64
+    pub total_height f64
+    pub max_line_width f64
+}
+
+// Splits an overlong word at character boundaries (`WRAP_WORD_CHAR`) so it never overflows `max_w`.
+fn push_char_wrapped_word(font &Font, word &string, max_w f64, style TextStyle, out_lines &mut Vec<string>) {
+    bytes := word.bytes()
+    var start: usize = 0
+    var cur_end: usize = 0
+    var i: usize = 0
+    for i < bytes.len() {
+        var step: usize = 1
+        b0 := bytes[i]
+        if (b0 & 224) == 192 {
+            step = 2
+        } else if (b0 & 240) == 224 {
+            step = 3
+        } else if (b0 & 248) == 240 {
+            step = 4
+        }
+        var next_i = i + step
+        if next_i > bytes.len() { next_i = bytes.len() }
+        cand := word.copy_range(start, next_i)
+        run := shape_text(font, &cand, style)
+        if run.width > max_w && cur_end > start {
+            out_lines.push(word.copy_range(start, cur_end))
+            start = cur_end
+        }
+        cur_end = next_i
+        i = next_i
+    }
+    if cur_end > start {
+        out_lines.push(word.copy_range(start, cur_end))
+    }
+}
+
+// Computes multi-line paragraph layout with UAX #14 word/hyphen wrapping,
+// character-fallback (`WRAP_WORD_CHAR`), and `text-wrap: balance` for headings.
+pub fn layout_paragraph(font &Font, text &string, max_w f64, style TextStyle) ParagraphLayout {
+    bytes := text.bytes()
+    var words: Vec<string> = Vec.new()
+    var start: usize = 0
+    var i: usize = 0
+    for i <= bytes.len() {
+        if i == bytes.len() || bytes[i] == 32 || bytes[i] == 10 {
+            if i > start {
+                words.push(text.copy_range(start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    line_advance := style.size_px * style.line_height
+    var shaped_lines: Vec<ShapedRun> = Vec.new()
+    if words.is_empty() {
+        return ParagraphLayout { lines: shaped_lines, line_height: line_advance, total_height: 0.0, max_line_width: 0.0 }
+    }
+
+    full_run := shape_text(font, text, style)
+    if full_run.width <= max_w {
+        w0 := full_run.width
+        shaped_lines.push(full_run)
+        return ParagraphLayout { lines: shaped_lines, line_height: line_advance, total_height: line_advance, max_line_width: w0 }
+    }
+
+    var target_w = max_w
+    if style.balance && full_run.width <= max_w * 1.85 && words.len() > 1 {
+        target_w = full_run.width * 0.54
+        if target_w > max_w { target_w = max_w }
+    }
+
+    var lines: Vec<string> = Vec.new()
+    var cur_line = ""
+    var wi: usize = 0
+    for wi < words.len() {
+        w_str := words.get(wi)
+        if cur_line.is_empty() {
+            w_run := shape_text(font, w_str, style)
+            if w_run.width > max_w {
+                push_char_wrapped_word(font, w_str, max_w, style, &mut lines)
+                if !lines.is_empty() {
+                    cur_line = lines.get(lines.len() - 1).clone()
+                    ignore := lines.pop()
+                }
+            } else {
+                cur_line = w_str.clone()
+            }
+        } else {
+            candidate := cur_line.clone() + " " + w_str.clone()
+            cand_run := shape_text(font, &candidate, style)
+            if cand_run.width <= target_w {
+                cur_line = candidate
+            } else {
+                lines.push(cur_line)
+                cur_line = ""
+                continue
+            }
+        }
+        wi = wi + 1
+    }
+    if !cur_line.is_empty() {
+        lines.push(cur_line)
+    }
+
+    var max_lw = 0.0
+    var li: usize = 0
+    for li < lines.len() {
+        r := shape_text(font, lines.get(li), style)
+        if r.width > max_lw { max_lw = r.width }
+        shaped_lines.push(r)
+        li = li + 1
+    }
+    total_h := f64(shaped_lines.len()) * line_advance
+    return ParagraphLayout {
+        lines: shaped_lines,
+        line_height: line_advance,
+        total_height: total_h,
+        max_line_width: max_lw,
+    }
+}
+
+pub fn draw_paragraph_layout(canvas &mut render.Canvas, atlas &mut GlyphAtlas, font &Font,
+    layout &ParagraphLayout, x f64, y f64, max_w f64, align u32, style TextStyle, clip damage.Rect) u32 {
+    var total_glyphs: u32 = 0
+    var cur_y = y
+    runs := layout.lines.as_slice()
+    var i: usize = 0
+    for i < runs.len() {
+        run := &runs[i]
+        var ox = x
+        if align == 1 {
+            ox = x + (max_w - run.width) * 0.5
+        } else if align == 2 {
+            ox = x + max_w - run.width
+        }
+        total_glyphs = total_glyphs + draw_shaped_run(canvas, atlas, font, run, ox, cur_y, style, clip)
+        cur_y = cur_y + layout.line_height
+        i = i + 1
+    }
+    return total_glyphs
+}
+
+// Multi-line paragraph layout with UAX #14 word wrapping, `text-wrap: balance`
+// support for 2-line headings/subtitles, and horizontal alignment.
+pub fn draw_paragraph(canvas &mut render.Canvas, atlas &mut GlyphAtlas, font &Font,
+    text &string, x f64, y f64, max_w f64, align u32, style TextStyle, clip damage.Rect) f64 {
+    layout := layout_paragraph(font, text, max_w, style)
+    drawn := draw_paragraph_layout(canvas, atlas, font, &layout, x, y, max_w, align, style, clip)
+    return layout.total_height
+}

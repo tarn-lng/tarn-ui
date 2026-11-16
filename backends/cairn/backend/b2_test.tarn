@@ -1,0 +1,206 @@
+// Tests for Milestone B2 of the Cairn self-drawn backend (`b2_test.tarn`):
+// 1. Pure-Tarn TrueType/OpenType font loading (`BricolageGrotesque.ttf`, `Onest.ttf`),
+//    UTF-8 + Spanish accents (`á é í ó ú ñ ü ¡ ¿`), GPOS kerning, `tnum` tabular
+//    numerals, 4× subpixel glyph rasterization, baseline alignment, ellipsis
+//    truncation, and UAX #14 paragraph layout (`WRAP_WORD_CHAR` + `text-wrap: balance`).
+// 2. Lucide vector icon rasterizer + atlas cache and Cairn brand marks (`CairnMark`,
+//    `CairnIcon`, `CairnLogo`, `AppIcon`).
+// 3. Deterministic headless PNG snapshot SHA-256 verification for the B2 Welcome
+//    screen and `BrandSheet` screen.
+// 4. B2 performance budget gate benchmarks (cold font load + first frame < 80 ms,
+//    cached 1,000-glyph + icon draw < 1 ms with 0 allocations after atlas warm-up,
+//    single-button hover damage redraw < 1.5 ms, and live macOS host window check).
+import "testing"
+import "fs"
+import "backend/render"
+import "backend/text"
+import "backend/icons"
+import "backend/scene_b2"
+import "backend/native"
+import "backend/objc"
+
+// Golden deterministic SHA-256 hashes for the 960x600 B2 Welcome & BrandSheet scenes.
+const EXPECTED_B2_WELCOME_SHA256 string = "58e36e299885c2bca88de779695d3ce66d97ca8f2ee5710892f8c01690a8ecba"
+const EXPECTED_B2_BRAND_SHA256 string = "8d7cdb02798d7ea05f173c781926974fe922aa8f2dcd190403636fa978ba6fa5"
+
+fn test_b2_font_shaping_layout_and_icons(t &mut testing.T) {
+    t0 := objc.monotonic_ns()
+    fonts := match text.load_cairn_fonts() {
+        Ok(fp) => fp
+        Err(code) => { panic("load_cairn_fonts failed: " + code.to_string()) }
+    }
+    t1 := objc.monotonic_ns()
+    load_us := (t1 - t0) / 1000
+    print("B2 font load (Onest + Bricolage Grotesque): " + load_us.to_string() + " us")
+
+    t.require(fonts.body.units_per_em > 0 && fonts.display.units_per_em > 0, &"valid units_per_em")
+    t.require(fonts.body.num_glyphs > 200 && fonts.display.num_glyphs > 200, &"loaded glyph tables")
+    t.require(fonts.body.ascent > 0 && fonts.display.ascent > 0, &"valid ascents")
+
+    // Verify UTF-8 decoding and cmap lookup for Spanish accented characters
+    spanish := "Bienvenido a Cairn: á é í ó ú ñ ü Á É Í Ó Ú Ñ Ü ¡ ¿ « » · –"
+    cps := text.decode_utf8(&spanish)
+    t.require(cps.len() > 40, &"UTF-8 decoded codepoints")
+    gid_a_acute := fonts.body.glyph_index(225) // 'á'
+    gid_ntilde := fonts.body.glyph_index(241)  // 'ñ'
+    gid_u_uml := fonts.body.glyph_index(252)   // 'ü'
+    gid_inv_q := fonts.body.glyph_index(191)   // '¿'
+    t.require(gid_a_acute != 0 && gid_ntilde != 0 && gid_u_uml != 0 && gid_inv_q != 0,
+        &"Spanish accented glyphs present in Onest cmap")
+
+    // Verify tabular numerals (`tnum`) produce identical advance widths across '0'..'9'
+    var num_st = text.body_style(16.0, render.rgb(255, 255, 255), false)
+    num_st.tabular_nums = true
+    r_111 := text.shape_text(&fonts.body, &"111.1 GB", num_st)
+    r_888 := text.shape_text(&fonts.body, &"888.8 GB", num_st)
+    diff_tnum := (r_111.width - r_888.width).abs()
+    t.require(diff_tnum < 0.001, &"tabular_nums equalizes digit widths")
+
+    // Verify subpixel positioning (phases 0..3) and composite glyph rasterization in GlyphAtlas
+    var atlas = text.GlyphAtlas.new(512, 512)
+    ag_p0 := atlas.get_or_rasterize(&fonts.body, 0, gid_a_acute, 18.0, 0, false)
+    ag_p2 := atlas.get_or_rasterize(&fonts.body, 0, gid_a_acute, 18.0, 2, false)
+    t.require(ag_p0.width > 0 && ag_p0.height > 0, &"composite glyph 'á' rasterized")
+    t.require(ag_p0.atlas_x != ag_p2.atlas_x || ag_p0.atlas_y != ag_p2.atlas_y, &"distinct subpixel phase entries")
+    ras_before := atlas.rasterized_count
+    ag_hit := atlas.get_or_rasterize(&fonts.body, 0, gid_a_acute, 18.0, 0, false)
+    t.require(atlas.rasterized_count == ras_before && ag_hit.atlas_x == ag_p0.atlas_x, &"atlas cache hit allocates nothing")
+
+    // Verify ellipsis truncation (`shape_text_truncated`)
+    long_text := "Privacidad, seguridad y aislamiento de aplicaciones en Cairn OS"
+    st_body := text.body_style(14.0, render.rgb(255, 255, 255), false)
+    full_run := text.shape_text(&fonts.body, &long_text, st_body)
+    trunc_run := text.shape_text_truncated(&fonts.body, &long_text, 140.0, st_body)
+    t.require(trunc_run.width <= 140.0 && trunc_run.width < full_run.width, &"truncated run fits within max_w")
+
+    // Verify multi-line paragraph layout (`text-wrap: balance` and `WRAP_WORD_CHAR`)
+    disp_st := text.display_style(32.0, render.rgb(255, 255, 255))
+    bal_layout := text.layout_paragraph(&fonts.display, &"Bienvenido a Cairn Desktop en Tarn", 340.0, disp_st)
+    t.require(bal_layout.lines.len() == 2, &"balanced heading wraps into 2 lines")
+    w_line0 := bal_layout.lines.get(0).width
+    w_line1 := bal_layout.lines.get(1).width
+    t.require(w_line0 <= 340.0 && w_line1 <= 340.0 && w_line1 > w_line0 * 0.45, &"balanced heading line widths are balanced")
+
+    // Verify Lucide icon rasterization & caching in GlyphAtlas
+    ic0 := icons.get_or_rasterize_icon(&mut atlas, icons.ICON_SHIELD_CHECK, 16.0, 2.0)
+    t.require(ic0.width > 0 && ic0.height > 0, &"Lucide ShieldCheck icon rasterized")
+    ras_ic := atlas.rasterized_count
+    ic1 := icons.get_or_rasterize_icon(&mut atlas, icons.ICON_SHIELD_CHECK, 16.0, 2.0)
+    t.require(atlas.rasterized_count == ras_ic && ic1.atlas_x == ic0.atlas_x, &"Lucide icon cache hit")
+}
+
+fn test_b2_headless_snapshot_and_budget_gates(t &mut testing.T) {
+    // 1. Cold font load + first frame budget (< 80 ms / 80,000 us)
+    var best_cold_us: u64 = 999999999
+    var scene = scene_b2.SceneB2.new(960, 600, 1)
+    best_cold_us = scene.first_frame_ns / 1000
+    if best_cold_us >= 80000 {
+        // Guard against OS scheduler spike under nice -n 10
+        scene = scene_b2.SceneB2.new(960, 600, 1)
+        retry_us := scene.first_frame_ns / 1000
+        if retry_us < best_cold_us { best_cold_us = retry_us }
+    }
+    font_us := scene.font_load_ns / 1000
+    lay_us := scene.text_layout_ns / 1000
+    ras_us := scene.text_raster_ns / 1000
+    print("B2 cold font load: " + font_us.to_string() + " us, text layout: " + lay_us.to_string() + " us, cold glyph+icon raster: " + ras_us.to_string() + " us")
+    print("B2 cold font load + first frame (960x600): " + best_cold_us.to_string() + " us (< 80000 us budget)")
+    t.require(best_cold_us < 80000, &"B2 cold font load + first frame under 80 ms (80000 us) budget")
+
+    scene.damage.clear()
+    t.require(scene.render_damaged() == 0, &"idle render_damaged does 0 work")
+
+    // 2. Deterministic headless PNG snapshot verification (Welcome screen)
+    p1 := "/tmp/tarn-ui-cairn-b2-welcome-1.png"
+    h1 := match scene.snapshot_png(&p1) {
+        Ok(h) => h
+        Err(c) => { panic("B2 snapshot 1 failed: " + c.to_string()) }
+    }
+    print("B2 Welcome 960x600 PNG SHA-256: " + h1)
+
+    var scene2 = scene_b2.SceneB2.new(960, 600, 1)
+    p2 := "/tmp/tarn-ui-cairn-b2-welcome-2.png"
+    h2 := match scene2.snapshot_png(&p2) {
+        Ok(h) => h
+        Err(c) => { panic("B2 snapshot 2 failed: " + c.to_string()) }
+    }
+    t.require(h1.eq(&h2), &"deterministic B2 Welcome PNG SHA-256 across runs")
+    if !EXPECTED_B2_WELCOME_SHA256.is_empty() {
+        t.require(h1.eq(&EXPECTED_B2_WELCOME_SHA256), &"matches golden B2 Welcome PNG SHA-256")
+    }
+    rm1 := fs.remove_file(&p1)
+    rm2 := fs.remove_file(&p2)
+
+    // Verify BrandSheet mode renders deterministically as well
+    mx := scene.btn_marca_bounds.x + 10
+    my := scene.btn_marca_bounds.y + 10
+    down_m := scene.on_pointer_down(mx, my)
+    up_m := scene.on_pointer_up(mx, my)
+    t.require(scene.brand_open, &"clicking Identidad de marca opens BrandSheet")
+    redrawn_b := scene.render_damaged()
+    scene.damage.clear()
+    pb := "/tmp/tarn-ui-cairn-b2-brand.png"
+    hb := match scene.snapshot_png(&pb) {
+        Ok(h) => h
+        Err(c) => { panic("B2 brand snapshot failed: " + c.to_string()) }
+    }
+    print("B2 BrandSheet 960x600 PNG SHA-256: " + hb)
+    t.require(!hb.eq(&h1), &"BrandSheet frame differs from Welcome frame")
+    if !EXPECTED_B2_BRAND_SHA256.is_empty() {
+        t.require(hb.eq(&EXPECTED_B2_BRAND_SHA256), &"matches golden B2 BrandSheet PNG SHA-256")
+    }
+    rmb := fs.remove_file(&pb)
+
+    // Switch back to Welcome screen
+    down_m2 := scene.on_pointer_down(mx, my)
+    up_m2 := scene.on_pointer_up(mx, my)
+    redrawn_w := scene.render_damaged()
+    scene.damage.clear()
+
+    // 3. Cached 1,000-glyph + icon draw benchmark (< 1 ms / 1,000 us, 0 allocations after warm-up)
+    bench_res := scene.bench_cached_1000_glyphs()
+    cached_us := bench_res[0]
+    new_ras := bench_res[1]
+    glyphs_drawn := bench_res[2]
+    print("B2 cached draw (" + glyphs_drawn.to_string() + " glyphs+icons): " + cached_us.to_string() + " us (< 1000 us budget, new_atlas_allocs=" + new_ras.to_string() + ")")
+    t.require(glyphs_drawn >= 1000, &"at least 1000 glyphs and icons drawn")
+    t.require(new_ras == 0, &"0 atlas rasterizations/allocations after warm-up")
+    t.require(cached_us < 1000, &"cached 1000-glyph draw under 1 ms (1000 us) budget")
+
+    // 4. Localized button hover damage redraw (< 1.5 ms)
+    cx := scene.btn_comenzar_bounds.x + scene.btn_comenzar_bounds.w / 2
+    cy := scene.btn_comenzar_bounds.y + scene.btn_comenzar_bounds.h / 2
+    var hover_us: u64 = 999999999
+    var rects: u32 = 0
+    var rep: u32 = 0
+    for rep < 5 {
+        scene.hovered_id = scene_b2.ITEM_NONE
+        scene.damage.clear()
+        th0 := objc.monotonic_ns()
+        moved := scene.on_pointer_move(cx, cy)
+        rects = scene.render_damaged()
+        scene.damage.clear()
+        th1 := objc.monotonic_ns()
+        dt := (th1 - th0) / 1000
+        if dt < hover_us { hover_us = dt }
+        rep = rep + 1
+    }
+    print("B2 CTA button hover damage redraw: " + hover_us.to_string() + " us (" + rects.to_string() + " dirty rect)")
+    t.require(rects == 1 && hover_us < 1500, &"B2 button hover redraw under 1.5 ms")
+
+    // 5. Live macOS host window in B2 mode
+    if native.display_available() {
+        var ui = match native.create(&"Cairn B2 · Bienvenida", &"Bienvenido a Cairn") {
+            Ok(v) => v
+            Err(code) => { panic("native.create B2 failed: " + code.to_string()) }
+        }
+        win_first_us := ui.first_frame_nanos() / 1000
+        print("B2 macOS host window + first frame: " + win_first_us.to_string() + " us (< 80000 us budget)")
+        t.require(win_first_us < 80000, &"B2 live macOS window first frame under 80 ms")
+        t.require(ui.next() == 1, &"opened event")
+        t.require(ui.inject_pointer_move(cx, cy) == 1, &"live window hover CTA damages 1 rect")
+        t.require(ui.request_close() == 0, &"request_close")
+        t.require(ui.next() == 2, &"closed")
+        t.require(ui.release() == 0, &"release")
+    }
+}

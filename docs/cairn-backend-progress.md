@@ -92,3 +92,54 @@ Per `cairn/docs/design/tarn-ui-cairn-backend-plan.md` §6 and the project rules,
 ### Gap 4: Struct-Returning `objc_msgSend` (e.g. `NSPoint` / `NSRect` Return Values)
 - **Context**: Calling `[NSEvent locationInWindow]` returns an `NSPoint` (`{CGFloat x, CGFloat y}`) in registers `xmm0`/`xmm1` (or `d0`/`d1`), whereas the single `objc_msgSend` declaration returns `*mut u8` in `rax`/`x0`.
 - **Workaround Used**: Parse `location=(x,y)` from `[event description]` in `backends/cairn/backend/native.tarn` (`parse_event_point`), converting AppKit bottom-left window coordinates to top-left scene coordinates without needing a second colliding `extern "C" fn objc_msgSend` symbol declaration.
+
+### Gap 5: `ffi.read` Supports Only Scalars and Raw Pointers (Not Structs)
+- **Context**: Reading a cached `AtlasGlyph` struct directly from a `*AtlasGlyph` pointer in the `GlyphAtlas` fast-path lookup (`draw_shaped_run` in `backends/cairn/backend/text.tarn`).
+- **Minimal Reproducer**:
+  ```tarn
+  import "ffi"
+  struct Entry { x i32, y i32 }
+  fn read_entry(v &Vec<Entry>, idx usize) Entry {
+      p := ffi.vec(v)
+      unsafe { return ffi.read(ffi.offset(p, idx)) } // error: backend not implemented: ffi.read supports only scalars and raw pointers
+  }
+  ```
+- **Workaround Used**: Check the `u64` key via `ffi.read(ffi.offset(fk_ptr, slot))` and, on hit, read the `AtlasGlyph` struct via `atlas.fast_vals.as_slice()[slot]`.
+
+---
+
+## 5. What Was Built in Milestone B2
+
+Milestone B2 adds pure-Tarn typography, Lucide vector icons, Cairn brand marks, and the Onboarding Welcome + BrandSheet demo over the B1 procedural `Wallpaper("lago")` and `.glass.window` backdrop.
+
+### 5.1 Subsystems & Files Added / Updated
+
+| Path | Responsibility |
+|---|---|
+| `backends/cairn/fonts/` | `BricolageGrotesque.ttf` (`--font-display`) + `BricolageGrotesque-OFL.txt`, `Onest.ttf` (`--font-body`) + `Onest-OFL.txt`. |
+| `backends/cairn/icons/Lucide-ISC.txt` | ISC license file for the Lucide vector icon set. |
+| `backends/cairn/backend/text.tarn` | Pure-Tarn TrueType/OpenType parser (`head`, `hhea`, `maxp`, `hmtx`, `loca`, `glyf`, `cmap` formats 4/12, `kern`, `GPOS` PairPos formats 1/2, `GSUB` `tnum` lookup), UTF-8 decoder with Spanish accents (`á é í ó ú ñ ü ¡ ¿`), analytical scanline coverage glyph rasterizer with 4× horizontal subpixel phase bins, shelf-packed `GlyphAtlas` with 2048-slot direct-mapped fast cache, ellipsis truncation, and UAX #14 paragraph layout (`text-wrap: balance`). |
+| `backends/cairn/backend/icons.tarn` | Pure-Tarn Lucide vector path/stroke SDF rasterizer cached in `GlyphAtlas`, plus `draw_cairn_mark` (3 rotated stones + sun dot), `draw_cairn_icon` (`96×96` squircle + ridge + radial glow), `draw_cairn_logo`, and `draw_app_icon` (`23%` squircle). |
+| `backends/cairn/backend/scene_b2.tarn` | Retained B2 scene rendering the Onboarding `SetupWindow` + `Sidebar` (`Paso 1 de 8`, `Espacio estimado 5.2 GB` `StorageMeter`) + `StepWelcome` (`"Bienvenido a Cairn"`, `"Tu sistema. Tus reglas."`, 3 feature chips, `"Comenzar"` CTA) and interactive `BrandSheet` (`"Identidad de marca"`). |
+| `backends/cairn/backend/native.tarn` | Wired `SceneB2` into `Native` when title starts with `"Cairn B2"`, avoiding unused `SceneB1` full-frame initialization. |
+| `backends/cairn/backend/b2_test.tarn` | Automated B2 tests: font loading, Spanish UTF-8/cmap, `tnum`, 4× subpixel atlas caching, truncation, balanced paragraph layout, Lucide icon caching, deterministic PNG SHA-256 hashes, B2 budget gates, and live macOS host window check. |
+| `examples/cairn_b2_welcome/` | Interactive B2 demo (`main.tarn`, `README.md`) supporting live window, `--brand`, `--headless`, `--headless-brand`, and `--bench`. |
+| `scripts/build-cairn-b2.sh`, `scripts/run-cairn-b2.sh`, `scripts/build-cairn-b1.sh` | Build and run scripts for Milestone B2 (and updated B1 build copy list). |
+
+---
+
+## 6. Measurements vs. Milestone B2 Budget Gate
+
+Measured on macOS under `nice -n 10` (`nice -n 10 bash scripts/run-cairn-b2.sh --bench`):
+
+| Metric | Plan / ADR 0009 Budget Gate | Measured Result (`cairn_b2_welcome`) | Status |
+|---|---|---|---|
+| **Cold font load (`Onest` + `Bricolage Grotesque`)** | Part of `< 80 ms` cold start | **`1.06 ms`** (`1,057 µs` Welcome / `974 µs` BrandSheet) | **PASS** |
+| **Text layout (`SceneB2` Welcome)** | Part of `< 80 ms` cold start | **`0.36 ms`** (`359 µs`) | **PASS** |
+| **Cold glyph + icon rasterization** | Part of `< 80 ms` cold start | **`3.19 ms`** (`3,191 µs`) | **PASS** |
+| **Cold font load + first frame (`960×600` headless)** | `< 80 ms` (`80,000 µs`) | **`17.61 ms`** (`17,606 µs`) | **PASS** (~4.5× under budget) |
+| **Live macOS host window + first frame (`960×600`)** | `< 80 ms` (`80,000 µs`) | **`18.82 ms`** (`18,819 µs`) | **PASS** (~4.2× under budget) |
+| **Cached 1,000+ glyph & icon draw (`1,080` items)** | `< 1 ms` (`1,000 µs`), `0` atlas allocs | **`0.70 ms`** (`697–742 µs`), `new_atlas_allocs = 0` | **PASS** |
+| **CTA button hover damage redraw** | `< 1.5 ms` (`1,500 µs`) | **`0.10 ms`** (`102 µs` headless / `910 µs` live window, `1` dirty rect) | **PASS** |
+| **Idle redraws / presents** | `0` redraws | **`0` redraws**, **`0` presents** | **PASS** |
+| **Headless `snapshot_png` determinism** | Verified deterministic SHA-256 | Welcome: `58e36e299885c2bca88de779695d3ce66d97ca8f2ee5710892f8c01690a8ecba`<br>BrandSheet: `8d7cdb02798d7ea05f173c781926974fe922aa8f2dcd190403636fa978ba6fa5` | **PASS** |
