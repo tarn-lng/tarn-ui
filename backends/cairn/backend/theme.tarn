@@ -1,0 +1,126 @@
+// Pure-Tarn Theme Engine (`theme.tarn`) — Milestone B4:
+// Implements all light/dark/accent/transparency tokens from `desktop-spec.md` §1.3
+// and semantic/status colors from §1.4 on top of `render.ThemePalette`.
+import "backend/render"
+
+pub const ACCENT_COUNT u32 = 8
+
+// 8 Cairn accent presets (`desktop-spec.md` §1.3 / §1.4)
+pub const ACCENT_INDIGO u32 = 5527510    // #5457d6
+pub const ACCENT_BLUE u32 = 3836648      // #3a8ae8
+pub const ACCENT_EMERALD u32 = 2075009   // #1fa971
+pub const ACCENT_AMBER u32 = 14715435    // #e08a2b
+pub const ACCENT_CORAL u32 = 15029855    // #e5565f
+pub const ACCENT_VIOLET u32 = 10120432   // #9a6cf0
+pub const ACCENT_TEAL u32 = 3122591      // #2fa59f
+pub const ACCENT_GRAPHITE u32 = 8225704  // #7d83a8
+
+pub fn accent_hex(idx u32) u32 {
+    if idx == 0 { return ACCENT_INDIGO }
+    if idx == 1 { return ACCENT_BLUE }
+    if idx == 2 { return ACCENT_EMERALD }
+    if idx == 3 { return ACCENT_AMBER }
+    if idx == 4 { return ACCENT_CORAL }
+    if idx == 5 { return ACCENT_VIOLET }
+    if idx == 6 { return ACCENT_TEAL }
+    if idx == 7 { return ACCENT_GRAPHITE }
+    return ACCENT_INDIGO
+}
+
+pub fn accent_name(idx u32) string {
+    if idx == 0 { return "Índigo" }
+    if idx == 1 { return "Azul" }
+    if idx == 2 { return "Esmeralda" }
+    if idx == 3 { return "Ámbar" }
+    if idx == 4 { return "Coral" }
+    if idx == 5 { return "Violeta" }
+    if idx == 6 { return "Turquesa" }
+    if idx == 7 { return "Grafito" }
+    return "Índigo"
+}
+
+pub copy struct SemanticColors {
+    pub tl_close render.Color
+    pub tl_min render.Color
+    pub tl_max render.Color
+    pub danger render.Color
+    pub success render.Color
+    pub warning render.Color
+    pub error_border render.Color
+    pub shadow_window render.Color
+    pub shadow_pop render.Color
+}
+
+pub fn semantic_colors(dark bool) SemanticColors {
+    var win_sh = render.rgba(8, 10, 40, 90)
+    var pop_sh = render.rgba(8, 10, 40, 75)
+    if dark {
+        win_sh = render.rgba(8, 10, 40, 178)
+        pop_sh = render.rgba(8, 10, 40, 153)
+    }
+    return SemanticColors {
+        tl_close: render.rgb(255, 95, 87),   // #ff5f57
+        tl_min: render.rgb(254, 188, 46),    // #febc2e
+        tl_max: render.rgb(40, 200, 64),     // #28c840
+        danger: render.rgb(229, 86, 95),     // #e5565f
+        success: render.rgb(31, 169, 113),   // #1fa971
+        warning: render.rgb(224, 138, 43),   // #e08a2b
+        error_border: render.rgb(214, 58, 69), // #d63a45
+        shadow_window: win_sh,
+        shadow_pop: pop_sh,
+    }
+}
+
+pub copy struct Theme {
+    pub dark bool
+    pub accent_idx u32
+    pub transparency u32
+    pub palette render.ThemePalette
+    pub semantic SemanticColors
+}
+
+pub fn Theme.new(dark bool, accent_idx u32, transparency u32) Theme {
+    var tr = transparency
+    if tr > 100 { tr = 100 }
+    idx := accent_idx % ACCENT_COUNT
+    return Theme {
+        dark: dark,
+        accent_idx: idx,
+        transparency: tr,
+        palette: render.theme_palette(dark, accent_hex(idx), tr),
+        semantic: semantic_colors(dark),
+    }
+}
+
+pub fn Theme.default_dark() Theme {
+    return Theme.new(true, 0, 45)
+}
+
+pub fn Theme.default_light() Theme {
+    return Theme.new(false, 0, 45)
+}
+
+pub fn Theme.set_dark(&mut self, dark bool) bool {
+    if self.dark == dark { return false }
+    self.dark = dark
+    self.palette = render.theme_palette(self.dark, accent_hex(self.accent_idx), self.transparency)
+    self.semantic = semantic_colors(self.dark)
+    return true
+}
+
+pub fn Theme.set_accent(&mut self, accent_idx u32) bool {
+    idx := accent_idx % ACCENT_COUNT
+    if self.accent_idx == idx { return false }
+    self.accent_idx = idx
+    self.palette = render.theme_palette(self.dark, accent_hex(self.accent_idx), self.transparency)
+    return true
+}
+
+pub fn Theme.set_transparency(&mut self, transparency u32) bool {
+    var tr = transparency
+    if tr > 100 { tr = 100 }
+    if self.transparency == tr { return false }
+    self.transparency = tr
+    self.palette = render.theme_palette(self.dark, accent_hex(self.accent_idx), self.transparency)
+    return true
+}

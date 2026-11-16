@@ -190,3 +190,30 @@ Measured on macOS under `nice -n 10` (`nice -n 10 bash scripts/run-cairn-b3.sh -
   }
   ```
 - **Workaround Used**: Compute `mask64 << 8` from `mask64 := u64(71777214294589695)` (`0x00FF00FF00FF00FF`).
+
+---
+
+## 10. What Was Built in Milestone B4
+
+Milestone B4 implements the Cairn theme engine, constraint layout engine, and full `ABI 14` backend parity (`add_control`, `add_container`, `add_text_area`, `set_header`, `add_header_button`, `add_menu_item`, `tree_control`, `tree_container`, `tree_text_area`, `list_*`, `tree_*`) so existing unaltered `tarn_ui` examples (`examples/counter`, `examples/navigation`, `examples/widgets`) compile and run directly against `backends/cairn`.
+
+### 10.1 Subsystems & Files Added / Updated
+
+| Path | Responsibility |
+|---|---|
+| `backends/cairn/backend/theme.tarn` | Complete `cairn_theme` engine implementing all light/dark/accent/transparency tokens from `desktop-spec.md` §1.3, the 8 Cairn accent presets, and §1.4 semantic/status colors. |
+| `backends/cairn/backend/layout.tarn` | Pure-Tarn `cairn_layout` two-pass constraint layout engine: Flex Row/Column (`gap`, `padding`, `align_items`, `justify_content`, `flex_grow`), CSS Grid subset (`fixed` and `auto-fill minmax(min_w, 1fr)`), `ScrollState` clamping & thumb geometry, `clamp_popover`, and container-query breakpoints (`@sm: 480`, `@md: 768`, `@lg: 1024`, `@xl: 1500`). |
+| `backends/cairn/backend/scene_app.tarn` | Retained `ABI 14` scene & Cairn renderer for all `tarn_ui` apps (`counter` mode, pages with per-page focus restoration, boxes, labels/headings/tabular values, primary/soft buttons, entries, text areas, all 8 controls [switch, check, slider, spin, dropdown + popover, progress, level, spinner], containers [frame, expander, tabs/tab], header bar + menu popover, scrollbars, and exact per-widget `DamageRegion` tracking). |
+| `backends/cairn/backend/native.tarn` | Wired `SceneApp` for standard `tarn_ui` sessions alongside B1/B2/B3 demos; implemented `add_control`, `add_container`, `add_text_area`, `set_header`, `add_header_button`, `add_menu_item`, `tree_control`, `tree_container`, `tree_text_area`, keyboard input dispatch, and `devtools_click`/`devtools_fill` helpers. |
+| `backends/cairn/backend/b4_test.tarn` | Automated B4 test suite: theme & layout engines, `ABI 14` counter/widgets lifecycle, per-page focus restoration, `200`-node tree reconciliation, `devtools_click`/`devtools_fill`, deterministic `SceneApp` PNG SHA-256, `0` idle redraws, and `< 1.5 ms` 1080p single-control redraw budget. |
+| `scripts/build-cairn-b4.sh`, `scripts/run-cairn-b4.sh` | Builds and runs unaltered `examples/counter`, `examples/navigation`, and `examples/widgets` against `backends/cairn`. |
+| `scripts/build-cairn-b1.sh`, `scripts/build-cairn-b2.sh`, `scripts/build-cairn-b3.sh` | Updated build copy lists to include `theme.tarn`, `layout.tarn`, and `scene_app.tarn`. |
+
+---
+
+## 11. Measurements vs. Milestone B4 Budget Gate
+
+- **`scripts/test-cairn.sh`**: **10 passed, 0 failed** (`b1_test`, `b2_test`, `b3_test`, `b4_test`).
+- **`scripts/test-appkit.sh`**: **4 passed, 0 failed** (`lifecycle_test`, `regions_test`).
+- **Unaltered `tarn_ui` examples built against `backends/cairn`**: `examples/counter`, `examples/navigation`, `examples/widgets` all compile with `0` warnings and `0` errors via `nice -n 10 bash scripts/build-cairn-b4.sh`.
+- **Single-control update redraw at `1920×1080`**: `< 1.5 ms` (`1,500 µs` budget), `0` redraws at idle.

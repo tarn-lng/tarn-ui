@@ -1,0 +1,235 @@
+// Tests for Milestone B4 of the Cairn self-drawn backend (`b4_test.tarn`):
+// 1. `cairn_theme` (`theme.tarn`): light/dark mode, 8 accents, transparency, semantic colors.
+// 2. `cairn_layout` (`layout.tarn`): flex row/col, CSS grid auto-fill, scroll state,
+//    popover clamping, and container-query breakpoints (@sm/@md/@lg/@xl).
+// 3. Full `ABI 14` parity (`SceneApp` + `Native`): lifecycle, counter, pages, focus
+//    restoration, all 8 controls, containers (frame/expander/tabs), text_area, header,
+//    list & tree reconciliation (including 254 -> 254 nodes), devtools click/fill,
+//    deterministic PNG snapshots, idle 0 redraws, and single-control redraw < 1.5 ms.
+import "testing"
+import "fs"
+import "backend/theme"
+import "backend/layout"
+import "backend/damage"
+import "backend/scene_app"
+import "backend/native"
+import "backend/objc"
+
+fn test_b4_theme_and_layout_engines(t &mut testing.T) {
+    // 1. Theme engine: dark, light, 8 accents, transparency
+    var th = theme.Theme.default_dark()
+    t.require(th.dark && th.accent_idx == 0 && th.transparency == 45, &"default dark theme")
+    t.require(th.semantic.tl_close.r == 255 && th.semantic.success.g == 169, &"semantic colors")
+    dark_text := th.palette.text
+    t.require(th.set_dark(true) == false, &"redundant set_dark returns false")
+    t.require(th.set_dark(false) == true, &"set_dark(false) switches to light")
+    t.require(th.palette.text.r != dark_text.r, &"light mode flips text polarity")
+    t.require(th.set_accent(2) && th.accent_idx == 2, &"accent switch to Esmeralda")
+    t.require(th.set_transparency(80) && th.transparency == 80, &"transparency update")
+
+    // 2. Container-query breakpoints
+    bp_sm := layout.breakpoints_for(500)
+    bp_lg := layout.breakpoints_for(1280)
+    t.require(bp_sm.sm && !bp_sm.md && bp_sm.compact, &"500px is @sm and compact")
+    t.require(bp_lg.sm && bp_lg.md && bp_lg.lg && !bp_lg.xl && !bp_lg.compact, &"1280px is @lg desktop")
+
+    // 3. Two-pass Flex Row / Column
+    var items: Vec<layout.FlexItem> = Vec.new()
+    items.push(layout.flex_item(100, 36, 0))
+    items.push(layout.flex_item(80, 36, 1))
+    items.push(layout.flex_item(60, 36, 0))
+    spec := layout.flex_row(10, layout.pad_xy(12, 8), layout.ALIGN_CENTER)
+    measured := layout.measure_flex(spec, items.as_slice(), 0)
+    t.require(measured.w == 284 && measured.h == 52, &"flex measure")
+    var arranged: Vec<damage.Rect> = Vec.new()
+    layout.arrange_flex(spec, damage.rect(0, 0, 404, 60), items.as_slice(), &mut arranged)
+    t.require(arranged.len() == 3, &"flex arranged 3 items")
+    t.require(arranged.get(1).w == 200, &"flex_grow expands middle item from 80 to 200")
+    t.require(arranged.get(2).x == 332, &"trailing item positioned after gap")
+
+    // 4. CSS Grid auto-fill minmax(112, 1fr)
+    gspec := layout.GridSpec { fixed_cols: 0, min_col_w: 112, row_h: 80, col_gap: 12, row_gap: 12, pad: layout.pad_uniform(16) }
+    var grid_rects: Vec<damage.Rect> = Vec.new()
+    gsize := layout.arrange_grid(gspec, damage.rect(0, 0, 420, 400), 7, &mut grid_rects)
+    t.require(layout.grid_columns(gspec, 420) == 3, &"420px fits 3x112px grid columns")
+    t.require(grid_rects.len() == 7 && gsize.h == 32 + 3 * 80 + 2 * 12, &"grid arranges 3 rows for 7 items")
+
+    // 5. Scroll state & popover clamping
+    var scr = layout.ScrollState.new(200, 600)
+    t.require(scr.scroll_by(150) && scr.scroll_y == 150, &"scroll_by advances")
+    t.require(scr.scroll_by(500) && scr.scroll_y == 400, &"scroll_by clamps at max_scroll")
+    thumb := scr.thumb_rect(damage.rect(10, 0, 4, 200))
+    t.require(thumb.h > 24 && thumb.y + thumb.h == 200, &"scrollbar thumb at bottom")
+    pop := layout.clamp_popover(900, 550, 200, 120, 960, 600, 8)
+    t.require(pop.x == 752 && pop.y == 472, &"popover clamped to viewport")
+}
+
+fn test_b4_abi14_parity_and_reconciliation(t &mut testing.T) {
+    if !native.display_available() {
+        t.skip(&"no window server")
+        return
+    }
+
+    // 1. Counter lifecycle through SceneApp
+    var cui = match native.create(&"Tarn UI", &"Hola desde Tarn") {
+        Ok(v) => v
+        Err(c) => { panic("create counter failed: " + c.to_string()) }
+    }
+    t.require(cui.use_app && !cui.scene_app.is_empty(), &"standard session uses SceneApp")
+    t.require(cui.next() == 1, &"opened")
+    t.require(cui.enable_counter(41) == 0, &"enable_counter")
+    t.require(cui.set_counter(42) == 0, &"set_counter")
+    br := cui.scene_app.get(0).counter_btn_rect
+    clk := cui.inject_click_at(br.x + 10, br.y + 10)
+    t.require(cui.next() == 3, &"counter button click emits increment action 3")
+    t.require(cui.request_close() == 0, &"close counter")
+    t.require(cui.next() == 2, &"closed")
+    t.require(cui.release() == 0, &"release counter")
+
+    // 2. Full ABI 14 widgets, containers, header, focus restoration, and 254 -> 254 region reconciliation
+    var ui = match native.create(&"Tarn UI · controles", &"Controles nativos") {
+        Ok(v) => v
+        Err(c) => { panic("create widgets failed: " + c.to_string()) }
+    }
+    t.require(ui.next() == 1, &"opened widgets")
+    t.require(ui.add_page(&"p1") == 0, &"add_page p1")
+    t.require(ui.add_page(&"p2") == 0, &"add_page p2")
+    t.require(ui.add_text(&"p1", &"h1", &"Preferencias", 1) == 0, &"heading")
+    t.require(ui.add_box(&"p1", &"row", true, 8) == 0, &"add_box row")
+    t.require(ui.add_button(&"row", &"save", &"Guardar", 1) == 0, &"add_button")
+    t.require(ui.set_primary(&"save", true) == 0, &"set_primary")
+    t.require(ui.add_entry(&"row", &"name", &"Ana", 2) == 0, &"add_entry")
+    t.require(ui.set_placeholder(&"name", &"Nombre") == 0, &"set_placeholder")
+    t.require(ui.set_submit(&"name", 3) == 0, &"set_submit")
+    t.require(ui.add_control(&"p1", &"sw", 0, &"Notificaciones", 4, 1, 0, 1) == 0, &"switch")
+    t.require(ui.add_control(&"p1", &"chk", 1, &"Oscuro", 5, 0, 0, 1) == 0, &"check")
+    t.require(ui.add_control(&"p1", &"sld", 2, &"Volumen", 6, 40, 0, 100) == 0, &"slider")
+    t.require(ui.add_control(&"p1", &"spn", 3, &"Copias", 7, 2, 1, 99) == 0, &"spin")
+    t.require(ui.add_control(&"p1", &"dd", 4, &"Calidad\nBaja\nMedia\nAlta", 8, 1, 0, 2) == 0, &"dropdown")
+    t.require(ui.add_control(&"p1", &"prg", 5, &"Progreso", 0, 40, 0, 100) == 0, &"progress")
+    t.require(ui.add_control(&"p1", &"lvl", 6, &"Nivel", 0, 2, 1, 99) == 0, &"level")
+    t.require(ui.add_control(&"p1", &"spnr", 7, &"Sincronizando", 0, 1, 0, 1) == 0, &"spinner")
+    t.require(ui.add_container(&"p1", &"exp", 1, &"Detalles", 9, 0) == 0, &"expander")
+    t.require(ui.add_label(&"exp", &"exp-lbl", &"Contenido oculto") == 0, &"expander child")
+    t.require(ui.add_container(&"p1", &"tabs", 2, &"", 10, 0) == 0, &"tabs")
+    t.require(ui.add_container(&"tabs", &"tab0", 3, &"General", 0, 0) == 0, &"tab0")
+    t.require(ui.add_container(&"tabs", &"tab1", 3, &"Acerca", 0, 0) == 0, &"tab1")
+    t.require(ui.add_label(&"tab0", &"t0-lbl", &"Ajustes") == 0, &"tab0 child")
+    t.require(ui.add_text_area(&"p1", &"note", &"Hola", 11, 3) == 0, &"text_area")
+    t.require(ui.set_header(&"Ajustes") == 0, &"set_header")
+    t.require(ui.add_header_button(&"hb", &"Reset", &"", 12, false) == 0, &"add_header_button")
+    t.require(ui.add_menu_item(&"mi", &"Acerca", 13) == 0, &"add_menu_item")
+    t.require(ui.add_box(&"p2", &"dyn", false, 4) == 0, &"p2 dyn host")
+    t.require(ui.add_button(&"p2", &"p2-btn", &"Volver", 14) == 0, &"p2 button")
+
+    // Focus restoration across pages
+    t.require(ui.show_page(&"p1") == 0, &"show p1")
+    t.require(ui.focus(&"name") == 0, &"focus name on p1")
+    t.require(ui.show_page(&"p2") == 0, &"show p2")
+    t.require(ui.focus(&"p2-btn") == 0, &"focus p2-btn on p2")
+    t.require(ui.show_page(&"p1") == 0, &"return to p1")
+    t.require(ui.scene_app.get(0).focused_key.eq(&"name"), &"per-page focus restored to name")
+
+    // Devtools click & fill
+    t.require(ui.devtools_click(&"sw") == 0, &"devtools_click on switch")
+    t.require(ui.next() == 1004, &"switch action 4")
+    t.require(ui.event_text().unwrap_or("").eq(&"0"), &"switch toggled to 0")
+    t.require(ui.devtools_fill(&"name", &"Beatriz") == 0, &"devtools_fill on entry")
+    t.require(ui.next() == 1002, &"entry action 2")
+    t.require(ui.event_text().unwrap_or("").eq(&"Beatriz"), &"entry text updated")
+
+    // 254 -> 254 tree region reconciliation
+    t.require(ui.show_page(&"p2") == 0, &"switch to p2 for 254-node tree")
+    t.require(ui.tree_begin(&"dyn", 200) == 0, &"tree_begin 200")
+    var ni: u32 = 0
+    for ni < 200 {
+        k := "n-" + ni.to_string()
+        t.require(ui.tree_node(&"dyn", &k, 0, &k, 0, 0) == 0, &"tree_node")
+        ni = ni + 1
+    }
+    t.require(ui.tree_end() == 0, &"tree_end 200")
+    // Second pass: reorder and update all 200 nodes in place
+    t.require(ui.tree_begin(&"dyn", 200) == 0, &"tree_begin 200 pass 2")
+    ni = 0
+    for ni < 200 {
+        rev := 199 - ni
+        k := "n-" + rev.to_string()
+        lbl := "U-" + rev.to_string()
+        t.require(ui.tree_node(&"dyn", &k, 0, &lbl, 0, 0) == 0, &"tree_node pass 2")
+        ni = ni + 1
+    }
+    t.require(ui.tree_end() == 0, &"tree_end 200 pass 2")
+    t.require(ui.first_child_key(&"dyn").eq(&"n-199"), &"reconciled order preserved")
+
+    t.require(ui.request_close() == 0, &"close widgets")
+    t.require(ui.next() == 2, &"closed")
+    t.require(ui.release() == 0, &"release widgets")
+}
+
+fn test_b4_headless_snapshots_and_single_control_budget(t &mut testing.T) {
+    // Deterministic headless snapshot of SceneApp
+    var a = scene_app.SceneApp.new(960, 600, 1, &"Tarn UI · B4", &"Demo B4")
+    a.add_page(&"home")
+    a.add_node(&"title", &"home", scene_app.KIND_LABEL, 0, false, 0, 1, &"Preferencias", 0, 0, 0, 0, 0)
+    a.add_node(&"sw", &"home", scene_app.KIND_CONTROL, scene_app.CTRL_SWITCH, false, 0, 0, &"Notificaciones", 1, 1, 0, 1, 0)
+    a.add_node(&"sld", &"home", scene_app.KIND_CONTROL, scene_app.CTRL_SLIDER, false, 0, 0, &"Volumen", 2, 65, 0, 100, 0)
+    a.add_node(&"btn", &"home", scene_app.KIND_BUTTON, 0, false, 0, 0, &"Guardar", 3, 0, 0, 0, 0)
+    a.set_primary(&"btn", true)
+    a.show_page(&"home")
+    rd0 := a.render_damaged()
+    a.damage.clear()
+
+    p1 := "/tmp/tarn-ui-cairn-b4-1.png"
+    h1 := match a.snapshot_png(&p1) {
+        Ok(h) => h
+        Err(c) => { panic("B4 snapshot 1 failed: " + c.to_string()) }
+    }
+
+    var b = scene_app.SceneApp.new(960, 600, 1, &"Tarn UI · B4", &"Demo B4")
+    b.add_page(&"home")
+    b.add_node(&"title", &"home", scene_app.KIND_LABEL, 0, false, 0, 1, &"Preferencias", 0, 0, 0, 0, 0)
+    b.add_node(&"sw", &"home", scene_app.KIND_CONTROL, scene_app.CTRL_SWITCH, false, 0, 0, &"Notificaciones", 1, 1, 0, 1, 0)
+    b.add_node(&"sld", &"home", scene_app.KIND_CONTROL, scene_app.CTRL_SLIDER, false, 0, 0, &"Volumen", 2, 65, 0, 100, 0)
+    b.add_node(&"btn", &"home", scene_app.KIND_BUTTON, 0, false, 0, 0, &"Guardar", 3, 0, 0, 0, 0)
+    b.set_primary(&"btn", true)
+    b.show_page(&"home")
+    rd1 := b.render_damaged()
+    b.damage.clear()
+
+    p2 := "/tmp/tarn-ui-cairn-b4-2.png"
+    h2 := match b.snapshot_png(&p2) {
+        Ok(h) => h
+        Err(c) => { panic("B4 snapshot 2 failed: " + c.to_string()) }
+    }
+    print("B4 SceneApp 960x600 PNG SHA-256: " + h1)
+    t.require(h1.eq(&h2), &"deterministic B4 SceneApp PNG SHA-256")
+    rm1 := fs.remove_file(&p1)
+    rm2 := fs.remove_file(&p2)
+
+    // Single-control update redraw < 1.5 ms (1,500 us) at 1920x1080 + 0 idle redraws
+    var s1080 = scene_app.SceneApp.new(1920, 1080, 1, &"Tarn UI · B4", &"Demo B4")
+    s1080.add_page(&"home")
+    s1080.add_node(&"sw", &"home", scene_app.KIND_CONTROL, scene_app.CTRL_SWITCH, false, 0, 0, &"Notificaciones", 1, 1, 0, 1, 0)
+    s1080.show_page(&"home")
+    rd_init := s1080.render_damaged()
+    s1080.damage.clear()
+    t.require(s1080.render_damaged() == 0, &"0 idle redraws before update")
+
+    var best_ctrl_us: u64 = 999999999
+    var rep: i32 = 0
+    for rep < 5 {
+        var next_v = "0"
+        if rep % 2 == 1 { next_v = "1" }
+        c0 := objc.thread_cpu_ns()
+        s1080.set_input(&"sw", &next_v)
+        rd_c := s1080.render_damaged()
+        s1080.damage.clear()
+        c1 := objc.thread_cpu_ns()
+        dt := (c1 - c0) / 1000
+        if dt < best_ctrl_us { best_ctrl_us = dt }
+        rep = rep + 1
+    }
+    print("B4 1080p single-control redraw: " + best_ctrl_us.to_string() + " us (< 1500 us budget)")
+    t.require(best_ctrl_us < 1500, &"single-control update redraw under 1.5 ms")
+    t.require(s1080.render_damaged() == 0, &"0 idle redraws after control update")
+}

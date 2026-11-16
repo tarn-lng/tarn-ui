@@ -9,6 +9,7 @@ import "backend/objc"
 import "backend/scene_b1"
 import "backend/scene_b2"
 import "backend/scene_b3"
+import "backend/scene_app"
 import "backend/surface_macos"
 
 const OPENED usize = 0
@@ -30,6 +31,11 @@ const BOX u32 = 1
 const LABEL u32 = 2
 const BUTTON u32 = 3
 const ENTRY u32 = 4
+const CTRL u32 = 5
+const CONT u32 = 6
+const TEXT_AREA u32 = 7
+const HEADER_BTN u32 = 8
+const MENU_ITEM u32 = 9
 
 const MAX_ACTION u32 = 1024
 const MAX_PARTS usize = 256
@@ -63,6 +69,7 @@ struct Part {
     submit_action u32
     region u32
     tree_kind u32
+    sub_kind u32
     children Vec<string>
 }
 
@@ -86,6 +93,7 @@ fn new_part(key &string, parent &string, kind u32, horizontal bool) Part {
         submit_action: 0,
         region: 0,
         tree_kind: 0,
+        sub_kind: 0,
         children: Vec.new(),
     }
 }
@@ -102,6 +110,8 @@ pub struct Native {
     pub use_b2 bool
     pub scene_b3 Vec<scene_b3.SceneB3>
     pub use_b3 bool
+    pub scene_app Vec<scene_app.SceneApp>
+    pub use_app bool
     pub last_anim_ns u64
     title string
     heading string
@@ -278,6 +288,9 @@ pub fn abi() u32 { return 14 }
 pub fn Native.native_window(&self) *mut u8 { return self.window }
 pub fn Native.first_frame_nanos(&self) u64 { return self.first_frame_ns }
 pub fn Native.frames_rendered(&self) u64 {
+    if self.use_app && !self.scene_app.is_empty() {
+        return self.scene_app.get(0).frames_rendered
+    }
     if self.use_b3 && !self.scene_b3.is_empty() {
         return self.scene_b3.get(0).frames_rendered
     }
@@ -365,12 +378,21 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
     }
 
     t0 := objc.monotonic_ns()
+    is_b1 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B1")
     is_b2 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B2")
     is_b3 := title.len() >= 8 && title.copy_range(0, 8).eq(&"Cairn B3")
+    is_app := !is_b1 && !is_b2 && !is_b3
     var scene = scene_b1.SceneB1.new(1, 1, 1)
     var sb2_vec: Vec<scene_b2.SceneB2> = Vec.new()
     var sb3_vec: Vec<scene_b3.SceneB3> = Vec.new()
-    if is_b3 {
+    var app_vec: Vec<scene_app.SceneApp> = Vec.new()
+    if is_app {
+        var sapp = scene_app.SceneApp.new(w, h, 1, title, heading)
+        blitted_a := surf.present_damaged(sapp.frame.pixels.as_slice(), w, h, sapp.frame.stride, &sapp.damage)
+        sapp.damage.clear()
+        app_vec.push(sapp)
+        scene.damage.clear()
+    } else if is_b3 {
         var sb3 = scene_b3.SceneB3.new(w, h, 1)
         blitted3 := surf.present_damaged(sb3.frame.pixels.as_slice(), w, h, sb3.frame.stride, &sb3.damage)
         sb3.damage.clear()
@@ -412,6 +434,8 @@ pub fn create(title &string, heading &string) Result<Native, i32> {
         use_b2: is_b2,
         scene_b3: sb3_vec,
         use_b3: is_b3,
+        scene_app: app_vec,
+        use_app: is_app,
         last_anim_ns: t1,
         title: title.clone(),
         heading: heading.clone(),
@@ -457,6 +481,20 @@ fn Native.writable(&self) i32 {
 
 // Re-renders only damaged tiles and presents to the host surface if anything changed.
 pub fn Native.flush_damage(&mut self) u32 {
+    if self.use_app && !self.scene_app.is_empty() {
+        sapp := self.scene_app.get_mut(0)
+        if sapp.damage.is_empty() { return 0 }
+        tiles_a := sapp.render_damaged()
+        blitted_a := self.surface.present_damaged(
+            sapp.frame.pixels.as_slice(),
+            self.width,
+            self.height,
+            sapp.frame.stride,
+            &sapp.damage
+        )
+        sapp.damage.clear()
+        return tiles_a
+    }
     if self.use_b3 && !self.scene_b3.is_empty() {
         sb3 := self.scene_b3.get_mut(0)
         if sb3.damage.is_empty() { return 0 }
@@ -501,6 +539,12 @@ pub fn Native.flush_damage(&mut self) u32 {
 // Synthetic pointer move injection (in window-local top-left coordinates) for
 // deterministic hover damage benchmarking and testing without OS Accessibility permissions.
 pub fn Native.inject_pointer_move(&mut self, x i32, y i32) u32 {
+    if self.use_app && !self.scene_app.is_empty() {
+        if self.scene_app.get_mut(0).on_pointer_move(x, y) {
+            return self.flush_damage()
+        }
+        return 0
+    }
     if self.use_b3 && !self.scene_b3.is_empty() {
         if self.scene_b3.get_mut(0).on_pointer_move(x, y) {
             return self.flush_damage()
@@ -520,7 +564,28 @@ pub fn Native.inject_pointer_move(&mut self, x i32, y i32) u32 {
 }
 
 // Synthetic click injection on a B1/B2 card/button or keyed widget.
+fn Native.dispatch_app_event(&mut self, ev &scene_app.AppInputEvent) {
+    if ev.action == 0 { return }
+    if self.counter_enabled && ev.action == 3 && ev.key.eq(&"__counter_btn__") {
+        enqueue(self.block, 3, objc.nil())
+        return
+    }
+    if ev.has_text {
+        enqueue(self.block, 1000 + i32(ev.action), objc.owned_text(objc.nsstring(&ev.text)))
+    } else {
+        enqueue(self.block, 1000 + i32(ev.action), objc.nil())
+    }
+}
+
 pub fn Native.inject_click_at(&mut self, x i32, y i32) u32 {
+    if self.use_app && !self.scene_app.is_empty() {
+        down_a := self.scene_app.get_mut(0).on_pointer_down(x, y)
+        self.flush_damage()
+        ev := self.scene_app.get_mut(0).on_pointer_up(x, y)
+        tiles_a := self.flush_damage()
+        self.dispatch_app_event(&ev)
+        return tiles_a
+    }
     if self.use_b3 && !self.scene_b3.is_empty() {
         down3 := self.scene_b3.get_mut(0).on_pointer_down(x, y)
         self.flush_damage()
@@ -663,7 +728,11 @@ pub fn Native.iterate(&mut self) {
         if ev_type == objc.EVENT_MOUSE_MOVED || ev_type == objc.EVENT_LEFT_MOUSE_DRAGGED {
             match parse_event_point(event, self.height) {
                 Some(pt) => {
-                    if self.use_b3 && !self.scene_b3.is_empty() {
+                    if self.use_app && !self.scene_app.is_empty() {
+                        if self.scene_app.get_mut(0).on_pointer_move(pt[0], pt[1]) {
+                            self.flush_damage()
+                        }
+                    } else if self.use_b3 && !self.scene_b3.is_empty() {
                         if self.scene_b3.get_mut(0).on_pointer_move(pt[0], pt[1]) {
                             self.last_anim_ns = objc.monotonic_ns()
                             self.flush_damage()
@@ -681,7 +750,11 @@ pub fn Native.iterate(&mut self) {
         } else if ev_type == objc.EVENT_LEFT_MOUSE_DOWN {
             match parse_event_point(event, self.height) {
                 Some(pt) => {
-                    if self.use_b3 && !self.scene_b3.is_empty() {
+                    if self.use_app && !self.scene_app.is_empty() {
+                        if self.scene_app.get_mut(0).on_pointer_down(pt[0], pt[1]) {
+                            self.flush_damage()
+                        }
+                    } else if self.use_b3 && !self.scene_b3.is_empty() {
                         if self.scene_b3.get_mut(0).on_pointer_down(pt[0], pt[1]) {
                             self.last_anim_ns = objc.monotonic_ns()
                             self.flush_damage()
@@ -699,7 +772,11 @@ pub fn Native.iterate(&mut self) {
         } else if ev_type == objc.EVENT_LEFT_MOUSE_UP {
             match parse_event_point(event, self.height) {
                 Some(pt) => {
-                    if self.use_b3 && !self.scene_b3.is_empty() {
+                    if self.use_app && !self.scene_app.is_empty() {
+                        ev := self.scene_app.get_mut(0).on_pointer_up(pt[0], pt[1])
+                        self.flush_damage()
+                        self.dispatch_app_event(&ev)
+                    } else if self.use_b3 && !self.scene_b3.is_empty() {
                         act3 := self.scene_b3.get_mut(0).on_pointer_up(pt[0], pt[1])
                         self.last_anim_ns = objc.monotonic_ns()
                         self.flush_damage()
@@ -731,6 +808,12 @@ pub fn Native.iterate(&mut self) {
             if keycode == 53 && self.escape_action != 0 {
                 enqueue(self.block, 1000 + i32(self.escape_action), objc.nil())
                 return
+            }
+            if self.use_app && !self.scene_app.is_empty() {
+                key_chars := objc.text_of(objc.send(event, &"characters"))
+                ev := self.scene_app.get_mut(0).on_key_input(i64(keycode), &key_chars)
+                self.flush_damage()
+                self.dispatch_app_event(&ev)
             }
         }
         if ev_type != objc.EVENT_APPLICATION_DEFINED {
@@ -807,6 +890,9 @@ pub fn Native.enable_counter(&mut self, value i64) i32 {
     if self.closed() { return 6 }
     if self.counter_enabled || !self.page_keys.is_empty() { return 1 }
     self.counter_enabled = true
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).enable_counter(value)
+    }
     return self.set_counter(value)
 }
 pub fn Native.set_counter(&mut self, value i64) i32 {
@@ -816,7 +902,11 @@ pub fn Native.set_counter(&mut self, value i64) i32 {
     if flag(self.block, FULL) != 0 { return 8 }
     if !self.counter_enabled { return 1 }
     self.counter_value = value
-    self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_counter(value)
+    } else {
+        self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    }
     self.flush_damage()
     return 0
 }
@@ -829,7 +919,11 @@ pub fn Native.set_heading(&mut self, text &string) i32 {
         Err(failure) => { return failure }
     }
     self.heading = text.clone()
-    self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_heading(text)
+    } else {
+        self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    }
     self.flush_damage()
     return 0
 }
@@ -875,7 +969,8 @@ fn Native.admit(&self, key &string) i32 {
 fn Native.parent_ok(&self, key &string) bool {
     if !self.parts.contains(key) { return false }
     part := self.parts.get(key)
-    if part.kind != PAGE && part.kind != BOX { return false }
+    if part.kind != PAGE && part.kind != BOX && part.kind != CONT { return false }
+    if part.kind == CONT && part.sub_kind == scene_app.CONT_TABS { return false }
     if part.region != 0 || part.tree_kind != 0 { return false }
     return true
 }
@@ -891,6 +986,9 @@ pub fn Native.add_page(&mut self, key &string) i32 {
     if self.page_keys.len() >= 32 { return 1 }
     self.page_keys.push(key.clone())
     previous := self.parts.insert(key.clone(), new_part(key, &"", PAGE, false))
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_page(key)
+    }
     return 0
 }
 
@@ -902,6 +1000,9 @@ pub fn Native.add_box(&mut self, parent &string, key &string, horizontal bool, s
     p.spacing = spacing
     previous := self.parts.insert(key.clone(), p)
     self.append_child(parent, key)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_node(key, parent, scene_app.KIND_BOX, 0, horizontal, spacing, 0, &"", 0, 0, 0, 0, 0)
+    }
     return 0
 }
 
@@ -914,13 +1015,20 @@ fn Native.add_leaf(&mut self, parent &string, key &string, text &string, action 
         Err(failure) => { return failure }
     }
     var kind = LABEL
-    if action != 0 { kind = BUTTON }
+    var skind = scene_app.KIND_LABEL
+    if action != 0 {
+        kind = BUTTON
+        skind = scene_app.KIND_BUTTON
+    }
     var p = new_part(key, parent, kind, false)
     p.text = text.clone()
     p.action = action
     p.style = style
     previous := self.parts.insert(key.clone(), p)
     self.append_child(parent, key)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_node(key, parent, skind, 0, false, 0, style, text, action, 0, 0, 0, 0)
+    }
     return 0
 }
 pub fn Native.add_label(&mut self, page &string, key &string, text &string) i32 { return self.add_leaf(page, key, text, 0, 0) }
@@ -945,6 +1053,9 @@ pub fn Native.add_entry(&mut self, parent &string, key &string, text &string, ac
     p.action = action
     previous := self.parts.insert(key.clone(), p)
     self.append_child(parent, key)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_node(key, parent, scene_app.KIND_ENTRY, 0, false, 0, 0, text, action, 0, 0, 0, 0)
+    }
     return 0
 }
 
@@ -959,14 +1070,18 @@ pub fn Native.set_text(&mut self, key &string, text &string) i32 {
     var changed = false
     {
         part := self.parts.get_mut(key)
-        if part.kind != LABEL && part.kind != BUTTON { return 1 }
+        if part.kind != LABEL && part.kind != BUTTON && part.kind != CONT { return 1 }
         if !part.text.eq(text) {
             part.text = text.clone()
             changed = true
         }
     }
     if changed {
-        self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+        if self.use_app && !self.scene_app.is_empty() {
+            self.scene_app.get_mut(0).set_text(key, text)
+        } else {
+            self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+        }
         self.flush_damage()
     }
     return 0
@@ -979,6 +1094,10 @@ pub fn Native.set_primary(&mut self, key &string, primary bool) i32 {
     part := self.parts.get_mut(key)
     if part.kind != BUTTON { return 1 }
     part.primary = primary
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_primary(key, primary)
+        self.flush_damage()
+    }
     return 0
 }
 
@@ -986,9 +1105,16 @@ pub fn Native.set_enabled(&mut self, key &string, enabled bool) i32 {
     status := self.writable()
     if status != 0 { return status }
     if !self.parts.contains(key) { return 1 }
-    part := self.parts.get_mut(key)
-    if part.kind != BUTTON && part.kind != ENTRY { return 1 }
-    part.enabled = enabled
+    {
+        part := self.parts.get_mut(key)
+        if part.kind != BUTTON && part.kind != ENTRY && part.kind != CTRL && part.kind != TEXT_AREA { return 1 }
+        if part.enabled == enabled { return 0 }
+        part.enabled = enabled
+    }
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_enabled(key, enabled)
+        self.flush_damage()
+    }
     return 0
 }
 
@@ -1005,9 +1131,14 @@ pub fn Native.set_accessible(&mut self, key &string, label_text &string, descrip
         Err(failure) => { return failure }
     }
     if !self.parts.contains(key) { return 1 }
-    part := self.parts.get_mut(key)
-    part.acc_label = label_text.clone()
-    part.acc_desc = description.clone()
+    {
+        part := self.parts.get_mut(key)
+        part.acc_label = label_text.clone()
+        part.acc_desc = description.clone()
+    }
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_accessible(key, label_text, description)
+    }
     return 0
 }
 
@@ -1015,9 +1146,15 @@ pub fn Native.focus(&mut self, key &string) i32 {
     status := self.writable()
     if status != 0 { return status }
     if self.page_keys.is_empty() || !self.parts.contains(key) { return 1 }
-    part := self.parts.get(key)
-    if part.kind != BUTTON && part.kind != ENTRY { return 1 }
+    {
+        part := self.parts.get(key)
+        if part.kind != BUTTON && part.kind != ENTRY && part.kind != TEXT_AREA && part.kind != CTRL { return 1 }
+    }
     self.focused_key = key.clone()
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_focus(key)
+        self.flush_damage()
+    }
     return 0
 }
 
@@ -1028,7 +1165,12 @@ pub fn Native.show_page(&mut self, key &string) i32 {
     if self.parts.get(key).kind != PAGE { return 1 }
     self.active_page = key.clone()
     self.pages_presented = true
-    self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).show_page(key)
+        self.focused_key = self.scene_app.get(0).focused_key.clone()
+    } else {
+        self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    }
     self.flush_damage()
     return 0
 }
@@ -1041,9 +1183,19 @@ pub fn Native.set_input(&mut self, key &string, text &string) i32 {
         Err(failure) => { return failure }
     }
     if chars(text) > MAX_INPUT || !self.parts.contains(key) { return 1 }
-    part := self.parts.get_mut(key)
-    if part.kind != ENTRY { return 1 }
-    part.text = text.clone()
+    var changed = false
+    {
+        part := self.parts.get_mut(key)
+        if part.kind != ENTRY && part.kind != TEXT_AREA && part.kind != CTRL && part.kind != CONT { return 1 }
+        if !part.text.eq(text) {
+            part.text = text.clone()
+            changed = true
+        }
+    }
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_input(key, text)
+        self.flush_damage()
+    }
     return 0
 }
 
@@ -1059,9 +1211,14 @@ pub fn Native.set_submit(&mut self, key &string, action u32) i32 {
     status := self.writable()
     if status != 0 { return status }
     if !valid_action(action) || !self.parts.contains(key) { return 1 }
-    part := self.parts.get_mut(key)
-    if part.kind != ENTRY { return 1 }
-    part.submit_action = action
+    {
+        part := self.parts.get_mut(key)
+        if part.kind != ENTRY { return 1 }
+        part.submit_action = action
+    }
+    if self.use_app && !self.scene_app.is_empty() && self.scene_app.get(0).nodes.contains(key) {
+        self.scene_app.get_mut(0).nodes.get_mut(key).submit_action = action
+    }
     return 0
 }
 
@@ -1073,9 +1230,14 @@ pub fn Native.set_placeholder(&mut self, key &string, text &string) i32 {
         Err(failure) => { return failure }
     }
     if !self.parts.contains(key) { return 1 }
-    part := self.parts.get_mut(key)
-    if part.kind != ENTRY { return 1 }
-    part.placeholder = text.clone()
+    {
+        part := self.parts.get_mut(key)
+        if part.kind != ENTRY { return 1 }
+        part.placeholder = text.clone()
+    }
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_placeholder(key, text)
+    }
     return 0
 }
 
@@ -1165,6 +1327,9 @@ fn Native.remove_subtree(&mut self, parent &string, child &string) {
     }
     for key in self.keys_within(child, true) {
         removed := self.parts.remove(&key)
+        if self.use_app && !self.scene_app.is_empty() {
+            self.scene_app.get_mut(0).remove_node(&key)
+        }
     }
     if self.parts.contains(parent) {
         host := self.parts.get_mut(parent)
@@ -1251,6 +1416,9 @@ pub fn Native.list_item(&mut self, key &string, text &string, action u32) i32 {
         created.text = text.clone()
         created.action = action
         previous := self.parts.insert(key.clone(), created)
+        if self.use_app && !self.scene_app.is_empty() {
+            self.scene_app.get_mut(0).add_node(key, &root, scene_app.KIND_BUTTON, 0, false, 0, 0, text, action, 0, 0, 0, 0)
+        }
     }
     self.place_child(&root, key)
     return 0
@@ -1273,6 +1441,25 @@ fn Native.prune(&mut self, parent &string, nested bool) {
     }
 }
 
+fn Native.sync_app_children_recursive(&mut self, parent &string) {
+    if !self.use_app || self.scene_app.is_empty() || !self.parts.contains(parent) { return }
+    var ch: Vec<string> = Vec.new()
+    {
+        p := self.parts.get(parent)
+        var i: usize = 0
+        for i < p.children.len() {
+            ch.push(p.children.get(i).clone())
+            i = i + 1
+        }
+    }
+    self.scene_app.get_mut(0).set_children(parent, &ch)
+    var j: usize = 0
+    for j < ch.len() {
+        self.sync_app_children_recursive(ch.get(j))
+        j = j + 1
+    }
+}
+
 pub fn Native.list_end(&mut self) i32 {
     status := self.writable()
     if status != 0 { return status }
@@ -1282,6 +1469,13 @@ pub fn Native.list_end(&mut self) i32 {
     self.region_root = ""
     self.seen = collections.Set.new()
     self.next_index = collections.Map.new()
+    if self.use_app && !self.scene_app.is_empty() {
+        self.sync_app_children_recursive(&root)
+        self.scene_app.get_mut(0).relayout()
+        cr := self.scene_app.get(0).content_rect
+        self.scene_app.get_mut(0).damage.add(cr, self.width, self.height)
+        self.flush_damage()
+    }
     return 0
 }
 
@@ -1371,6 +1565,14 @@ pub fn Native.tree_node(&mut self, parent_key &string, key &string, kind u32, te
         node.primary = kind == NODE_PRIMARY
         node.tree_kind = kind + 1
         previous := self.parts.insert(key.clone(), node)
+        if self.use_app && !self.scene_app.is_empty() {
+            var skind = scene_app.KIND_LABEL
+            var st: u32 = 0
+            if kind == 1 { st = 1 } else if kind == 2 { st = 2 }
+            if p_kind == BUTTON { skind = scene_app.KIND_BUTTON } else if p_kind == ENTRY { skind = scene_app.KIND_ENTRY } else if p_kind == BOX { skind = scene_app.KIND_BOX }
+            self.scene_app.get_mut(0).add_node(key, parent_key, skind, 0, kind == NODE_ROW, spacing, st, text, action, 0, 0, 0, 0)
+            if kind == NODE_PRIMARY { self.scene_app.get_mut(0).set_primary(key, true) }
+        }
     }
     self.place_child(parent_key, key)
     return 0
@@ -1386,6 +1588,13 @@ pub fn Native.tree_end(&mut self) i32 {
     self.tree_mode = false
     self.seen = collections.Set.new()
     self.next_index = collections.Map.new()
+    if self.use_app && !self.scene_app.is_empty() {
+        self.sync_app_children_recursive(&root)
+        self.scene_app.get_mut(0).relayout()
+        cr := self.scene_app.get(0).content_rect
+        self.scene_app.get_mut(0).damage.add(cr, self.width, self.height)
+        self.flush_damage()
+    }
     return 0
 }
 
@@ -1398,6 +1607,12 @@ pub fn Native.snapshot_png(&mut self, path &string) i32 {
         Err(failure) => { return failure }
     }
     self.flush_damage()
+    if self.use_app && !self.scene_app.is_empty() {
+        return match self.scene_app.get(0).snapshot_png(path) {
+            Ok(_) => 0
+            Err(code) => code
+        }
+    }
     if self.use_b3 && !self.scene_b3.is_empty() {
         return match self.scene_b3.get(0).snapshot_png(path) {
             Ok(_) => 0
@@ -1445,21 +1660,254 @@ pub fn Native.trigger_key(&mut self, key &string) i32 {
     return 1
 }
 
-// ---- Deferred to B4 (status 11) ----
-fn Native.unsupported(&self) i32 {
+// ---- Milestone B4: Controls, Containers, TextAreas, Header & Tree Extensions ----
+pub fn Native.add_control(&mut self, parent &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if kind > scene_app.CTRL_SPINNER || !self.parent_ok(parent) { return 1 }
+    if kind >= scene_app.CTRL_PROGRESS && action != 0 { return 1 }
+    if kind < scene_app.CTRL_PROGRESS && !valid_action(action) { return 1 }
+    val_ok := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var p = new_part(key, parent, CTRL, false)
+    p.sub_kind = kind
+    p.text = text.clone()
+    p.action = action
+    previous := self.parts.insert(key.clone(), p)
+    self.append_child(parent, key)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_node(key, parent, scene_app.KIND_CONTROL, kind, false, 0, 0, text, action, value, min, max, 0)
+    }
+    return 0
+}
+
+pub fn Native.add_container(&mut self, parent &string, key &string, kind u32, title &string, action u32, value i64) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if kind > scene_app.CONT_TAB || !self.parts.contains(parent) { return 1 }
+    {
+        hp := self.parts.get(parent)
+        if hp.region != 0 || hp.tree_kind != 0 { return 1 }
+        if kind == scene_app.CONT_TAB {
+            if hp.kind != CONT || hp.sub_kind != scene_app.CONT_TABS { return 1 }
+        } else {
+            if !self.parent_ok(parent) { return 1 }
+        }
+    }
+    if (kind == scene_app.CONT_EXPANDER || kind == scene_app.CONT_TABS) && !valid_action(action) { return 1 }
+    if (kind == scene_app.CONT_FRAME || kind == scene_app.CONT_TAB) && action != 0 { return 1 }
+    val_ok := match c(title) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var p = new_part(key, parent, CONT, false)
+    p.sub_kind = kind
+    p.text = title.clone()
+    p.action = action
+    previous := self.parts.insert(key.clone(), p)
+    self.append_child(parent, key)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_node(key, parent, scene_app.KIND_CONTAINER, kind, false, 0, 0, title, action, value, 0, 1, 0)
+    }
+    return 0
+}
+
+pub fn Native.add_text_area(&mut self, parent &string, key &string, text &string, action u32, lines u32) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if !valid_action(action) || !self.parent_ok(parent) || lines == 0 || lines > 32 { return 1 }
+    val_ok := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var p = new_part(key, parent, TEXT_AREA, false)
+    p.text = text.clone()
+    p.action = action
+    previous := self.parts.insert(key.clone(), p)
+    self.append_child(parent, key)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_node(key, parent, scene_app.KIND_TEXT_AREA, 0, false, 0, 0, text, action, 0, 0, 0, lines)
+    }
+    return 0
+}
+
+pub fn Native.set_header(&mut self, subtitle &string) i32 {
     status := self.writable()
     if status != 0 { return status }
-    return 11
+    val_ok := match c(subtitle) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).set_header(subtitle)
+        self.flush_damage()
+    }
+    return 0
 }
-pub fn Native.add_control(&mut self, parent &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 { return self.unsupported() }
-pub fn Native.add_container(&mut self, parent &string, key &string, kind u32, title &string, action u32, value i64) i32 { return self.unsupported() }
-pub fn Native.add_text_area(&mut self, parent &string, key &string, text &string, action u32, lines u32) i32 { return self.unsupported() }
-pub fn Native.set_header(&mut self, subtitle &string) i32 { return self.unsupported() }
-pub fn Native.add_header_button(&mut self, key &string, text &string, icon &string, action u32, end bool) i32 { return self.unsupported() }
-pub fn Native.add_menu_item(&mut self, key &string, text &string, action u32) i32 { return self.unsupported() }
-pub fn Native.tree_control(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 { return self.unsupported() }
-pub fn Native.tree_container(&mut self, parent_key &string, key &string, kind u32, title &string, action u32, value i64) i32 { return self.unsupported() }
-pub fn Native.tree_text_area(&mut self, parent_key &string, key &string, text &string, action u32, lines u32) i32 { return self.unsupported() }
+
+pub fn Native.add_header_button(&mut self, key &string, text &string, icon &string, action u32, end bool) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !valid_key(key) || !valid_action(action) || self.parts.contains(key) { return 1 }
+    val_ok := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var p = new_part(key, &"__header__", HEADER_BTN, false)
+    p.text = text.clone()
+    p.action = action
+    previous := self.parts.insert(key.clone(), p)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_header_button(key, text, action)
+        self.flush_damage()
+    }
+    return 0
+}
+
+pub fn Native.add_menu_item(&mut self, key &string, text &string, action u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !valid_key(key) || !valid_action(action) || self.parts.contains(key) { return 1 }
+    val_ok := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var p = new_part(key, &"__menu__", MENU_ITEM, false)
+    p.text = text.clone()
+    p.action = action
+    previous := self.parts.insert(key.clone(), p)
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).add_menu_item(key, text, action)
+        self.flush_damage()
+    }
+    return 0
+}
+
+pub fn Native.tree_control(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || self.region_root.is_empty() || !valid_key(key) || kind > scene_app.CTRL_SPINNER { return 1 }
+    if self.seen.contains(key) || u32(self.seen.len()) >= self.expected { return 1 }
+    if kind >= scene_app.CTRL_PROGRESS && action != 0 { return 1 }
+    if kind < scene_app.CTRL_PROGRESS && !valid_action(action) { return 1 }
+    if !self.parts.contains(parent_key) { return 1 }
+    if self.parts.contains(key) {
+        {
+            found := self.parts.get(key)
+            if !found.parent.eq(parent_key) || found.kind != CTRL || found.sub_kind != kind || found.action != action { return 1 }
+        }
+        in_st := self.set_input(key, &value.to_string())
+    } else {
+        if self.parts.len() >= MAX_STAGED { return 1 }
+        var p = new_part(key, parent_key, CTRL, false)
+        p.sub_kind = kind
+        p.text = text.clone()
+        p.action = action
+        p.tree_kind = 10 + kind
+        previous := self.parts.insert(key.clone(), p)
+        if self.use_app && !self.scene_app.is_empty() {
+            self.scene_app.get_mut(0).add_node(key, parent_key, scene_app.KIND_CONTROL, kind, false, 0, 0, text, action, value, min, max, 0)
+        }
+    }
+    self.place_child(parent_key, key)
+    return 0
+}
+
+pub fn Native.tree_container(&mut self, parent_key &string, key &string, kind u32, title &string, action u32, value i64) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || self.region_root.is_empty() || !valid_key(key) || kind > scene_app.CONT_TAB { return 1 }
+    if self.seen.contains(key) || u32(self.seen.len()) >= self.expected { return 1 }
+    if (kind == scene_app.CONT_EXPANDER || kind == scene_app.CONT_TABS) && !valid_action(action) { return 1 }
+    if (kind == scene_app.CONT_FRAME || kind == scene_app.CONT_TAB) && action != 0 { return 1 }
+    if !self.parts.contains(parent_key) { return 1 }
+    if self.parts.contains(key) {
+        {
+            found := self.parts.get(key)
+            if !found.parent.eq(parent_key) || found.kind != CONT || found.sub_kind != kind || found.action != action { return 1 }
+        }
+        if kind == scene_app.CONT_EXPANDER || kind == scene_app.CONT_TABS {
+            in_st := self.set_input(key, &value.to_string())
+        } else {
+            tx_st := self.set_text(key, title)
+        }
+    } else {
+        if self.parts.len() >= MAX_STAGED { return 1 }
+        var p = new_part(key, parent_key, CONT, false)
+        p.sub_kind = kind
+        p.text = title.clone()
+        p.action = action
+        p.tree_kind = 20 + kind
+        previous := self.parts.insert(key.clone(), p)
+        if self.use_app && !self.scene_app.is_empty() {
+            self.scene_app.get_mut(0).add_node(key, parent_key, scene_app.KIND_CONTAINER, kind, false, 0, 0, title, action, value, 0, 1, 0)
+        }
+    }
+    self.place_child(parent_key, key)
+    return 0
+}
+
+pub fn Native.tree_text_area(&mut self, parent_key &string, key &string, text &string, action u32, lines u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || self.region_root.is_empty() || !valid_key(key) || !valid_action(action) || lines == 0 || lines > 32 { return 1 }
+    if self.seen.contains(key) || u32(self.seen.len()) >= self.expected { return 1 }
+    if !self.parts.contains(parent_key) { return 1 }
+    if self.parts.contains(key) {
+        {
+            found := self.parts.get(key)
+            if !found.parent.eq(parent_key) || found.kind != TEXT_AREA || found.action != action { return 1 }
+        }
+        in_st := self.set_input(key, text)
+    } else {
+        if self.parts.len() >= MAX_STAGED { return 1 }
+        var p = new_part(key, parent_key, TEXT_AREA, false)
+        p.text = text.clone()
+        p.action = action
+        p.tree_kind = 30
+        previous := self.parts.insert(key.clone(), p)
+        if self.use_app && !self.scene_app.is_empty() {
+            self.scene_app.get_mut(0).add_node(key, parent_key, scene_app.KIND_TEXT_AREA, 0, false, 0, 0, text, action, 0, 0, 0, lines)
+        }
+    }
+    self.place_child(parent_key, key)
+    return 0
+}
+
+pub fn Native.apply_theme(&mut self, dark bool, accent_idx u32, transparency u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if self.use_app && !self.scene_app.is_empty() {
+        self.scene_app.get_mut(0).apply_theme(dark, accent_idx, transparency)
+        self.flush_damage()
+    }
+    return 0
+}
+
+pub fn Native.devtools_fill(&mut self, key &string, text &string) i32 {
+    status := self.set_input(key, text)
+    if status != 0 { return status }
+    if !self.parts.contains(key) { return 1 }
+    act := self.parts.get(key).action
+    if act != 0 {
+        enqueue(self.block, 1000 + i32(act), objc.owned_text(objc.nsstring(text)))
+    }
+    return 0
+}
+
+pub fn Native.devtools_click(&mut self, key &string) i32 {
+    if !self.parts.contains(key) { return 1 }
+    if self.use_app && !self.scene_app.is_empty() && self.scene_app.get(0).nodes.contains(key) {
+        b := self.scene_app.get(0).nodes.get(key).bounds
+        if !b.is_empty() {
+            tiles := self.inject_click_at(b.x + b.w / 2, b.y + b.h / 2)
+            return 0
+        }
+    }
+    return self.trigger_key(key)
+}
 
 // ---- Run loop sources (watch_fd / watch_interval) ----
 pub fn Native.watch_interval(&mut self, milliseconds u32) u32 {

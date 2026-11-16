@@ -1,0 +1,1512 @@
+// Pure-Tarn ABI 14 Retained Scene & Widget Renderer (`scene_app.tarn`) — Milestone B4:
+// Renders any `tarn_ui` application (`examples/counter`, `examples/navigation`,
+// `examples/widgets`, `core/components`) using the Cairn design system:
+// - `theme.Theme` (light/dark/accents/transparency from `desktop-spec.md` §1.3)
+// - `layout` (two-pass flex row/column, scroll containers, popover clamping)
+// - `render` (cached `Wallpaper("lago")` + Dual-Kawase `.glass.window` backdrop, SDF rects)
+// - `text` + `icons` (Bricolage Grotesque + Onest + Lucide icons)
+// - `damage` (exact per-widget dirty rects, 0 redraws at idle)
+import "string"
+import "collections"
+import "backend/damage"
+import "backend/render"
+import "backend/text"
+import "backend/icons"
+import "backend/theme"
+import "backend/layout"
+import "backend/png"
+import "backend/objc"
+
+pub const KIND_PAGE u32 = 0
+pub const KIND_BOX u32 = 1
+pub const KIND_LABEL u32 = 2
+pub const KIND_BUTTON u32 = 3
+pub const KIND_ENTRY u32 = 4
+pub const KIND_CONTROL u32 = 5
+pub const KIND_CONTAINER u32 = 6
+pub const KIND_TEXT_AREA u32 = 7
+pub const KIND_HEADER_BTN u32 = 8
+pub const KIND_MENU_ITEM u32 = 9
+
+// Control sub-kinds (matching `core/components.tarn` ABI 14)
+pub const CTRL_SWITCH u32 = 0
+pub const CTRL_CHECK u32 = 1
+pub const CTRL_SLIDER u32 = 2
+pub const CTRL_SPIN u32 = 3
+pub const CTRL_DROPDOWN u32 = 4
+pub const CTRL_PROGRESS u32 = 5
+pub const CTRL_LEVEL u32 = 6
+pub const CTRL_SPINNER u32 = 7
+
+// Container sub-kinds
+pub const CONT_FRAME u32 = 0
+pub const CONT_EXPANDER u32 = 1
+pub const CONT_TABS u32 = 2
+pub const CONT_TAB u32 = 3
+
+// Input event returned to `Native`
+pub struct AppInputEvent {
+    pub action u32
+    pub text string
+    pub has_text bool
+    pub key string
+}
+
+pub fn no_app_event() AppInputEvent {
+    return AppInputEvent { action: 0, text: "", has_text: false, key: "" }
+}
+
+pub struct AppNode {
+    pub key string
+    pub parent string
+    pub kind u32
+    pub sub_kind u32
+    pub horizontal bool
+    pub spacing i32
+    pub style u32
+    pub text string
+    pub placeholder string
+    pub acc_label string
+    pub acc_desc string
+    pub primary bool
+    pub enabled bool
+    pub selectable bool
+    pub align_start bool
+    pub action u32
+    pub submit_action u32
+    pub value i64
+    pub min_val i64
+    pub max_val i64
+    pub lines u32
+    pub options Vec<string>
+    pub children Vec<string>
+    pub bounds damage.Rect
+    pub visible bool
+}
+
+fn AppNode.clone(&self) AppNode {
+    var opts: Vec<string> = Vec.with_capacity(self.options.len())
+    var i: usize = 0
+    for i < self.options.len() {
+        opts.push(self.options.get(i).clone())
+        i = i + 1
+    }
+    var ch: Vec<string> = Vec.with_capacity(self.children.len())
+    i = 0
+    for i < self.children.len() {
+        ch.push(self.children.get(i).clone())
+        i = i + 1
+    }
+    return AppNode {
+        key: self.key.clone(),
+        parent: self.parent.clone(),
+        kind: self.kind,
+        sub_kind: self.sub_kind,
+        horizontal: self.horizontal,
+        spacing: self.spacing,
+        style: self.style,
+        text: self.text.clone(),
+        placeholder: self.placeholder.clone(),
+        acc_label: self.acc_label.clone(),
+        acc_desc: self.acc_desc.clone(),
+        primary: self.primary,
+        enabled: self.enabled,
+        selectable: self.selectable,
+        align_start: self.align_start,
+        action: self.action,
+        submit_action: self.submit_action,
+        value: self.value,
+        min_val: self.min_val,
+        max_val: self.max_val,
+        lines: self.lines,
+        options: opts,
+        children: ch,
+        bounds: self.bounds,
+        visible: self.visible,
+    }
+}
+
+fn new_app_node(key &string, parent &string, kind u32) AppNode {
+    return AppNode {
+        key: key.clone(),
+        parent: parent.clone(),
+        kind: kind,
+        sub_kind: 0,
+        horizontal: false,
+        spacing: 8,
+        style: 0,
+        text: "",
+        placeholder: "",
+        acc_label: "",
+        acc_desc: "",
+        primary: false,
+        enabled: true,
+        selectable: false,
+        align_start: false,
+        action: 0,
+        submit_action: 0,
+        value: 0,
+        min_val: 0,
+        max_val: 1,
+        lines: 3,
+        options: Vec.new(),
+        children: Vec.new(),
+        bounds: damage.rect(0, 0, 0, 0),
+        visible: true,
+    }
+}
+
+fn split_lines(s &string) Vec<string> {
+    var out: Vec<string> = Vec.new()
+    bytes := s.bytes()
+    var start: usize = 0
+    var i: usize = 0
+    for i < bytes.len() {
+        if bytes[i] == 10 {
+            out.push(s.copy_range(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start <= bytes.len() {
+        out.push(s.copy_range(start, bytes.len()))
+    }
+    return out
+}
+
+pub struct SceneApp {
+    pub width i32
+    pub height i32
+    pub scale i32
+    pub theme theme.Theme
+    pub frame render.Canvas
+    pub wallpaper render.Canvas
+    pub window_base render.Canvas
+    pub window_shadow render.NineSliceShadow
+    pub damage damage.DamageRegion
+    pub fonts text.FontPair
+    pub atlas text.GlyphAtlas
+
+    pub win_rect damage.Rect
+    pub header_rect damage.Rect
+    pub content_rect damage.Rect
+    pub scroll layout.ScrollState
+
+    pub title string
+    pub heading string
+    pub subtitle string
+    pub counter_enabled bool
+    pub counter_value i64
+    pub counter_btn_rect damage.Rect
+
+    pub active_page string
+    pub page_keys Vec<string>
+    pub nodes collections.Map<string, AppNode>
+    pub header_buttons Vec<string>
+    pub menu_items Vec<string>
+    pub menu_btn_rect damage.Rect
+    pub menu_pop_rect damage.Rect
+    pub menu_open bool
+    pub open_dropdown_key string
+    pub dropdown_pop_rect damage.Rect
+
+    pub hovered_key string
+    pub pressed_key string
+    pub focused_key string
+    pub dragging_slider_key string
+    pub saved_focus collections.Map<string, string>
+
+    pub first_frame_ns u64
+    pub frames_rendered u64
+    pub tiles_rendered u64
+}
+
+pub fn SceneApp.new(width i32, height i32, scale i32, title &string, heading &string) SceneApp {
+    t0 := objc.monotonic_ns()
+    s := f64(scale)
+    th := theme.Theme.default_dark()
+    fonts := match text.load_cairn_fonts() {
+        Ok(fp) => fp
+        Err(code) => { panic("SceneApp load_cairn_fonts failed: " + code.to_string()) }
+    }
+    var atlas = text.GlyphAtlas.new(512, 512)
+    var wp = render.Canvas.new(width, height, scale)
+    wp.render_wallpaper_lago()
+
+    var w_base = render.Canvas.new(width, height, scale)
+    win_shadow := render.NineSliceShadow.precompute(26.0 * s, 28.0 * s, 12 * scale, 0, th.semantic.shadow_window)
+    win_rect := compute_win_rect(width, height, scale)
+    rebuild_window_base(&mut w_base, &wp, &th, win_rect, &win_shadow, scale)
+
+    header_h := i32(50.0 * s)
+    header_rect := damage.rect(win_rect.x, win_rect.y, win_rect.w, header_h)
+    pad_x := i32(20.0 * s)
+    content_rect := damage.rect(win_rect.x + pad_x, win_rect.y + header_h + i32(8.0 * s),
+        win_rect.w - pad_x * 2, win_rect.h - header_h - i32(20.0 * s))
+
+    var frame = render.Canvas.new(width, height, scale)
+    frame.blit_from(&w_base, damage.rect(0, 0, width, height))
+
+    var dmg = damage.DamageRegion.new()
+    dmg.add_full(width, height)
+
+    var sc = SceneApp {
+        width: width,
+        height: height,
+        scale: scale,
+        theme: th,
+        frame: frame,
+        wallpaper: wp,
+        window_base: w_base,
+        window_shadow: win_shadow,
+        damage: dmg,
+        fonts: fonts,
+        atlas: atlas,
+        win_rect: win_rect,
+        header_rect: header_rect,
+        content_rect: content_rect,
+        scroll: layout.ScrollState.new(content_rect.h, content_rect.h),
+        title: title.clone(),
+        heading: heading.clone(),
+        subtitle: "",
+        counter_enabled: false,
+        counter_value: 0,
+        counter_btn_rect: damage.rect(0, 0, 0, 0),
+        active_page: "",
+        page_keys: Vec.new(),
+        nodes: collections.Map.new(),
+        header_buttons: Vec.new(),
+        menu_items: Vec.new(),
+        menu_btn_rect: damage.rect(0, 0, 0, 0),
+        menu_pop_rect: damage.rect(0, 0, 0, 0),
+        menu_open: false,
+        open_dropdown_key: "",
+        dropdown_pop_rect: damage.rect(0, 0, 0, 0),
+        hovered_key: "",
+        pressed_key: "",
+        focused_key: "",
+        dragging_slider_key: "",
+        saved_focus: collections.Map.new(),
+        first_frame_ns: 0,
+        frames_rendered: 0,
+        tiles_rendered: 0,
+    }
+    rd := sc.render_damaged()
+    t1 := objc.monotonic_ns()
+    sc.first_frame_ns = t1 - t0
+    return sc
+}
+
+fn compute_win_rect(width i32, height i32, scale i32) damage.Rect {
+    s := f64(scale)
+    var margin_x = i32(20.0 * s)
+    var margin_y = i32(18.0 * s)
+    if width < 400 { margin_x = 4 }
+    if height < 300 { margin_y = 4 }
+    return damage.rect(margin_x, margin_y, width - margin_x * 2, height - margin_y * 2)
+}
+
+fn rebuild_window_base(w_base &mut render.Canvas, wp &render.Canvas, th &theme.Theme,
+    win_rect damage.Rect, win_shadow &render.NineSliceShadow, scale i32) {
+    full := damage.rect(0, 0, w_base.width, w_base.height)
+    w_base.blit_from(wp, full)
+    w_base.draw_shadow_9slice(win_rect, win_shadow, full)
+    s := f64(scale)
+    pal := th.palette
+    w_base.draw_glass_backdrop(wp, win_rect, render.uniform_radii(26.0 * s), pal.surface, pal.edge, pal.hi, 1.9, full)
+
+    // Header divider hairline
+    hdr_y := win_rect.y + i32(50.0 * s)
+    w_base.draw_rrect(damage.rect(win_rect.x + 1, hdr_y, win_rect.w - 2, 1), render.RRectStyle {
+        fill_top: pal.line,
+        fill_bottom: pal.line,
+        border_color: render.rgba(0, 0, 0, 0),
+        inner_hi: render.rgba(0, 0, 0, 0),
+        radii: render.uniform_radii(0.0),
+        border_width: 0.0,
+    }, full)
+
+    // Traffic lights
+    tl_y := win_rect.y + i32(19.0 * s)
+    tl_b := render.rgba(0, 0, 0, 56)
+    tl_h := render.rgba(0, 0, 0, 0)
+    draw_solid(w_base, damage.rect(win_rect.x + i32(20.0 * s), tl_y, 11, 11), th.semantic.tl_close, tl_b, tl_h, 5.5, 1.0, full)
+    draw_solid(w_base, damage.rect(win_rect.x + i32(38.0 * s), tl_y, 11, 11), th.semantic.tl_min, tl_b, tl_h, 5.5, 1.0, full)
+    draw_solid(w_base, damage.rect(win_rect.x + i32(56.0 * s), tl_y, 11, 11), th.semantic.tl_max, tl_b, tl_h, 5.5, 1.0, full)
+}
+
+fn draw_solid(c &mut render.Canvas, bounds damage.Rect, fill render.Color, border render.Color, hi render.Color, r f64, bw f64, clip damage.Rect) {
+    c.draw_rrect(bounds, render.RRectStyle {
+        fill_top: fill,
+        fill_bottom: fill,
+        border_color: border,
+        inner_hi: hi,
+        radii: render.uniform_radii(r),
+        border_width: bw,
+    }, clip)
+}
+
+pub fn SceneApp.apply_theme(&mut self, dark bool, accent_idx u32, transparency u32) {
+    c0 := self.theme.set_dark(dark)
+    c1 := self.theme.set_accent(accent_idx)
+    c2 := self.theme.set_transparency(transparency)
+    if !c0 && !c1 && !c2 { return }
+    self.window_shadow = render.NineSliceShadow.precompute(26.0 * f64(self.scale), 28.0 * f64(self.scale), 12 * self.scale, 0, self.theme.semantic.shadow_window)
+    rebuild_window_base(&mut self.window_base, &self.wallpaper, &self.theme, self.win_rect, &self.window_shadow, self.scale)
+    self.damage.add_full(self.width, self.height)
+}
+
+pub fn SceneApp.set_heading(&mut self, val &string) {
+    self.heading = val.clone()
+    self.damage.add(self.content_rect, self.width, self.height)
+}
+
+pub fn SceneApp.enable_counter(&mut self, value i64) {
+    self.counter_enabled = true
+    self.counter_value = value
+    self.relayout()
+    self.damage.add(self.win_rect, self.width, self.height)
+}
+
+pub fn SceneApp.set_counter(&mut self, value i64) {
+    self.counter_value = value
+    self.damage.add(self.content_rect, self.width, self.height)
+}
+
+pub fn SceneApp.set_header(&mut self, subtitle &string) {
+    self.subtitle = subtitle.clone()
+    self.relayout()
+    self.damage.add(self.header_rect, self.width, self.height)
+}
+
+pub fn SceneApp.add_header_button(&mut self, key &string, val &string, action u32) {
+    var node = new_app_node(key, &"__header__", KIND_HEADER_BTN)
+    node.text = val.clone()
+    node.action = action
+    self.nodes.insert(key.clone(), node)
+    self.header_buttons.push(key.clone())
+    self.relayout()
+    self.damage.add(self.header_rect, self.width, self.height)
+}
+
+pub fn SceneApp.add_menu_item(&mut self, key &string, val &string, action u32) {
+    var node = new_app_node(key, &"__menu__", KIND_MENU_ITEM)
+    node.text = val.clone()
+    node.action = action
+    self.nodes.insert(key.clone(), node)
+    self.menu_items.push(key.clone())
+    self.relayout()
+    self.damage.add(self.header_rect, self.width, self.height)
+}
+
+pub fn SceneApp.add_page(&mut self, key &string) {
+    node := new_app_node(key, &"", KIND_PAGE)
+    self.nodes.insert(key.clone(), node)
+    self.page_keys.push(key.clone())
+    if self.active_page.is_empty() {
+        self.active_page = key.clone()
+    }
+}
+
+pub fn SceneApp.add_node(&mut self, key &string, parent &string, kind u32, sub_kind u32,
+    horizontal bool, spacing u32, style u32, text_val &string, action u32,
+    value i64, min_v i64, max_v i64, lines u32) {
+    var node = new_app_node(key, parent, kind)
+    node.sub_kind = sub_kind
+    node.horizontal = horizontal
+    node.spacing = i32(spacing)
+    if node.spacing <= 0 { node.spacing = 8 }
+    node.style = style
+    node.action = action
+    node.value = value
+    node.min_val = min_v
+    node.max_val = max_v
+    node.lines = lines
+    if kind == KIND_CONTROL && sub_kind == CTRL_DROPDOWN {
+        parts := split_lines(text_val)
+        if !parts.is_empty() {
+            node.text = parts.get(0).clone()
+            var oi: usize = 1
+            for oi < parts.len() {
+                if !parts.get(oi).is_empty() {
+                    node.options.push(parts.get(oi).clone())
+                }
+                oi = oi + 1
+            }
+        }
+    } else {
+        node.text = text_val.clone()
+    }
+    self.nodes.insert(key.clone(), node)
+    if self.nodes.contains(parent) {
+        self.nodes.get_mut(parent).children.push(key.clone())
+    }
+}
+
+pub fn SceneApp.show_page(&mut self, key &string) {
+    if !self.active_page.is_empty() && !self.focused_key.is_empty() {
+        self.saved_focus.insert(self.active_page.clone(), self.focused_key.clone())
+    }
+    self.active_page = key.clone()
+    self.open_dropdown_key = ""
+    self.menu_open = false
+    if self.saved_focus.contains(key) {
+        self.focused_key = self.saved_focus.get(key).clone()
+    } else {
+        self.focused_key = ""
+    }
+    self.scroll.scroll_y = 0
+    self.relayout()
+    self.damage.add(self.win_rect, self.width, self.height)
+}
+
+pub fn SceneApp.mark_node_dirty(&mut self, key &string) {
+    if !self.nodes.contains(key) { return }
+    b := self.nodes.get(key).bounds
+    if !b.is_empty() {
+        self.damage.add(damage.rect(b.x - 4, b.y - 4, b.w + 8, b.h + 8), self.width, self.height)
+    }
+}
+
+pub fn SceneApp.set_text(&mut self, key &string, text_val &string) {
+    if !self.nodes.contains(key) { return }
+    self.nodes.get_mut(key).text = text_val.clone()
+    self.mark_node_dirty(key)
+}
+
+pub fn SceneApp.set_input(&mut self, key &string, text_val &string) {
+    if !self.nodes.contains(key) { return }
+    var needs_relayout = false
+    {
+        n := self.nodes.get_mut(key)
+        if n.kind == KIND_CONTROL || n.kind == KIND_CONTAINER {
+            match string.parse_i64(text_val) {
+                Some(v) => {
+                    if n.kind == KIND_CONTAINER && n.value != v {
+                        needs_relayout = true
+                    }
+                    n.value = v
+                }
+                None => {}
+            }
+        } else {
+            n.text = text_val.clone()
+        }
+    }
+    if needs_relayout {
+        self.relayout()
+        self.damage.add(self.content_rect, self.width, self.height)
+    } else {
+        self.mark_node_dirty(key)
+    }
+}
+
+pub fn SceneApp.set_enabled(&mut self, key &string, enabled bool) {
+    if !self.nodes.contains(key) { return }
+    self.nodes.get_mut(key).enabled = enabled
+    self.mark_node_dirty(key)
+}
+
+pub fn SceneApp.set_primary(&mut self, key &string, primary bool) {
+    if !self.nodes.contains(key) { return }
+    self.nodes.get_mut(key).primary = primary
+    self.mark_node_dirty(key)
+}
+
+pub fn SceneApp.set_placeholder(&mut self, key &string, text_val &string) {
+    if !self.nodes.contains(key) { return }
+    self.nodes.get_mut(key).placeholder = text_val.clone()
+    self.mark_node_dirty(key)
+}
+
+pub fn SceneApp.set_accessible(&mut self, key &string, label_text &string, desc &string) {
+    if !self.nodes.contains(key) { return }
+    n := self.nodes.get_mut(key)
+    n.acc_label = label_text.clone()
+    n.acc_desc = desc.clone()
+}
+
+pub fn SceneApp.set_focus(&mut self, key &string) {
+    prev := self.focused_key.clone()
+    self.focused_key = key.clone()
+    if !prev.is_empty() { self.mark_node_dirty(&prev) }
+    if !key.is_empty() { self.mark_node_dirty(key) }
+}
+
+pub fn SceneApp.set_children(&mut self, parent &string, new_children &Vec<string>) {
+    if !self.nodes.contains(parent) { return }
+    self.nodes.get_mut(parent).children.clear()
+    var i: usize = 0
+    for i < new_children.len() {
+        self.nodes.get_mut(parent).children.push(new_children.get(i).clone())
+        i = i + 1
+    }
+}
+
+pub fn SceneApp.remove_node(&mut self, key &string) {
+    if self.focused_key.eq(key) { self.focused_key = "" }
+    if self.hovered_key.eq(key) { self.hovered_key = "" }
+    if self.open_dropdown_key.eq(key) { self.open_dropdown_key = "" }
+    self.nodes.remove(key)
+}
+
+// ---- Measure & Arrange Pass ----
+
+fn measure_node_height(nodes &collections.Map<string, AppNode>, key &string, avail_w i32, scale i32) i32 {
+    if !nodes.contains(key) { return 0 }
+    n := nodes.get(key)
+    if !n.visible { return 0 }
+    s := f64(scale)
+    if n.kind == KIND_LABEL {
+        if n.style == 1 { return i32(34.0 * s) }
+        if n.style == 2 { return i32(30.0 * s) }
+        return i32(22.0 * s)
+    }
+    if n.kind == KIND_BUTTON { return i32(36.0 * s) }
+    if n.kind == KIND_ENTRY { return i32(36.0 * s) }
+    if n.kind == KIND_TEXT_AREA {
+        var ln = i32(n.lines)
+        if ln < 2 { ln = 2 }
+        return i32(16.0 * s) + ln * i32(20.0 * s)
+    }
+    if n.kind == KIND_CONTROL {
+        if n.sub_kind == CTRL_PROGRESS || n.sub_kind == CTRL_LEVEL { return i32(32.0 * s) }
+        return i32(38.0 * s)
+    }
+    if n.kind == KIND_CONTAINER {
+        if n.sub_kind == CONT_FRAME {
+            var h = i32(42.0 * s)
+            var i: usize = 0
+            for i < n.children.len() {
+                h = h + measure_node_height(nodes, n.children.get(i), avail_w - 24, scale)
+                if i + 1 < n.children.len() { h = h + 8 }
+                i = i + 1
+            }
+            return h + i32(14.0 * s)
+        }
+        if n.sub_kind == CONT_EXPANDER {
+            var h = i32(38.0 * s)
+            if n.value != 0 {
+                h = h + 8
+                var i: usize = 0
+                for i < n.children.len() {
+                    h = h + measure_node_height(nodes, n.children.get(i), avail_w - 24, scale)
+                    if i + 1 < n.children.len() { h = h + 8 }
+                    i = i + 1
+                }
+                h = h + 10
+            }
+            return h
+        }
+        if n.sub_kind == CONT_TABS {
+            var h = i32(44.0 * s)
+            var active_idx = i32(n.value)
+            if active_idx < 0 { active_idx = 0 }
+            if usize(active_idx) < n.children.len() {
+                tab_key := n.children.get(usize(active_idx))
+                h = h + measure_node_height(nodes, tab_key, avail_w - 16, scale) + 12
+            }
+            return h
+        }
+        if n.sub_kind == CONT_TAB {
+            var h: i32 = 0
+            var i: usize = 0
+            for i < n.children.len() {
+                h = h + measure_node_height(nodes, n.children.get(i), avail_w, scale)
+                if i + 1 < n.children.len() { h = h + 8 }
+                i = i + 1
+            }
+            return h
+        }
+    }
+    if n.kind == KIND_BOX || n.kind == KIND_PAGE {
+        if n.horizontal {
+            var max_h: i32 = i32(36.0 * s)
+            var i: usize = 0
+            for i < n.children.len() {
+                ch := measure_node_height(nodes, n.children.get(i), avail_w, scale)
+                if ch > max_h { max_h = ch }
+                i = i + 1
+            }
+            return max_h
+        }
+        var h: i32 = 0
+        var i: usize = 0
+        for i < n.children.len() {
+            ch := measure_node_height(nodes, n.children.get(i), avail_w, scale)
+            h = h + ch
+            if i + 1 < n.children.len() { h = h + n.spacing }
+            i = i + 1
+        }
+        return h
+    }
+    return i32(30.0 * s)
+}
+
+fn arrange_children(nodes &mut collections.Map<string, AppNode>, keys &Vec<string>,
+    rect damage.Rect, horizontal bool, spacing i32, scale i32) {
+    if keys.is_empty() { return }
+    var items: Vec<layout.FlexItem> = Vec.with_capacity(keys.len())
+    var i: usize = 0
+    for i < keys.len() {
+        k := keys.get(i)
+        ch := measure_node_height(nodes, k, rect.w, scale)
+        var cw = rect.w
+        var grow: i32 = 0
+        if horizontal {
+            cw = 130
+            if nodes.contains(k) {
+                nk := nodes.get(k)
+                if nk.kind == KIND_BUTTON {
+                    cw = i32(nk.text.len()) * 8 + 32
+                    if cw < 90 { cw = 90 }
+                    if cw > 220 { cw = 220 }
+                } else if nk.kind == KIND_ENTRY {
+                    cw = 180
+                    grow = 1
+                } else if nk.kind == KIND_LABEL {
+                    cw = i32(nk.text.len()) * 8 + 16
+                    if cw < 60 { cw = 60 }
+                }
+            }
+        }
+        items.push(layout.flex_item(cw, ch, grow))
+        i = i + 1
+    }
+    var spec = layout.flex_col(spacing, layout.pad_uniform(0))
+    if horizontal { spec = layout.flex_row(spacing, layout.pad_uniform(0), layout.ALIGN_CENTER) }
+    var rects: Vec<damage.Rect> = Vec.with_capacity(keys.len())
+    layout.arrange_flex(spec, rect, items.as_slice(), &mut rects)
+
+    i = 0
+    for i < keys.len() && i < rects.len() {
+        k := keys.get(i)
+        r := rects.as_slice()[i]
+        arrange_node(nodes, k, r, scale)
+        i = i + 1
+    }
+}
+
+fn arrange_node(nodes &mut collections.Map<string, AppNode>, key &string, rect damage.Rect, scale i32) {
+    if !nodes.contains(key) { return }
+    var kind: u32 = 0
+    var sub_kind: u32 = 0
+    var horizontal = false
+    var spacing: i32 = 8
+    var val: i64 = 0
+    var children_copy: Vec<string> = Vec.new()
+    {
+        n := nodes.get_mut(key)
+        n.bounds = rect
+        kind = n.kind
+        sub_kind = n.sub_kind
+        horizontal = n.horizontal
+        spacing = n.spacing
+        val = n.value
+        var ci: usize = 0
+        for ci < n.children.len() {
+            children_copy.push(n.children.get(ci).clone())
+            ci = ci + 1
+        }
+    }
+    if kind == KIND_PAGE || kind == KIND_BOX {
+        arrange_children(nodes, &children_copy, rect, horizontal, spacing, scale)
+    } else if kind == KIND_CONTAINER {
+        s := f64(scale)
+        if sub_kind == CONT_FRAME {
+            inner := damage.rect(rect.x + 12, rect.y + i32(34.0 * s), rect.w - 24, rect.h - i32(44.0 * s))
+            arrange_children(nodes, &children_copy, inner, false, 8, scale)
+        } else if sub_kind == CONT_EXPANDER {
+            if val != 0 {
+                inner := damage.rect(rect.x + 12, rect.y + i32(42.0 * s), rect.w - 24, rect.h - i32(48.0 * s))
+                arrange_children(nodes, &children_copy, inner, false, 8, scale)
+            }
+        } else if sub_kind == CONT_TABS {
+            inner := damage.rect(rect.x + 8, rect.y + i32(44.0 * s), rect.w - 16, rect.h - i32(50.0 * s))
+            var active_idx = i32(val)
+            if active_idx < 0 { active_idx = 0 }
+            var ti: usize = 0
+            for ti < children_copy.len() {
+                tk := children_copy.get(ti)
+                if i32(ti) == active_idx {
+                    arrange_node(nodes, tk, inner, scale)
+                } else if nodes.contains(tk) {
+                    nodes.get_mut(tk).bounds = damage.rect(0, 0, 0, 0)
+                }
+                ti = ti + 1
+            }
+        } else if sub_kind == CONT_TAB {
+            arrange_children(nodes, &children_copy, rect, false, 8, scale)
+        }
+    }
+}
+
+pub fn SceneApp.relayout(&mut self) {
+    s := f64(self.scale)
+    // Header buttons on right of header_rect
+    var rx = self.win_rect.right() - i32(16.0 * s)
+    if !self.menu_items.is_empty() {
+        mw := i32(32.0 * s)
+        self.menu_btn_rect = damage.rect(rx - mw, self.win_rect.y + i32(11.0 * s), mw, i32(28.0 * s))
+        rx = rx - mw - i32(8.0 * s)
+        pop_w := i32(200.0 * s)
+        pop_h := i32(self.menu_items.len()) * i32(32.0 * s) + 12
+        self.menu_pop_rect = layout.clamp_popover(self.menu_btn_rect.right() - pop_w, self.menu_btn_rect.bottom() + 6,
+            pop_w, pop_h, self.width, self.height, 8)
+    } else {
+        self.menu_btn_rect = damage.rect(0, 0, 0, 0)
+    }
+    var hi: usize = 0
+    for hi < self.header_buttons.len() {
+        hk := self.header_buttons.get(hi)
+        if self.nodes.contains(hk) {
+            var bw = i32(self.nodes.get(hk).text.len()) * 8 + 24
+            if bw < 72 { bw = 72 }
+            if bw > 160 { bw = 160 }
+            self.nodes.get_mut(hk).bounds = damage.rect(rx - bw, self.win_rect.y + i32(11.0 * s), bw, i32(28.0 * s))
+            rx = rx - bw - i32(8.0 * s)
+        }
+        hi = hi + 1
+    }
+
+    if self.counter_enabled {
+        btn_w := i32(120.0 * s)
+        btn_h := i32(38.0 * s)
+        self.counter_btn_rect = damage.rect(self.content_rect.x + (self.content_rect.w - btn_w) / 2,
+            self.content_rect.y + i32(140.0 * s), btn_w, btn_h)
+        return
+    }
+
+    if !self.active_page.is_empty() && self.nodes.contains(&self.active_page) {
+        total_h := measure_node_height(&self.nodes, &self.active_page, self.content_rect.w - 10, self.scale)
+        self.scroll.viewport_h = self.content_rect.h
+        self.scroll.content_h = total_h
+        self.scroll.clamp()
+        page_rect := damage.rect(self.content_rect.x, self.content_rect.y - self.scroll.scroll_y,
+            self.content_rect.w - 10, total_h)
+        arrange_node(&mut self.nodes, &self.active_page, page_rect, self.scale)
+    }
+}
+
+// ---- Rendering ----
+
+fn draw_node_recursive(sc &mut SceneApp, key &string, clip damage.Rect) {
+    if !sc.nodes.contains(key) { return }
+    n := sc.nodes.get(key).clone()
+    if !n.visible { return }
+    if n.kind != KIND_PAGE && n.kind != KIND_BOX && !clip.intersects(&damage.rect(n.bounds.x - 4, n.bounds.y - 4, n.bounds.w + 8, n.bounds.h + 8)) {
+        return
+    }
+    s := f64(sc.scale)
+    pal := sc.theme.palette
+    r := n.bounds
+    is_hov := sc.hovered_key.eq(key)
+    is_foc := sc.focused_key.eq(key)
+
+    if n.kind == KIND_PAGE || n.kind == KIND_BOX {
+        var i: usize = 0
+        for i < n.children.len() {
+            draw_node_recursive(sc, n.children.get(i), clip)
+            i = i + 1
+        }
+        return
+    }
+
+    if n.kind == KIND_LABEL {
+        if n.style == 1 {
+            d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.display, &n.text,
+                f64(r.x), f64(r.y + 4), f64(r.w), 0, text.display_style(22.0 * s, pal.text), clip)
+        } else if n.style == 2 {
+            var st = text.display_style(22.0 * s, pal.accent_text)
+            st.tabular_nums = true
+            d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.display, &n.text,
+                f64(r.x), f64(r.y + 2), f64(r.w), 0, st, clip)
+        } else {
+            d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+                f64(r.x), f64(r.y + 3), f64(r.w), 0, text.body_style(13.0 * s, pal.muted, false), clip)
+        }
+        return
+    }
+
+    if n.kind == KIND_BUTTON {
+        var fill = pal.card
+        var border = pal.line
+        var lbl_col = pal.text
+        if n.primary {
+            fill = pal.accent
+            border = render.rgba(255, 255, 255, 45)
+            lbl_col = render.rgb(255, 255, 255)
+            if is_hov && n.enabled {
+                fill = render.color_mix(pal.accent, 85, render.rgb(255, 255, 255))
+            }
+        } else if is_hov && n.enabled {
+            fill = pal.card_hover
+        }
+        if !n.enabled {
+            fill = render.rgba(fill.r, fill.g, fill.b, fill.a / 2)
+            lbl_col = pal.muted
+        }
+        if is_foc { border = pal.accent }
+        draw_solid(&mut sc.frame, r, fill, border, pal.hi, 12.0 * s, 1.0, clip)
+        d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+            f64(r.x + 10), f64(r.y + 10), f64(r.w - 20), 1, text.body_style(13.0 * s, lbl_col, true), clip)
+        return
+    }
+
+    if n.kind == KIND_ENTRY || n.kind == KIND_TEXT_AREA {
+        var border = pal.line
+        if is_foc { border = pal.accent } else if is_hov { border = pal.line_strong }
+        draw_solid(&mut sc.frame, r, pal.card, border, render.rgba(0, 0, 0, 0), 12.0 * s, 1.0, clip)
+        var shown = n.text.clone()
+        var col = pal.text
+        if shown.is_empty() && !n.placeholder.is_empty() {
+            shown = n.placeholder.clone()
+            col = pal.muted
+        }
+        if n.kind == KIND_ENTRY {
+            d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &shown,
+                f64(r.x + 12), f64(r.y + 10), f64(r.w - 24), 0, text.body_style(13.0 * s, col, false), clip)
+        } else {
+            para := text.layout_paragraph(&sc.fonts.body, &shown, f64(r.w - 24), text.body_style(12.5 * s, col, false))
+            d := text.draw_paragraph_layout(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &para,
+                f64(r.x + 12), f64(r.y + 8), f64(r.w - 24), 0, text.body_style(12.5 * s, col, false), clip)
+        }
+        return
+    }
+
+    if n.kind == KIND_CONTROL {
+        draw_control_node(sc, &n, is_hov, is_foc, clip)
+        return
+    }
+
+    if n.kind == KIND_CONTAINER {
+        if n.sub_kind == CONT_FRAME {
+            draw_solid(&mut sc.frame, r, pal.card, pal.line, render.rgba(0, 0, 0, 0), 14.0 * s, 1.0, clip)
+            d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+                f64(r.x + 12), f64(r.y + 10), f64(r.w - 24), 0, text.body_style(12.0 * s, pal.accent_text, true), clip)
+            var i: usize = 0
+            for i < n.children.len() {
+                draw_node_recursive(sc, n.children.get(i), clip)
+                i = i + 1
+            }
+        } else if n.sub_kind == CONT_EXPANDER {
+            draw_solid(&mut sc.frame, r, pal.card, pal.line, render.rgba(0, 0, 0, 0), 14.0 * s, 1.0, clip)
+            var ic_id = icons.ICON_CHEVRON_RIGHT
+            if n.value != 0 { ic_id = icons.ICON_CHEVRON_DOWN }
+            ic := icons.draw_icon(&mut sc.frame, &mut sc.atlas, ic_id, r.x + 12, r.y + 11, 14.0 * s, 2.0, pal.muted, clip)
+            d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+                f64(r.x + 32), f64(r.y + 11), f64(r.w - 44), 0, text.body_style(13.0 * s, pal.text, true), clip)
+            if n.value != 0 {
+                var i: usize = 0
+                for i < n.children.len() {
+                    draw_node_recursive(sc, n.children.get(i), clip)
+                    i = i + 1
+                }
+            }
+        } else if n.sub_kind == CONT_TABS {
+            draw_solid(&mut sc.frame, r, pal.card, pal.line, render.rgba(0, 0, 0, 0), 14.0 * s, 1.0, clip)
+            // Tab strip at top
+            tab_cnt := n.children.len()
+            if tab_cnt > 0 {
+                strip := damage.rect(r.x + 8, r.y + 6, r.w - 16, i32(32.0 * s))
+                draw_solid(&mut sc.frame, strip, pal.track, pal.line, render.rgba(0, 0, 0, 0), 10.0 * s, 1.0, clip)
+                tw := (strip.w - 6) / i32(tab_cnt)
+                var ti: usize = 0
+                for ti < tab_cnt {
+                    tk := n.children.get(ti)
+                    tr := damage.rect(strip.x + 3 + i32(ti) * tw, strip.y + 3, tw, strip.h - 6)
+                    is_active := i64(ti) == n.value
+                    if is_active {
+                        draw_solid(&mut sc.frame, tr, pal.pill, render.rgba(0, 0, 0, 0), pal.hi, 8.0 * s, 0.0, clip)
+                    }
+                    var t_lbl = ""
+                    if sc.nodes.contains(tk) { t_lbl = sc.nodes.get(tk).text.clone() }
+                    var lcol = pal.muted
+                    if is_active { lcol = pal.text }
+                    dt := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &t_lbl,
+                        f64(tr.x + 6), f64(tr.y + 6), f64(tr.w - 12), 1, text.body_style(12.0 * s, lcol, is_active), clip)
+                    ti = ti + 1
+                }
+                var active_idx = usize(n.value)
+                if active_idx < tab_cnt {
+                    draw_node_recursive(sc, n.children.get(active_idx), clip)
+                }
+            }
+        } else if n.sub_kind == CONT_TAB {
+            var i: usize = 0
+            for i < n.children.len() {
+                draw_node_recursive(sc, n.children.get(i), clip)
+                i = i + 1
+            }
+        }
+    }
+}
+
+fn draw_control_node(sc &mut SceneApp, n &AppNode, is_hov bool, is_foc bool, clip damage.Rect) {
+    s := f64(sc.scale)
+    pal := sc.theme.palette
+    r := n.bounds
+    var row_fill = pal.card
+    if is_hov && n.sub_kind <= CTRL_DROPDOWN { row_fill = pal.card_hover }
+    var row_border = pal.line
+    if is_foc { row_border = pal.accent }
+    draw_solid(&mut sc.frame, r, row_fill, row_border, render.rgba(0, 0, 0, 0), 12.0 * s, 1.0, clip)
+
+    if n.sub_kind == CTRL_SWITCH {
+        d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+            f64(r.x + 12), f64(r.y + 11), f64(r.w - 72), 0, text.body_style(13.0 * s, pal.text, false), clip)
+        sw_r := damage.rect(r.right() - 56, r.y + (r.h - 26) / 2, 44, 26)
+        var tcol = pal.track
+        var kx = sw_r.x + 3
+        if n.value != 0 {
+            tcol = pal.accent
+            kx = sw_r.right() - 23
+        }
+        draw_solid(&mut sc.frame, sw_r, tcol, pal.line, render.rgba(0, 0, 0, 0), 13.0 * s, 1.0, clip)
+        draw_solid(&mut sc.frame, damage.rect(kx, sw_r.y + 3, 20, 20), render.rgb(255, 255, 255), render.rgba(0, 0, 0, 30), render.rgba(0, 0, 0, 0), 10.0, 1.0, clip)
+        return
+    }
+
+    if n.sub_kind == CTRL_CHECK {
+        cb_r := damage.rect(r.x + 12, r.y + (r.h - 20) / 2, 20, 20)
+        if n.value != 0 {
+            draw_solid(&mut sc.frame, cb_r, pal.accent, pal.accent, pal.hi, 6.0 * s, 1.0, clip)
+            ic := icons.draw_icon(&mut sc.frame, &mut sc.atlas, icons.ICON_CHECK, cb_r.x + 3, cb_r.y + 3, 14.0 * s, 2.2, render.rgb(255, 255, 255), clip)
+        } else {
+            draw_solid(&mut sc.frame, cb_r, pal.track, pal.line_strong, render.rgba(0, 0, 0, 0), 6.0 * s, 1.0, clip)
+        }
+        d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+            f64(r.x + 42), f64(r.y + 11), f64(r.w - 54), 0, text.body_style(13.0 * s, pal.text, false), clip)
+        return
+    }
+
+    if n.sub_kind == CTRL_SLIDER {
+        d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+            f64(r.x + 12), f64(r.y + 11), 130.0, 0, text.body_style(13.0 * s, pal.text, false), clip)
+        val_str := n.value.to_string()
+        var st_v = text.body_style(12.5 * s, pal.accent_text, true)
+        st_v.tabular_nums = true
+        dv := text.draw_text_line(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &val_str, f64(r.right() - 48), f64(r.y + 11), 36.0, 2, st_v, clip)
+        tr_x := r.x + 150
+        tr_w := r.w - 208
+        if tr_w > 20 {
+            tr_r := damage.rect(tr_x, r.y + r.h / 2 - 3, tr_w, 6)
+            draw_solid(&mut sc.frame, tr_r, pal.track, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 3.0, 0.0, clip)
+            span := n.max_val - n.min_val
+            var frac = 0.0
+            if span > 0 { frac = f64(n.value - n.min_val) / f64(span) }
+            if frac < 0.0 { frac = 0.0 }
+            if frac > 1.0 { frac = 1.0 }
+            fill_w := i32(f64(tr_w) * frac + 0.5)
+            if fill_w > 0 {
+                draw_solid(&mut sc.frame, damage.rect(tr_x, tr_r.y, fill_w, 6), pal.accent, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 3.0, 0.0, clip)
+            }
+            kx := tr_x + fill_w - 9
+            draw_solid(&mut sc.frame, damage.rect(kx, r.y + r.h / 2 - 9, 18, 18), render.rgb(255, 255, 255), pal.accent, render.rgba(0, 0, 0, 0), 9.0, 2.0, clip)
+        }
+        return
+    }
+
+    if n.sub_kind == CTRL_SPIN {
+        d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+            f64(r.x + 12), f64(r.y + 11), f64(r.w - 130), 0, text.body_style(13.0 * s, pal.text, false), clip)
+        minus_r := damage.rect(r.right() - 104, r.y + 6, 26, r.h - 12)
+        plus_r := damage.rect(r.right() - 36, r.y + 6, 26, r.h - 12)
+        draw_solid(&mut sc.frame, minus_r, pal.track, pal.line, render.rgba(0, 0, 0, 0), 8.0, 1.0, clip)
+        draw_solid(&mut sc.frame, plus_r, pal.track, pal.line, render.rgba(0, 0, 0, 0), 8.0, 1.0, clip)
+        dm := text.draw_text_line(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &"-", f64(minus_r.x), f64(minus_r.y + 5), f64(minus_r.w), 1, text.body_style(13.0 * s, pal.text, true), clip)
+        dp := text.draw_text_line(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &"+", f64(plus_r.x), f64(plus_r.y + 5), f64(plus_r.w), 1, text.body_style(13.0 * s, pal.text, true), clip)
+        var st_v = text.body_style(13.0 * s, pal.text, true)
+        st_v.tabular_nums = true
+        dv := text.draw_text_line(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.value.to_string(), f64(minus_r.right()), f64(r.y + 11), 42.0, 1, st_v, clip)
+        return
+    }
+
+    if n.sub_kind == CTRL_DROPDOWN {
+        d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+            f64(r.x + 12), f64(r.y + 11), 160.0, 0, text.body_style(13.0 * s, pal.muted, false), clip)
+        var cur_opt = ""
+        if n.value >= 0 && usize(n.value) < n.options.len() {
+            cur_opt = n.options.get(usize(n.value)).clone()
+        }
+        dv := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &cur_opt,
+            f64(r.x + 180), f64(r.y + 11), f64(r.w - 216), 2, text.body_style(13.0 * s, pal.text, true), clip)
+        ic := icons.draw_icon(&mut sc.frame, &mut sc.atlas, icons.ICON_CHEVRON_DOWN, r.right() - 28, r.y + 11, 14.0 * s, 2.0, pal.muted, clip)
+        return
+    }
+
+    if n.sub_kind == CTRL_PROGRESS || n.sub_kind == CTRL_LEVEL {
+        d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &n.text,
+            f64(r.x + 12), f64(r.y + 8), 160.0, 0, text.body_style(12.0 * s, pal.muted, false), clip)
+        bar_x := r.x + 180
+        bar_w := r.w - 196
+        if bar_w > 16 {
+            bar_r := damage.rect(bar_x, r.y + r.h / 2 - 4, bar_w, 8)
+            draw_solid(&mut sc.frame, bar_r, pal.track, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 4.0, 0.0, clip)
+            span := n.max_val - n.min_val
+            var frac = 0.0
+            if span > 0 { frac = f64(n.value - n.min_val) / f64(span) }
+            if frac < 0.0 { frac = 0.0 }
+            if frac > 1.0 { frac = 1.0 }
+            fw := i32(f64(bar_w) * frac + 0.5)
+            if fw > 0 {
+                var fcol = pal.accent
+                if n.sub_kind == CTRL_LEVEL { fcol = sc.theme.semantic.success }
+                draw_solid(&mut sc.frame, damage.rect(bar_x, bar_r.y, fw, 8), fcol, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 4.0, 0.0, clip)
+            }
+        }
+        return
+    }
+
+    if n.sub_kind == CTRL_SPINNER {
+        var scol = pal.muted
+        var st_lbl = "Inactivo"
+        if n.value != 0 {
+            scol = pal.accent
+            st_lbl = "Activo"
+        }
+        draw_solid(&mut sc.frame, damage.rect(r.x + 14, r.y + r.h / 2 - 6, 12, 12), scol, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 6.0, 0.0, clip)
+        d := text.draw_text_truncated(&mut sc.frame, &mut sc.atlas, &sc.fonts.body, &(n.text.clone() + " (" + st_lbl + ")"),
+            f64(r.x + 34), f64(r.y + 11), f64(r.w - 48), 0, text.body_style(13.0 * s, pal.text, false), clip)
+    }
+}
+
+pub fn SceneApp.draw_tile(&mut self, tile damage.Rect) {
+    self.frame.blit_from(&self.window_base, tile)
+    s := f64(self.scale)
+    pal := self.theme.palette
+
+    // Header
+    if tile.intersects(&self.header_rect) {
+        var title_str = self.title.clone()
+        if !self.subtitle.is_empty() {
+            title_str = title_str + " — " + self.subtitle.clone()
+        }
+        dt := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.display, &title_str,
+            f64(self.win_rect.x + i32(82.0 * s)), f64(self.win_rect.y + i32(15.0 * s)),
+            f64(self.win_rect.w - i32(280.0 * s)), 0, text.display_style(16.0 * s, pal.text), tile)
+
+        var hi: usize = 0
+        for hi < self.header_buttons.len() {
+            hk := self.header_buttons.get(hi)
+            if self.nodes.contains(hk) {
+                hb := self.nodes.get(hk).bounds
+                if tile.intersects(&hb) {
+                    var fill = pal.card
+                    if self.hovered_key.eq(hk) { fill = pal.card_hover }
+                    draw_solid(&mut self.frame, hb, fill, pal.line, render.rgba(0, 0, 0, 0), 9.0 * s, 1.0, tile)
+                    dh := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &self.nodes.get(hk).text,
+                        f64(hb.x + 8), f64(hb.y + 6), f64(hb.w - 16), 1, text.body_style(12.0 * s, pal.text, true), tile)
+                }
+            }
+            hi = hi + 1
+        }
+        if !self.menu_items.is_empty() && tile.intersects(&self.menu_btn_rect) {
+            var mfill = pal.card
+            if self.menu_open { mfill = pal.accent_soft }
+            draw_solid(&mut self.frame, self.menu_btn_rect, mfill, pal.line, render.rgba(0, 0, 0, 0), 9.0 * s, 1.0, tile)
+            dm := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"⋯",
+                f64(self.menu_btn_rect.x), f64(self.menu_btn_rect.y + 6), f64(self.menu_btn_rect.w), 1, text.body_style(14.0 * s, pal.text, true), tile)
+        }
+    }
+
+    // Content clipped to content_rect
+    c_clip := self.content_rect.intersect(&tile)
+    if !c_clip.is_empty() {
+        if self.counter_enabled {
+            dh := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.display, &self.heading,
+                f64(self.content_rect.x), f64(self.content_rect.y + i32(28.0 * s)), f64(self.content_rect.w), 1, text.display_style(26.0 * s, pal.text), c_clip)
+            var st_num = text.display_style(48.0 * s, pal.accent_text)
+            st_num.tabular_nums = true
+            dn := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.display, &self.counter_value.to_string(),
+                f64(self.content_rect.x), f64(self.content_rect.y + i32(72.0 * s)), f64(self.content_rect.w), 1, st_num, c_clip)
+            br := self.counter_btn_rect
+            var bfill = pal.accent
+            if self.hovered_key.eq(&"__counter_btn__") {
+                bfill = render.color_mix(pal.accent, 85, render.rgb(255, 255, 255))
+            }
+            draw_solid(&mut self.frame, br, bfill, render.rgba(255, 255, 255, 45), pal.hi, 12.0 * s, 1.0, c_clip)
+            db := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"Sumar 1",
+                f64(br.x), f64(br.y + 11), f64(br.w), 1, text.body_style(13.5 * s, render.rgb(255, 255, 255), true), c_clip)
+        } else if !self.active_page.is_empty() {
+            ap := self.active_page.clone()
+            draw_node_recursive(self, &ap, c_clip)
+            // Scrollbar thumb
+            if self.scroll.content_h > self.scroll.viewport_h {
+                track := damage.rect(self.content_rect.right() - 6, self.content_rect.y + 2, 4, self.content_rect.h - 4)
+                thumb := self.scroll.thumb_rect(track)
+                if c_clip.intersects(&thumb) {
+                    draw_solid(&mut self.frame, thumb, pal.line_strong, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 2.0, 0.0, c_clip)
+                }
+            }
+        }
+    }
+
+    // Popover menu / dropdown overlay
+    if self.menu_open && tile.intersects(&self.menu_pop_rect) {
+        draw_solid(&mut self.frame, self.menu_pop_rect, pal.pop, pal.edge, pal.hi, 14.0 * s, 1.0, tile)
+        var mi: usize = 0
+        for mi < self.menu_items.len() {
+            mk := self.menu_items.get(mi)
+            if self.nodes.contains(mk) {
+                ir := damage.rect(self.menu_pop_rect.x + 6, self.menu_pop_rect.y + 6 + i32(mi) * i32(32.0 * s),
+                    self.menu_pop_rect.w - 12, i32(30.0 * s))
+                menu_txt := self.nodes.get(mk).text.clone()
+                di := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &menu_txt,
+                    f64(ir.x + 8), f64(ir.y + 7), f64(ir.w - 16), 0, text.body_style(12.5 * s, pal.text, false), tile)
+            }
+            mi = mi + 1
+        }
+    }
+    if !self.open_dropdown_key.is_empty() && tile.intersects(&self.dropdown_pop_rect) && self.nodes.contains(&self.open_dropdown_key) {
+        draw_solid(&mut self.frame, self.dropdown_pop_rect, pal.pop, pal.edge, pal.hi, 14.0 * s, 1.0, tile)
+        opts_len := self.nodes.get(&self.open_dropdown_key).options.len()
+        cur_v := self.nodes.get(&self.open_dropdown_key).value
+        var oi: usize = 0
+        for oi < opts_len {
+            ir := damage.rect(self.dropdown_pop_rect.x + 6, self.dropdown_pop_rect.y + 6 + i32(oi) * i32(30.0 * s),
+                self.dropdown_pop_rect.w - 12, i32(28.0 * s))
+            if i64(oi) == cur_v {
+                draw_solid(&mut self.frame, ir, pal.accent_soft, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 8.0 * s, 0.0, tile)
+            }
+            opt_txt := self.nodes.get(&self.open_dropdown_key).options.get(oi).clone()
+            di := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &opt_txt,
+                f64(ir.x + 8), f64(ir.y + 6), f64(ir.w - 16), 0, text.body_style(12.5 * s, pal.text, i64(oi) == cur_v), tile)
+            oi = oi + 1
+        }
+    }
+}
+
+pub fn SceneApp.render_damaged(&mut self) u32 {
+    if self.damage.is_empty() { return 0 }
+    n := self.damage.len()
+    var i: usize = 0
+    for i < n {
+        r := self.damage.at(i)
+        self.draw_tile(r)
+        i = i + 1
+    }
+    self.frames_rendered = self.frames_rendered + 1
+    self.tiles_rendered = self.tiles_rendered + u64(n)
+    return u32(n)
+}
+
+// ---- Hit-Testing & Pointer/Key Dispatch ----
+
+fn pt_in(r damage.Rect, x i32, y i32) bool {
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+fn hit_test_recursive(nodes &collections.Map<string, AppNode>, key &string, x i32, y i32) string {
+    if !nodes.contains(key) { return "" }
+    n := nodes.get(key)
+    if !n.visible { return "" }
+    if n.kind == KIND_PAGE || n.kind == KIND_BOX {
+        var i: usize = n.children.len()
+        for i > 0 {
+            i = i - 1
+            hit := hit_test_recursive(nodes, n.children.get(i), x, y)
+            if !hit.is_empty() { return hit }
+        }
+        return ""
+    }
+    if n.kind == KIND_CONTAINER {
+        if n.sub_kind == CONT_TABS {
+            var active_idx = usize(n.value)
+            if active_idx < n.children.len() {
+                hit := hit_test_recursive(nodes, n.children.get(active_idx), x, y)
+                if !hit.is_empty() { return hit }
+            }
+            if pt_in(n.bounds, x, y) { return key.clone() }
+            return ""
+        }
+        if n.sub_kind == CONT_TAB {
+            var i: usize = n.children.len()
+            for i > 0 {
+                i = i - 1
+                hit := hit_test_recursive(nodes, n.children.get(i), x, y)
+                if !hit.is_empty() { return hit }
+            }
+            return ""
+        }
+        if n.sub_kind == CONT_FRAME || (n.sub_kind == CONT_EXPANDER && n.value != 0) {
+            var i: usize = n.children.len()
+            for i > 0 {
+                i = i - 1
+                hit := hit_test_recursive(nodes, n.children.get(i), x, y)
+                if !hit.is_empty() { return hit }
+            }
+        }
+        if n.sub_kind == CONT_EXPANDER && pt_in(n.bounds, x, y) { return key.clone() }
+        return ""
+    }
+    if (n.kind == KIND_BUTTON || n.kind == KIND_ENTRY || n.kind == KIND_TEXT_AREA ||
+        (n.kind == KIND_CONTROL && n.sub_kind <= CTRL_DROPDOWN)) && pt_in(n.bounds, x, y) {
+        return key.clone()
+    }
+    return ""
+}
+
+fn hit_test(sc &SceneApp, x i32, y i32) string {
+    var hi: usize = 0
+    for hi < sc.header_buttons.len() {
+        hk := sc.header_buttons.get(hi)
+        if sc.nodes.contains(hk) && pt_in(sc.nodes.get(hk).bounds, x, y) { return hk.clone() }
+        hi = hi + 1
+    }
+    if !sc.menu_items.is_empty() && pt_in(sc.menu_btn_rect, x, y) { return "__menu_btn__" }
+    if sc.counter_enabled {
+        if pt_in(sc.counter_btn_rect, x, y) { return "__counter_btn__" }
+        return ""
+    }
+    if !pt_in(sc.content_rect, x, y) || sc.active_page.is_empty() { return "" }
+    return hit_test_recursive(&sc.nodes, &sc.active_page, x, y)
+}
+
+pub fn SceneApp.on_pointer_move(&mut self, x i32, y i32) bool {
+    if !self.dragging_slider_key.is_empty() && self.nodes.contains(&self.dragging_slider_key) {
+        sk := self.dragging_slider_key.clone()
+        return self.update_slider_at(&sk, x)
+    }
+    next := hit_test(self, x, y)
+    if next.eq(&self.hovered_key) { return false }
+    prev := self.hovered_key.clone()
+    self.hovered_key = next.clone()
+    if prev.eq(&"__counter_btn__") || next.eq(&"__counter_btn__") {
+        self.damage.add(self.counter_btn_rect, self.width, self.height)
+    }
+    if !prev.is_empty() { self.mark_node_dirty(&prev) }
+    if !next.is_empty() { self.mark_node_dirty(&next) }
+    return !self.damage.is_empty()
+}
+
+fn SceneApp.update_slider_at(&mut self, key &string, x i32) bool {
+    r := self.nodes.get(key).bounds
+    tr_x := r.x + 150
+    tr_w := r.w - 208
+    if tr_w <= 0 { return false }
+    var frac = f64(x - tr_x) / f64(tr_w)
+    if frac < 0.0 { frac = 0.0 }
+    if frac > 1.0 { frac = 1.0 }
+    min_v := self.nodes.get(key).min_val
+    max_v := self.nodes.get(key).max_val
+    nv := min_v + i64(frac * f64(max_v - min_v) + 0.5)
+    if nv == self.nodes.get(key).value { return false }
+    self.nodes.get_mut(key).value = nv
+    self.mark_node_dirty(key)
+    return true
+}
+
+pub fn SceneApp.on_pointer_down(&mut self, x i32, y i32) bool {
+    hit := hit_test(self, x, y)
+    self.pressed_key = hit.clone()
+    if !hit.is_empty() && self.nodes.contains(&hit) {
+        n := self.nodes.get(&hit)
+        if n.kind == KIND_CONTROL && n.sub_kind == CTRL_SLIDER {
+            self.dragging_slider_key = hit.clone()
+            return self.update_slider_at(&hit, x)
+        }
+    }
+    return false
+}
+
+pub fn SceneApp.on_pointer_up(&mut self, x i32, y i32) AppInputEvent {
+    if !self.dragging_slider_key.is_empty() {
+        sk := self.dragging_slider_key.clone()
+        self.dragging_slider_key = ""
+        self.pressed_key = ""
+        if self.nodes.contains(&sk) {
+            n := self.nodes.get(&sk)
+            return AppInputEvent { action: n.action, text: n.value.to_string(), has_text: true, key: sk }
+        }
+        return no_app_event()
+    }
+
+    // Handle open menu popover click
+    if self.menu_open {
+        if pt_in(self.menu_pop_rect, x, y) {
+            idx := (y - self.menu_pop_rect.y - 6) / i32(32.0 * f64(self.scale))
+            self.menu_open = false
+            self.damage.add(self.menu_pop_rect, self.width, self.height)
+            if idx >= 0 && usize(idx) < self.menu_items.len() {
+                mk := self.menu_items.get(usize(idx))
+                if self.nodes.contains(mk) {
+                    return AppInputEvent { action: self.nodes.get(mk).action, text: "", has_text: false, key: mk.clone() }
+                }
+            }
+            return no_app_event()
+        }
+        self.menu_open = false
+        self.damage.add(self.menu_pop_rect, self.width, self.height)
+    }
+
+    // Handle open dropdown popover click
+    if !self.open_dropdown_key.is_empty() {
+        dk := self.open_dropdown_key.clone()
+        self.open_dropdown_key = ""
+        self.damage.add(self.dropdown_pop_rect, self.width, self.height)
+        if pt_in(self.dropdown_pop_rect, x, y) && self.nodes.contains(&dk) {
+            idx := (y - self.dropdown_pop_rect.y - 6) / i32(30.0 * f64(self.scale))
+            opts_len := self.nodes.get(&dk).options.len()
+            if idx >= 0 && usize(idx) < opts_len {
+                self.nodes.get_mut(&dk).value = i64(idx)
+                self.mark_node_dirty(&dk)
+                act := self.nodes.get(&dk).action
+                return AppInputEvent { action: act, text: i64(idx).to_string(), has_text: true, key: dk }
+            }
+        }
+        return no_app_event()
+    }
+
+    hit := hit_test(self, x, y)
+    was := self.pressed_key.clone()
+    self.pressed_key = ""
+    if hit.is_empty() || !hit.eq(&was) { return no_app_event() }
+
+    if hit.eq(&"__counter_btn__") {
+        return AppInputEvent { action: 3, text: "", has_text: false, key: hit }
+    }
+    if hit.eq(&"__menu_btn__") {
+        self.menu_open = true
+        self.damage.add(self.menu_pop_rect, self.width, self.height)
+        self.damage.add(self.menu_btn_rect, self.width, self.height)
+        return no_app_event()
+    }
+    if !self.nodes.contains(&hit) { return no_app_event() }
+
+    kind := self.nodes.get(&hit).kind
+    sub := self.nodes.get(&hit).sub_kind
+    enabled := self.nodes.get(&hit).enabled
+    act := self.nodes.get(&hit).action
+    if !enabled { return no_app_event() }
+
+    self.set_focus(&hit)
+    if kind == KIND_BUTTON || kind == KIND_HEADER_BTN {
+        return AppInputEvent { action: act, text: "", has_text: false, key: hit }
+    }
+    if kind == KIND_CONTROL {
+        if sub == CTRL_SWITCH || sub == CTRL_CHECK {
+            var nv: i64 = 1
+            if self.nodes.get(&hit).value != 0 { nv = 0 }
+            self.nodes.get_mut(&hit).value = nv
+            self.mark_node_dirty(&hit)
+            return AppInputEvent { action: act, text: nv.to_string(), has_text: true, key: hit }
+        }
+        if sub == CTRL_SPIN {
+            r := self.nodes.get(&hit).bounds
+            var nv = self.nodes.get(&hit).value
+            if x >= r.right() - 40 { nv = nv + 1 } else if x >= r.right() - 108 && x < r.right() - 72 { nv = nv - 1 }
+            min_v := self.nodes.get(&hit).min_val
+            max_v := self.nodes.get(&hit).max_val
+            if nv < min_v { nv = min_v }
+            if nv > max_v { nv = max_v }
+            self.nodes.get_mut(&hit).value = nv
+            self.mark_node_dirty(&hit)
+            return AppInputEvent { action: act, text: nv.to_string(), has_text: true, key: hit }
+        }
+        if sub == CTRL_DROPDOWN {
+            r := self.nodes.get(&hit).bounds
+            opts_len := self.nodes.get(&hit).options.len()
+            if opts_len > 0 {
+                pop_h := i32(opts_len) * i32(30.0 * f64(self.scale)) + 12
+                self.dropdown_pop_rect = layout.clamp_popover(r.right() - 200, r.bottom() + 4, 200, pop_h, self.width, self.height, 8)
+                self.open_dropdown_key = hit.clone()
+                self.damage.add(self.dropdown_pop_rect, self.width, self.height)
+            }
+            return no_app_event()
+        }
+    }
+    if kind == KIND_CONTAINER {
+        if sub == CONT_EXPANDER {
+            r := self.nodes.get(&hit).bounds
+            if y <= r.y + i32(40.0 * f64(self.scale)) {
+                var nv: i64 = 1
+                if self.nodes.get(&hit).value != 0 { nv = 0 }
+                self.nodes.get_mut(&hit).value = nv
+                self.relayout()
+                self.damage.add(self.content_rect, self.width, self.height)
+                return AppInputEvent { action: act, text: nv.to_string(), has_text: true, key: hit }
+            }
+        } else if sub == CONT_TABS {
+            r := self.nodes.get(&hit).bounds
+            cnt := self.nodes.get(&hit).children.len()
+            if cnt > 0 && y <= r.y + i32(42.0 * f64(self.scale)) {
+                strip_x := r.x + 11
+                tw := (r.w - 22) / i32(cnt)
+                if tw > 0 {
+                    idx := (x - strip_x) / tw
+                    if idx >= 0 && usize(idx) < cnt {
+                        self.nodes.get_mut(&hit).value = i64(idx)
+                        self.relayout()
+                        self.damage.add(self.content_rect, self.width, self.height)
+                        return AppInputEvent { action: act, text: i64(idx).to_string(), has_text: true, key: hit }
+                    }
+                }
+            }
+        }
+    }
+    return no_app_event()
+}
+
+pub fn SceneApp.on_scroll(&mut self, delta_y i32) bool {
+    if self.scroll.scroll_by(delta_y) {
+        self.relayout()
+        self.damage.add(self.content_rect, self.width, self.height)
+        return true
+    }
+    return false
+}
+
+pub fn SceneApp.on_key_input(&mut self, keycode i64, chars &string) AppInputEvent {
+    if self.focused_key.is_empty() || !self.nodes.contains(&self.focused_key) {
+        return no_app_event()
+    }
+    fk := self.focused_key.clone()
+    kind := self.nodes.get(&fk).kind
+    if kind == KIND_ENTRY || kind == KIND_TEXT_AREA {
+        if keycode == 36 || keycode == 76 {
+            // Return / Enter
+            if kind == KIND_ENTRY {
+                sub_act := self.nodes.get(&fk).submit_action
+                if sub_act != 0 {
+                    txt := self.nodes.get(&fk).text.clone()
+                    return AppInputEvent { action: sub_act, text: txt, has_text: true, key: fk }
+                }
+                return no_app_event()
+            }
+            // TextArea newline
+            var t = self.nodes.get(&fk).text.clone() + "\n"
+            self.nodes.get_mut(&fk).text = t.clone()
+            self.mark_node_dirty(&fk)
+            return AppInputEvent { action: self.nodes.get(&fk).action, text: t, has_text: true, key: fk }
+        }
+        if keycode == 51 {
+            // Backspace
+            cur := self.nodes.get(&fk).text.clone()
+            if !cur.is_empty() {
+                var cut = cur.len() - 1
+                bytes := cur.bytes()
+                for cut > 0 && (bytes[cut] & 192) == 128 { cut = cut - 1 }
+                nt := cur.copy_range(0, cut)
+                self.nodes.get_mut(&fk).text = nt.clone()
+                self.mark_node_dirty(&fk)
+                return AppInputEvent { action: self.nodes.get(&fk).action, text: nt, has_text: true, key: fk }
+            }
+            return no_app_event()
+        }
+        if !chars.is_empty() {
+            b0 := chars.bytes()[0]
+            if b0 >= 32 && b0 != 127 {
+                nt := self.nodes.get(&fk).text.clone() + chars.clone()
+                self.nodes.get_mut(&fk).text = nt.clone()
+                self.mark_node_dirty(&fk)
+                return AppInputEvent { action: self.nodes.get(&fk).action, text: nt, has_text: true, key: fk }
+            }
+        }
+    }
+    return no_app_event()
+}
+
+pub fn SceneApp.snapshot_png(&self, path &string) Result<string, i32> {
+    return png.write_bgra_png(path, self.frame.pixels.as_slice(), u32(self.width), u32(self.height))
+}

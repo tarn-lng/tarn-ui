@@ -1,0 +1,316 @@
+// Pure-Tarn Constraint Layout Engine (`layout.tarn`) — Milestone B4:
+// - Container-query breakpoints (`@sm: 480`, `@md: 768`, `@lg: 1024`, `@xl: 1500`).
+// - Two-pass Flex Row / Column (`gap`, `padding`, `align_items`, `justify_content`, `flex_grow`).
+// - CSS Grid subset (`fixed` and `auto-fill minmax(min_w, 1fr)`).
+// - Scroll container state & thumb geometry + viewport-clamped overlay positioning.
+import "backend/damage"
+
+pub const ALIGN_START i32 = 0
+pub const ALIGN_CENTER i32 = 1
+pub const ALIGN_END i32 = 2
+pub const ALIGN_STRETCH i32 = 3
+
+pub const JUSTIFY_START i32 = 0
+pub const JUSTIFY_CENTER i32 = 1
+pub const JUSTIFY_END i32 = 2
+pub const JUSTIFY_BETWEEN i32 = 3
+
+pub copy struct Breakpoints {
+    pub width i32
+    pub sm bool
+    pub md bool
+    pub lg bool
+    pub xl bool
+    pub compact bool
+}
+
+pub fn breakpoints_for(width i32) Breakpoints {
+    return Breakpoints {
+        width: width,
+        sm: width >= 480,
+        md: width >= 768,
+        lg: width >= 1024,
+        xl: width >= 1500,
+        compact: width < 768,
+    }
+}
+
+pub copy struct Size {
+    pub w i32
+    pub h i32
+}
+
+pub fn size(w i32, h i32) Size {
+    return Size { w: w, h: h }
+}
+
+pub copy struct Padding {
+    pub top i32
+    pub right i32
+    pub bottom i32
+    pub left i32
+}
+
+pub fn pad_uniform(p i32) Padding {
+    return Padding { top: p, right: p, bottom: p, left: p }
+}
+
+pub fn pad_xy(px i32, py i32) Padding {
+    return Padding { top: py, right: px, bottom: py, left: px }
+}
+
+pub copy struct FlexItem {
+    pub desired_w i32
+    pub desired_h i32
+    pub min_w i32
+    pub min_h i32
+    pub grow i32
+}
+
+pub fn flex_item(w i32, h i32, grow i32) FlexItem {
+    return FlexItem { desired_w: w, desired_h: h, min_w: 0, min_h: 0, grow: grow }
+}
+
+pub copy struct FlexSpec {
+    pub horizontal bool
+    pub gap i32
+    pub pad Padding
+    pub align i32
+    pub justify i32
+}
+
+pub fn flex_col(gap i32, pad Padding) FlexSpec {
+    return FlexSpec { horizontal: false, gap: gap, pad: pad, align: ALIGN_STRETCH, justify: JUSTIFY_START }
+}
+
+pub fn flex_row(gap i32, pad Padding, align i32) FlexSpec {
+    return FlexSpec { horizontal: true, gap: gap, pad: pad, align: align, justify: JUSTIFY_START }
+}
+
+// Pass 1: Measure total size of a flex container given its items.
+pub fn measure_flex(spec FlexSpec, items &[]FlexItem, max_w i32) Size {
+    n := items.len()
+    if n == 0 {
+        return size(spec.pad.left + spec.pad.right, spec.pad.top + spec.pad.bottom)
+    }
+    var main_sum: i32 = 0
+    var cross_max: i32 = 0
+    var i: usize = 0
+    for i < n {
+        it := items[i]
+        if spec.horizontal {
+            main_sum = main_sum + it.desired_w
+            if it.desired_h > cross_max { cross_max = it.desired_h }
+        } else {
+            main_sum = main_sum + it.desired_h
+            if it.desired_w > cross_max { cross_max = it.desired_w }
+        }
+        if i + 1 < n { main_sum = main_sum + spec.gap }
+        i = i + 1
+    }
+    if spec.horizontal {
+        var tw = main_sum + spec.pad.left + spec.pad.right
+        if max_w > 0 && tw > max_w { tw = max_w }
+        return size(tw, cross_max + spec.pad.top + spec.pad.bottom)
+    }
+    var tw = cross_max + spec.pad.left + spec.pad.right
+    if max_w > 0 && tw > max_w { tw = max_w }
+    return size(tw, main_sum + spec.pad.top + spec.pad.bottom)
+}
+
+// Pass 2: Arrange flex items into `bounds`, writing each item's `damage.Rect` to `out`.
+pub fn arrange_flex(spec FlexSpec, bounds damage.Rect, items &[]FlexItem, out &mut Vec<damage.Rect>) {
+    out.clear()
+    n := items.len()
+    if n == 0 { return }
+
+    inner_x := bounds.x + spec.pad.left
+    inner_y := bounds.y + spec.pad.top
+    var inner_w = bounds.w - spec.pad.left - spec.pad.right
+    var inner_h = bounds.h - spec.pad.top - spec.pad.bottom
+    if inner_w < 0 { inner_w = 0 }
+    if inner_h < 0 { inner_h = 0 }
+
+    var base_main: i32 = 0
+    var total_grow: i32 = 0
+    var i: usize = 0
+    for i < n {
+        it := items[i]
+        if spec.horizontal { base_main = base_main + it.desired_w } else { base_main = base_main + it.desired_h }
+        total_grow = total_grow + it.grow
+        if i + 1 < n { base_main = base_main + spec.gap }
+        i = i + 1
+    }
+
+    avail_main := if_i32(spec.horizontal, inner_w, inner_h)
+    extra := avail_main - base_main
+
+    var cursor: i32 = 0
+    var gap_used = spec.gap
+    if extra > 0 && total_grow == 0 {
+        if spec.justify == JUSTIFY_CENTER {
+            cursor = extra / 2
+        } else if spec.justify == JUSTIFY_END {
+            cursor = extra
+        } else if spec.justify == JUSTIFY_BETWEEN && n > 1 {
+            gap_used = spec.gap + extra / i32(n - 1)
+        }
+    }
+
+    var grow_rem = extra
+    if grow_rem < 0 { grow_rem = 0 }
+    var grow_left = total_grow
+
+    i = 0
+    for i < n {
+        it := items[i]
+        var main_sz = if_i32(spec.horizontal, it.desired_w, it.desired_h)
+        if total_grow > 0 && it.grow > 0 && extra > 0 {
+            add := (grow_rem * it.grow) / grow_left
+            main_sz = main_sz + add
+            grow_rem = grow_rem - add
+            grow_left = grow_left - it.grow
+        } else if extra < 0 && spec.horizontal && total_grow == 0 && base_main > 0 {
+            // Shrink proportionally if overflowing horizontally
+            min_m := it.min_w
+            if main_sz > avail_main && avail_main > min_m {
+                // Keep within inner_w if single overflowing item
+                if n == 1 { main_sz = avail_main }
+            }
+        }
+
+        if spec.horizontal {
+            var ch = it.desired_h
+            var cy = inner_y
+            if spec.align == ALIGN_STRETCH {
+                ch = inner_h
+            } else if spec.align == ALIGN_CENTER {
+                cy = inner_y + (inner_h - ch) / 2
+            } else if spec.align == ALIGN_END {
+                cy = inner_y + inner_h - ch
+            }
+            out.push(damage.rect(inner_x + cursor, cy, main_sz, ch))
+        } else {
+            var cw = it.desired_w
+            var cx = inner_x
+            if spec.align == ALIGN_STRETCH {
+                cw = inner_w
+            } else if spec.align == ALIGN_CENTER {
+                cx = inner_x + (inner_w - cw) / 2
+            } else if spec.align == ALIGN_END {
+                cx = inner_x + inner_w - cw
+            }
+            out.push(damage.rect(cx, inner_y + cursor, cw, main_sz))
+        }
+        cursor = cursor + main_sz + gap_used
+        i = i + 1
+    }
+}
+
+fn if_i32(cond bool, a i32, b i32) i32 {
+    if cond { return a }
+    return b
+}
+
+// CSS Grid subset (`repeat(auto-fill, minmax(min_col_w, 1fr))` or fixed `cols`).
+pub copy struct GridSpec {
+    pub fixed_cols i32
+    pub min_col_w i32
+    pub row_h i32
+    pub col_gap i32
+    pub row_gap i32
+    pub pad Padding
+}
+
+pub fn grid_columns(spec GridSpec, avail_w i32) i32 {
+    inner_w := avail_w - spec.pad.left - spec.pad.right
+    if inner_w <= 0 { return 1 }
+    if spec.fixed_cols > 0 { return spec.fixed_cols }
+    var mc = spec.min_col_w
+    if mc <= 0 { mc = 112 }
+    var cols = (inner_w + spec.col_gap) / (mc + spec.col_gap)
+    if cols < 1 { cols = 1 }
+    return cols
+}
+
+pub fn arrange_grid(spec GridSpec, bounds damage.Rect, count usize, out &mut Vec<damage.Rect>) Size {
+    out.clear()
+    cols := grid_columns(spec, bounds.w)
+    inner_w := bounds.w - spec.pad.left - spec.pad.right
+    total_gaps := (cols - 1) * spec.col_gap
+    var col_w = (inner_w - total_gaps) / cols
+    if col_w < 1 { col_w = 1 }
+
+    var i: usize = 0
+    for i < count {
+        col := i32(i) % cols
+        row := i32(i) / cols
+        x := bounds.x + spec.pad.left + col * (col_w + spec.col_gap)
+        y := bounds.y + spec.pad.top + row * (spec.row_h + spec.row_gap)
+        out.push(damage.rect(x, y, col_w, spec.row_h))
+        i = i + 1
+    }
+    var rows: i32 = 0
+    if count > 0 { rows = (i32(count) + cols - 1) / cols }
+    var total_h = spec.pad.top + spec.pad.bottom
+    if rows > 0 { total_h = total_h + rows * spec.row_h + (rows - 1) * spec.row_gap }
+    return size(bounds.w, total_h)
+}
+
+// Scroll container state & scrollbar thumb geometry.
+pub copy struct ScrollState {
+    pub scroll_y i32
+    pub content_h i32
+    pub viewport_h i32
+}
+
+pub fn ScrollState.new(viewport_h i32, content_h i32) ScrollState {
+    var st = ScrollState { scroll_y: 0, content_h: content_h, viewport_h: viewport_h }
+    st.clamp()
+    return st
+}
+
+pub fn ScrollState.max_scroll(&self) i32 {
+    m := self.content_h - self.viewport_h
+    if m < 0 { return 0 }
+    return m
+}
+
+pub fn ScrollState.clamp(&mut self) {
+    if self.scroll_y < 0 { self.scroll_y = 0 }
+    m := self.max_scroll()
+    if self.scroll_y > m { self.scroll_y = m }
+}
+
+pub fn ScrollState.scroll_by(&mut self, delta_y i32) bool {
+    prev := self.scroll_y
+    self.scroll_y = self.scroll_y + delta_y
+    self.clamp()
+    return self.scroll_y != prev
+}
+
+pub fn ScrollState.thumb_rect(&self, track damage.Rect) damage.Rect {
+    if self.content_h <= self.viewport_h || self.content_h <= 0 {
+        return damage.rect(0, 0, 0, 0)
+    }
+    var thumb_h = (track.h * self.viewport_h) / self.content_h
+    if thumb_h < 24 { thumb_h = 24 }
+    if thumb_h > track.h { thumb_h = track.h }
+    max_s := self.max_scroll()
+    var thumb_y = track.y
+    if max_s > 0 {
+        thumb_y = track.y + ((track.h - thumb_h) * self.scroll_y) / max_s
+    }
+    return damage.rect(track.x, thumb_y, track.w, thumb_h)
+}
+
+// Clamps an anchored popover/menu inside the viewport with `margin`.
+pub fn clamp_popover(x i32, y i32, w i32, h i32, vw i32, vh i32, margin i32) damage.Rect {
+    var cx = x
+    var cy = y
+    if cx + w > vw - margin { cx = vw - margin - w }
+    if cy + h > vh - margin { cy = vh - margin - h }
+    if cx < margin { cx = margin }
+    if cy < margin { cy = margin }
+    return damage.rect(cx, cy, w, h)
+}
