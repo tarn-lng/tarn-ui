@@ -1,0 +1,1346 @@
+// Cairn self-drawn backend (`backends/cairn/backend/native.tarn`):
+// Implements the `native.Native` contract (`ABI 14`, same status codes as GTK
+// and AppKit backends) while drawing every pixel in pure Tarn (`render.tarn`,
+// `damage.tarn`, `scene_b1.tarn`, `png.tarn`) and presenting damaged tiles to
+// a host window (`surface_macos.tarn`).
+import "ffi"
+import "collections"
+import "backend/objc"
+import "backend/scene_b1"
+import "backend/surface_macos"
+
+const OPENED usize = 0
+const CLOSED usize = 1
+const HIDDEN usize = 2
+const WOKEN usize = 3
+const FULL usize = 4
+const BACKGROUND usize = 5
+const COUNT_SLOT usize = 32
+const HEAD_SLOT usize = 36
+const APP_SLOT usize = 40
+const RECORDS usize = 48
+const QUEUE_CAPACITY u32 = 64
+const RECORD_SIZE usize = 16
+const BLOCK_SIZE usize = RECORDS + 64 * RECORD_SIZE
+
+const PAGE u32 = 0
+const BOX u32 = 1
+const LABEL u32 = 2
+const BUTTON u32 = 3
+const ENTRY u32 = 4
+
+const MAX_ACTION u32 = 1024
+const MAX_PARTS usize = 256
+const MAX_INPUT i64 = 256
+const TARGET_CLASS string = "TarnUICairnTarget"
+
+const WATCH_TIMER u32 = 1
+const WATCH_DESCRIPTOR u32 = 2
+
+copy struct Watch {
+    kind u32
+    source usize
+}
+
+struct Part {
+    key string
+    parent string
+    kind u32
+    horizontal bool
+    spacing u32
+    style u32
+    text string
+    placeholder string
+    acc_label string
+    acc_desc string
+    primary bool
+    enabled bool
+    selectable bool
+    align_start bool
+    action u32
+    submit_action u32
+    region u32
+    tree_kind u32
+    children Vec<string>
+}
+
+fn new_part(key &string, parent &string, kind u32, horizontal bool) Part {
+    return Part {
+        key: key.clone(),
+        parent: parent.clone(),
+        kind: kind,
+        horizontal: horizontal,
+        spacing: 0,
+        style: 0,
+        text: "",
+        placeholder: "",
+        acc_label: "",
+        acc_desc: "",
+        primary: false,
+        enabled: true,
+        selectable: false,
+        align_start: false,
+        action: 0,
+        submit_action: 0,
+        region: 0,
+        tree_kind: 0,
+        children: Vec.new(),
+    }
+}
+
+pub struct Native {
+    window *mut u8
+    view *mut u8
+    block *mut u8
+    target *mut u8
+    pool *mut u8
+    pub surface surface_macos.MacSurface
+    pub scene scene_b1.SceneB1
+    title string
+    heading string
+    counter_enabled bool
+    counter_value i64
+    active_page string
+    page_keys Vec<string>
+    parts collections.Map<string, Part>
+    pages_presented bool
+    focused_key string
+    escape_action u32
+    text *mut u8
+    delivered_closed bool
+    dispatched_token u64
+    finished bool
+    width i32
+    height i32
+    region_root string
+    tree_mode bool
+    expected u32
+    seen collections.Set<string>
+    next_index collections.Map<string, usize>
+    focus_removed bool
+    watches collections.Map<u32, Watch>
+    next_watch u32
+    first_frame_ns u64
+}
+
+fn cell<T>(base *mut u8, offset usize) *mut T {
+    return ffi.from_address(ffi.address(ffi.to_const(base)) + offset)
+}
+fn flag(block *mut u8, slot usize) i32 {
+    var flags: *mut i32 = cell(block, 0)
+    unsafe { return ffi.read(ffi.offset(ffi.to_const(flags), slot)) }
+}
+fn set_flag(block *mut u8, slot usize, value i32) {
+    var flags: *mut i32 = cell(block, 0)
+    unsafe { ffi.write(ffi.offset_mut(flags, slot), value) }
+}
+fn read_u32(block *mut u8, slot usize) u32 {
+    var value: *mut u32 = cell(block, slot)
+    unsafe { return ffi.read(ffi.to_const(value)) }
+}
+fn write_u32(block *mut u8, slot usize, value u32) {
+    var target: *mut u32 = cell(block, slot)
+    unsafe { ffi.write(target, value) }
+}
+fn app_of(block *mut u8) *mut u8 {
+    var slot: *mut *mut u8 = cell(block, APP_SLOT)
+    unsafe { return ffi.read(ffi.to_const(slot)) }
+}
+fn record(block *mut u8, index u32) *mut u8 { return cell(block, RECORDS + usize(index) * RECORD_SIZE) }
+
+fn enqueue(block *mut u8, code i32, text *mut u8) {
+    count := read_u32(block, COUNT_SLOT)
+    if flag(block, CLOSED) != 0 || flag(block, FULL) != 0 || count == QUEUE_CAPACITY {
+        if count == QUEUE_CAPACITY { set_flag(block, FULL, 1) }
+        unsafe { objc.free(text) }
+        return
+    }
+    entry := record(block, (read_u32(block, HEAD_SLOT) + count) % QUEUE_CAPACITY)
+    var code_cell: *mut i64 = cell(entry, 0)
+    var text_cell: *mut *mut u8 = cell(entry, 8)
+    unsafe {
+        ffi.write(code_cell, i64(code))
+        ffi.write(text_cell, text)
+    }
+    write_u32(block, COUNT_SLOT, count + 1)
+}
+
+fn dequeue(block *mut u8, text &mut usize) i32 {
+    count := read_u32(block, COUNT_SLOT)
+    if count == 0 { return 0 }
+    head := read_u32(block, HEAD_SLOT)
+    entry := record(block, head)
+    var code_cell: *mut i64 = cell(entry, 0)
+    var text_cell: *mut *mut u8 = cell(entry, 8)
+    var code: i64 = 0
+    unsafe {
+        code = ffi.read(ffi.to_const(code_cell))
+        *text = ffi.address(ffi.to_const(ffi.read(ffi.to_const(text_cell))))
+    }
+    write_u32(block, HEAD_SLOT, (head + 1) % QUEUE_CAPACITY)
+    write_u32(block, COUNT_SLOT, count - 1)
+    return i32(code)
+}
+
+fn drain(block *mut u8) {
+    var text: usize = 0
+    for dequeue(block, &mut text) != 0 {
+        unsafe { objc.free(ffi.from_address(text)) }
+    }
+}
+
+fn mark_closed(block *mut u8) {
+    set_flag(block, CLOSED, 1)
+    set_flag(block, OPENED, 0)
+    drain(block)
+}
+
+fn block_key() *mut u8 { return objc.sel(&"tarnCairnBlock") }
+fn block_of(target *mut u8) *mut u8 {
+    unsafe { return objc.send(objc.objc_getAssociatedObject(target, block_key()), &"pointerValue") }
+}
+
+fn on_should_close(target *mut u8, command *mut u8, window *mut u8) bool {
+    block := block_of(target)
+    if flag(block, BACKGROUND) != 0 {
+        objc.tell1(window, &"orderOut:", objc.nil())
+        set_flag(block, HIDDEN, 1)
+        return false
+    }
+    mark_closed(block)
+    return false
+}
+
+fn on_tick(target *mut u8, command *mut u8, timer *mut u8) {
+    block := block_of(target)
+    wake(block)
+    objc.post_wake_event(app_of(block))
+}
+
+fn on_descriptor(descriptor *mut u8, types usize, block *mut u8) {
+    wake(block)
+    unsafe { objc.CFFileDescriptorEnableCallBacks(descriptor, 1) }
+    objc.post_wake_event(app_of(block))
+}
+
+fn add_method(cls *mut u8, name &string, imp *u8, types &string) {
+    encoding := ffi.CString.new(types).expect("literal with NUL")
+    unsafe { added := objc.class_addMethod(cls, objc.sel(name), imp, encoding.as_ptr()) }
+}
+
+fn target_class() *mut u8 {
+    existing := objc.class(&TARGET_CLASS)
+    if !objc.is_nil(existing) { return existing }
+    name := ffi.CString.new(&TARGET_CLASS).expect("literal with NUL")
+    unsafe {
+        cls := objc.objc_allocateClassPair(objc.class(&"NSObject"), name.as_ptr(), 0)
+        if objc.is_nil(cls) { return cls }
+        add_method(cls, &"tick:", ffi.callback(on_tick), &"v@:@")
+        add_method(cls, &"windowShouldClose:", ffi.callback(on_should_close), &"c@:@")
+        objc.objc_registerClassPair(cls)
+        return cls
+    }
+}
+
+fn c(text &string) Result<ffi.CString, i32> { return ffi.CString.new(text).ok_or(1) }
+fn chars(text &string) i64 {
+    var count: i64 = 0
+    for byte in text.bytes() {
+        if byte < 128 || byte >= 192 { count = count + 1 }
+    }
+    return count
+}
+fn valid_action(action u32) bool { return action != 0 && action <= MAX_ACTION }
+fn reserved(key &string) bool {
+    return key.eq(&"main") || key.eq(&"heading") || key.eq(&"content") || key.eq(&"pages") || key.eq(&"scroll")
+}
+fn valid_key(key &string) bool {
+    if key.is_empty() || key.len() > 128 || reserved(key) { return false }
+    for byte in key.bytes() {
+        alphanumeric := (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+        if !alphanumeric && byte != 45 && byte != 95 { return false }
+    }
+    return true
+}
+fn release(object *mut u8) {
+    if !objc.is_nil(object) { objc.tell(object, &"release") }
+}
+
+pub fn abi() u32 { return 14 }
+
+pub fn Native.native_window(&self) *mut u8 { return self.window }
+pub fn Native.first_frame_nanos(&self) u64 { return self.first_frame_ns }
+pub fn Native.frames_rendered(&self) u64 { return self.scene.frames_rendered }
+pub fn Native.presents_count(&self) u64 { return self.surface.presents }
+
+pub fn display_available() bool { return objc.main_thread() && objc.load_frameworks() }
+
+fn app() *mut u8 { return objc.send(objc.class(&"NSApplication"), &"sharedApplication") }
+fn session_key() *mut u8 { return objc.sel(&"tarnSession") }
+fn session_active() bool {
+    unsafe { return !objc.is_nil(objc.objc_getAssociatedObject(app(), session_key())) }
+}
+
+pub fn set_app_id(id &string) i32 {
+    if !objc.main_thread() { return 2 }
+    if id.is_empty() || id.len() > 255 { return 1 }
+    for b in id.bytes() {
+        ok := (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 46 || b == 95 || b == 45
+        if !ok { return 1 }
+    }
+    if !objc.load_frameworks() { return 4 }
+    if session_active() { return 3 }
+    return 0
+}
+
+pub fn create(title &string, heading &string) Result<Native, i32> {
+    if !objc.main_thread() { return Err(2) }
+    title_text := try c(title)
+    heading_text := try c(heading)
+    if !objc.load_frameworks() { return Err(4) }
+    var pool: *mut u8 = objc.nil()
+    unsafe { pool = objc.objc_autoreleasePoolPush() }
+    application := app()
+    if objc.is_nil(application) { return Err(4) }
+    if session_active() { return Err(3) }
+    cls := target_class()
+    if objc.is_nil(cls) { return Err(5) }
+    var block: *mut u8 = objc.nil()
+    unsafe { block = objc.calloc(1, BLOCK_SIZE) }
+    if objc.is_nil(block) { return Err(5) }
+    var app_slot: *mut *mut u8 = cell(block, APP_SLOT)
+    unsafe { ffi.write(app_slot, application) }
+
+    objc.tell1(application, &"setActivationPolicy:", objc.nil())
+    objc.tell(application, &"finishLaunching")
+
+    target := objc.send(objc.send(cls, &"alloc"), &"init")
+    pointer := objc.send1(objc.class(&"NSValue"), &"valueWithPointer:", block)
+    unsafe { objc.objc_setAssociatedObject(target, block_key(), pointer, objc.RETAIN) }
+
+    content := objc.send(objc.send(objc.class(&"NSView"), &"alloc"), &"init")
+    controller := objc.send(objc.send(objc.class(&"NSViewController"), &"alloc"), &"init")
+    objc.tell1(controller, &"setView:", content)
+    window := objc.send1(objc.class(&"NSWindow"), &"windowWithContentViewController:", controller)
+    release(content)
+    release(controller)
+    if objc.is_nil(window) {
+        release(target)
+        unsafe { objc.free(block) }
+        return Err(5)
+    }
+
+    w := 960
+    h := 600
+    objc.tell(window, &"retain")
+    objc.tell1(window, &"setReleasedWhenClosed:", objc.flag(false))
+    objc.tell1(window, &"setTitle:", objc.nsstring(title))
+    result := objc.send_f(window, &"setContentSize:", f64(w), f64(h))
+    objc.tell1(window, &"setDelegate:", target)
+    objc.tell(window, &"center")
+
+    var surf = match surface_macos.create(window, content, w, h) {
+        Ok(s) => s
+        Err(err) => {
+            release(window)
+            release(target)
+            unsafe { objc.free(block) }
+            return Err(err)
+        }
+    }
+
+    t0 := objc.monotonic_ns()
+    var scene = scene_b1.SceneB1.new(w, h, 1)
+    blitted := surf.present_damaged(scene.frame.pixels.as_slice(), w, h, scene.frame.stride, &scene.damage)
+    scene.damage.clear()
+    t1 := objc.monotonic_ns()
+
+    objc.tell1(window, &"makeKeyAndOrderFront:", objc.nil())
+    objc.tell1(application, &"activateIgnoringOtherApps:", objc.flag(true))
+    unsafe { objc.objc_setAssociatedObject(application, session_key(), window, objc.RETAIN) }
+    set_flag(block, OPENED, 1)
+
+    return Ok(Native {
+        window: window,
+        view: content,
+        block: block,
+        target: target,
+        pool: pool,
+        surface: surf,
+        scene: scene,
+        title: title.clone(),
+        heading: heading.clone(),
+        counter_enabled: false,
+        counter_value: 0,
+        active_page: "",
+        page_keys: Vec.new(),
+        parts: collections.Map.new(),
+        pages_presented: false,
+        focused_key: "",
+        escape_action: 0,
+        text: objc.nil(),
+        delivered_closed: false,
+        dispatched_token: 0,
+        finished: false,
+        width: w,
+        height: h,
+        region_root: "",
+        tree_mode: false,
+        expected: 0,
+        seen: collections.Set.new(),
+        next_index: collections.Map.new(),
+        focus_removed: false,
+        watches: collections.Map.new(),
+        next_watch: 0,
+        first_frame_ns: t1 - t0,
+    })
+}
+
+fn Native.check(&self) i32 {
+    if !objc.main_thread() { return 2 }
+    if self.finished { return 1 }
+    return 0
+}
+fn Native.closed(&self) bool { return self.finished || flag(self.block, CLOSED) != 0 }
+fn Native.writable(&self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    if flag(self.block, FULL) != 0 { return 8 }
+    return 0
+}
+
+// Re-renders only damaged tiles and presents to the host surface if anything changed.
+pub fn Native.flush_damage(&mut self) u32 {
+    if self.scene.damage.is_empty() { return 0 }
+    tiles := self.scene.render_damaged()
+    blitted := self.surface.present_damaged(
+        self.scene.frame.pixels.as_slice(),
+        self.width,
+        self.height,
+        self.scene.frame.stride,
+        &self.scene.damage
+    )
+    self.scene.damage.clear()
+    return tiles
+}
+
+// Synthetic pointer move injection (in window-local top-left coordinates) for
+// deterministic hover damage benchmarking and testing without OS Accessibility permissions.
+pub fn Native.inject_pointer_move(&mut self, x i32, y i32) u32 {
+    if self.scene.on_pointer_move(x, y) {
+        return self.flush_damage()
+    }
+    return 0
+}
+
+// Synthetic click injection on a B1 card/button or keyed widget.
+pub fn Native.inject_click_at(&mut self, x i32, y i32) u32 {
+    down := self.scene.on_pointer_down(x, y)
+    self.flush_damage()
+    act := self.scene.on_pointer_up(x, y)
+    tiles := self.flush_damage()
+    if act != scene_b1.CARD_NONE {
+        if self.counter_enabled && act == scene_b1.CARD_BTN_PRIMARY {
+            enqueue(self.block, 3, objc.nil())
+        } else {
+            enqueue(self.block, 1001 + act, objc.nil())
+        }
+    }
+    return tiles
+}
+
+pub fn Native.next(&mut self) i32 {
+    for true {
+        event := self.poll()
+        if event != 0 { return event }
+        self.iterate()
+    }
+    return -1
+}
+
+pub fn Native.poll(&mut self) i32 {
+    status := self.check()
+    if status != 0 { return 0 - status }
+    if self.closed() {
+        if self.delivered_closed { return -6 }
+        objc.tell1(self.window, &"orderOut:", objc.nil())
+        self.delivered_closed = true
+        return 2
+    }
+    if flag(self.block, FULL) != 0 { return -8 }
+    if flag(self.block, HIDDEN) != 0 {
+        set_flag(self.block, HIDDEN, 0)
+        return 4
+    }
+    if flag(self.block, WOKEN) != 0 {
+        set_flag(self.block, WOKEN, 0)
+        return 5
+    }
+    if flag(self.block, OPENED) != 0 {
+        set_flag(self.block, OPENED, 0)
+        return 1
+    }
+    var text: usize = 0
+    code := dequeue(self.block, &mut text)
+    if code != 0 {
+        unsafe { objc.free(self.text) }
+        self.text = ffi.from_address(text)
+        return code
+    }
+    return 0
+}
+
+// Parses `location=(x,y)` from `[event description]` and converts AppKit
+// bottom-left window coordinates into top-left coordinates.
+fn parse_event_point(event *mut u8, win_h i32) Option<[2]i32> {
+    desc := objc.text_of(objc.send(event, &"description"))
+    bytes := desc.bytes()
+    var i: usize = 0
+    for i + 10 < bytes.len() {
+        if bytes[i] == 108 && bytes[i + 1] == 111 && bytes[i + 2] == 99 && bytes[i + 8] == 61 && bytes[i + 9] == 40 {
+            var p = i + 10
+            var x_val: i32 = 0
+            var x_neg = false
+            if p < bytes.len() && bytes[p] == 45 {
+                x_neg = true
+                p = p + 1
+            }
+            for p < bytes.len() && bytes[p] >= 48 && bytes[p] <= 57 {
+                x_val = x_val * 10 + i32(bytes[p] - 48)
+                p = p + 1
+            }
+            for p < bytes.len() && bytes[p] != 44 { p = p + 1 }
+            if p < bytes.len() && bytes[p] == 44 { p = p + 1 }
+            for p < bytes.len() && bytes[p] == 32 { p = p + 1 }
+            var y_val: i32 = 0
+            var y_neg = false
+            if p < bytes.len() && bytes[p] == 45 {
+                y_neg = true
+                p = p + 1
+            }
+            for p < bytes.len() && bytes[p] >= 48 && bytes[p] <= 57 {
+                y_val = y_val * 10 + i32(bytes[p] - 48)
+                p = p + 1
+            }
+            if x_neg { x_val = 0 - x_val }
+            if y_neg { y_val = 0 - y_val }
+            return Some([2]i32{x_val, win_h - y_val})
+        }
+        i = i + 1
+    }
+    return None
+}
+
+pub fn Native.iterate(&mut self) {
+    application := app_of(self.block)
+    unsafe {
+        objc.objc_autoreleasePoolPop(self.pool)
+        self.pool = objc.objc_autoreleasePoolPush()
+    }
+    future := objc.send(objc.class(&"NSDate"), &"distantFuture")
+    event := objc.send4(application, &"nextEventMatchingMask:untilDate:inMode:dequeue:",
+        objc.word(18446744073709551615), future, objc.nsstring(&objc.DEFAULT_MODE), objc.flag(true))
+    if objc.is_nil(event) { return }
+    ev_type := objc.number(objc.send(event, &"type"))
+    if ev_type == objc.EVENT_MOUSE_MOVED || ev_type == objc.EVENT_LEFT_MOUSE_DRAGGED {
+        match parse_event_point(event, self.height) {
+            Some(pt) => {
+                if self.scene.on_pointer_move(pt[0], pt[1]) {
+                    self.flush_damage()
+                }
+            }
+            None => {}
+        }
+    } else if ev_type == objc.EVENT_LEFT_MOUSE_DOWN {
+        match parse_event_point(event, self.height) {
+            Some(pt) => {
+                if self.scene.on_pointer_down(pt[0], pt[1]) {
+                    self.flush_damage()
+                }
+            }
+            None => {}
+        }
+    } else if ev_type == objc.EVENT_LEFT_MOUSE_UP {
+        match parse_event_point(event, self.height) {
+            Some(pt) => {
+                act := self.scene.on_pointer_up(pt[0], pt[1])
+                self.flush_damage()
+                if act != scene_b1.CARD_NONE {
+                    if self.counter_enabled && act == scene_b1.CARD_BTN_PRIMARY {
+                        enqueue(self.block, 3, objc.nil())
+                    } else {
+                        enqueue(self.block, 1001 + act, objc.nil())
+                    }
+                }
+            }
+            None => {}
+        }
+    } else if ev_type == objc.EVENT_KEY_DOWN {
+        keycode := objc.number(objc.send(event, &"keyCode"))
+        if keycode == 53 && self.escape_action != 0 {
+            enqueue(self.block, 1000 + i32(self.escape_action), objc.nil())
+            return
+        }
+    }
+    if ev_type != objc.EVENT_APPLICATION_DEFINED {
+        objc.tell1(application, &"sendEvent:", event)
+    }
+    objc.tell(application, &"updateWindows")
+}
+
+pub fn Native.event_text(&self) Option<string> {
+    if self.check() != 0 || self.closed() { return None }
+    if objc.is_nil(self.text) { return Some("") }
+    unsafe { return ffi.string_from_c(ffi.to_const(self.text)) }
+}
+
+pub fn Native.request_close(&mut self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    set_flag(self.block, BACKGROUND, 0)
+    mark_closed(self.block)
+    return 0
+}
+
+pub fn wake(data *mut u8) { set_flag(data, WOKEN, 1) }
+pub fn Native.wake_data(&self) *mut u8 { return self.block }
+
+pub fn Native.set_background(&mut self, enabled bool) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    var value: i32 = 0
+    if enabled { value = 1 }
+    set_flag(self.block, BACKGROUND, value)
+    return 0
+}
+pub fn Native.present(&mut self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    set_flag(self.block, HIDDEN, 0)
+    objc.tell1(self.window, &"makeKeyAndOrderFront:", objc.nil())
+    objc.tell1(app_of(self.block), &"activateIgnoringOtherApps:", objc.flag(true))
+    return 0
+}
+pub fn Native.hide(&mut self) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    objc.tell1(self.window, &"orderOut:", objc.nil())
+    return 0
+}
+pub fn Native.is_visible(&self) i32 {
+    status := self.check()
+    if status != 0 { return 0 - status }
+    if objc.truth(objc.send(self.window, &"isVisible")) { return 1 }
+    return 0
+}
+
+pub fn Native.enable_counter(&mut self, value i64) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    if self.counter_enabled || !self.page_keys.is_empty() { return 1 }
+    self.counter_enabled = true
+    return self.set_counter(value)
+}
+pub fn Native.set_counter(&mut self, value i64) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    if flag(self.block, FULL) != 0 { return 8 }
+    if !self.counter_enabled { return 1 }
+    self.counter_value = value
+    self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    self.flush_damage()
+    return 0
+}
+pub fn Native.set_heading(&mut self, text &string) i32 {
+    status := self.check()
+    if status != 0 { return status }
+    if self.closed() { return 6 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    self.heading = text.clone()
+    self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    self.flush_damage()
+    return 0
+}
+
+pub fn Native.release(self) i32 {
+    var native = self
+    return native.finish()
+}
+pub fn Native.finish(&mut self) i32 {
+    if !objc.main_thread() { return 2 }
+    if self.finished { return 6 }
+    self.finished = true
+    unsafe { objc.free(self.text) }
+    self.text = objc.nil()
+    mark_closed(self.block)
+    var id: u32 = 1
+    for id <= self.next_watch {
+        self.unwatch(id)
+        id = id + 1
+    }
+    self.surface.destroy()
+    objc.tell1(self.window, &"setDelegate:", objc.nil())
+    objc.tell1(self.window, &"orderOut:", objc.nil())
+    objc.tell(self.window, &"close")
+    unsafe { objc.objc_setAssociatedObject(app_of(self.block), session_key(), objc.nil(), objc.RETAIN) }
+    release(self.window)
+    release(self.target)
+    unsafe {
+        objc.free(self.block)
+        objc.objc_autoreleasePoolPop(self.pool)
+    }
+    return 0
+}
+
+// ---- Keyed pages, leaf components and regions (ABI 14 contract) ----
+fn Native.admit(&self, key &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !valid_key(key) || self.counter_enabled || self.pages_presented || !self.region_root.is_empty() { return 1 }
+    if self.parts.contains(key) || self.parts.len() >= MAX_PARTS { return 1 }
+    return 0
+}
+fn Native.parent_ok(&self, key &string) bool {
+    if !self.parts.contains(key) { return false }
+    part := self.parts.get(key)
+    if part.kind != PAGE && part.kind != BOX { return false }
+    if part.region != 0 || part.tree_kind != 0 { return false }
+    return true
+}
+fn Native.append_child(&mut self, parent &string, child &string) {
+    if self.parts.contains(parent) {
+        self.parts.get_mut(parent).children.push(child.clone())
+    }
+}
+
+pub fn Native.add_page(&mut self, key &string) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if self.page_keys.len() >= 32 { return 1 }
+    self.page_keys.push(key.clone())
+    previous := self.parts.insert(key.clone(), new_part(key, &"", PAGE, false))
+    return 0
+}
+
+pub fn Native.add_box(&mut self, parent &string, key &string, horizontal bool, spacing u32) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if spacing > 64 || !self.parent_ok(parent) { return 1 }
+    var p = new_part(key, parent, BOX, horizontal)
+    p.spacing = spacing
+    previous := self.parts.insert(key.clone(), p)
+    self.append_child(parent, key)
+    return 0
+}
+
+fn Native.add_leaf(&mut self, parent &string, key &string, text &string, action u32, style u32) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if style > 2 || (action != 0 && style != 0) || !self.parent_ok(parent) { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    var kind = LABEL
+    if action != 0 { kind = BUTTON }
+    var p = new_part(key, parent, kind, false)
+    p.text = text.clone()
+    p.action = action
+    p.style = style
+    previous := self.parts.insert(key.clone(), p)
+    self.append_child(parent, key)
+    return 0
+}
+pub fn Native.add_label(&mut self, page &string, key &string, text &string) i32 { return self.add_leaf(page, key, text, 0, 0) }
+pub fn Native.add_text(&mut self, parent &string, key &string, text &string, style u32) i32 { return self.add_leaf(parent, key, text, 0, style) }
+pub fn Native.add_button(&mut self, page &string, key &string, text &string, action u32) i32 {
+    if !objc.main_thread() { return 2 }
+    if !valid_action(action) { return 1 }
+    return self.add_leaf(page, key, text, action, 0)
+}
+
+pub fn Native.add_entry(&mut self, parent &string, key &string, text &string, action u32) i32 {
+    status := self.admit(key)
+    if status != 0 { return status }
+    if !valid_action(action) || !self.parent_ok(parent) { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if chars(text) > MAX_INPUT { return 1 }
+    var p = new_part(key, parent, ENTRY, false)
+    p.text = text.clone()
+    p.action = action
+    previous := self.parts.insert(key.clone(), p)
+    self.append_child(parent, key)
+    return 0
+}
+
+pub fn Native.set_text(&mut self, key &string, text &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if !self.parts.contains(key) { return 1 }
+    var changed = false
+    {
+        part := self.parts.get_mut(key)
+        if part.kind != LABEL && part.kind != BUTTON { return 1 }
+        if !part.text.eq(text) {
+            part.text = text.clone()
+            changed = true
+        }
+    }
+    if changed {
+        self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+        self.flush_damage()
+    }
+    return 0
+}
+
+pub fn Native.set_primary(&mut self, key &string, primary bool) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.parts.contains(key) { return 1 }
+    part := self.parts.get_mut(key)
+    if part.kind != BUTTON { return 1 }
+    part.primary = primary
+    return 0
+}
+
+pub fn Native.set_enabled(&mut self, key &string, enabled bool) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.parts.contains(key) { return 1 }
+    part := self.parts.get_mut(key)
+    if part.kind != BUTTON && part.kind != ENTRY { return 1 }
+    part.enabled = enabled
+    return 0
+}
+
+pub fn Native.set_accessible(&mut self, key &string, label_text &string, description &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if label_text.is_empty() { return 1 }
+    first := match c(label_text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    second := match c(description) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if !self.parts.contains(key) { return 1 }
+    part := self.parts.get_mut(key)
+    part.acc_label = label_text.clone()
+    part.acc_desc = description.clone()
+    return 0
+}
+
+pub fn Native.focus(&mut self, key &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if self.page_keys.is_empty() || !self.parts.contains(key) { return 1 }
+    part := self.parts.get(key)
+    if part.kind != BUTTON && part.kind != ENTRY { return 1 }
+    self.focused_key = key.clone()
+    return 0
+}
+
+pub fn Native.show_page(&mut self, key &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if self.page_keys.is_empty() || !self.parts.contains(key) { return 1 }
+    if self.parts.get(key).kind != PAGE { return 1 }
+    self.active_page = key.clone()
+    self.pages_presented = true
+    self.scene.damage.add(self.scene.win_bounds, self.width, self.height)
+    self.flush_damage()
+    return 0
+}
+
+pub fn Native.set_input(&mut self, key &string, text &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if chars(text) > MAX_INPUT || !self.parts.contains(key) { return 1 }
+    part := self.parts.get_mut(key)
+    if part.kind != ENTRY { return 1 }
+    part.text = text.clone()
+    return 0
+}
+
+pub fn Native.complete_event(&mut self, status i32) i32 {
+    self.dispatched_token = 0
+    return self.check()
+}
+pub fn Native.is_closed(&self) bool { return self.closed() }
+pub fn Native.dispatched_token(&self) u64 { return self.dispatched_token }
+pub fn Native.pages_presented(&self) bool { return self.pages_presented }
+
+pub fn Native.set_submit(&mut self, key &string, action u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !valid_action(action) || !self.parts.contains(key) { return 1 }
+    part := self.parts.get_mut(key)
+    if part.kind != ENTRY { return 1 }
+    part.submit_action = action
+    return 0
+}
+
+pub fn Native.set_placeholder(&mut self, key &string, text &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if !self.parts.contains(key) { return 1 }
+    part := self.parts.get_mut(key)
+    if part.kind != ENTRY { return 1 }
+    part.placeholder = text.clone()
+    return 0
+}
+
+pub fn Native.set_class(&mut self, key &string, class &string, on bool) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.parts.contains(key) { return 1 }
+    if class.is_empty() || class.len() > 64 { return 1 }
+    for b in class.bytes() {
+        if !((b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45) { return 1 }
+    }
+    return 0
+}
+
+pub fn Native.set_selectable(&mut self, key &string, on bool) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.parts.contains(key) { return 1 }
+    part := self.parts.get_mut(key)
+    if part.kind != LABEL { return 1 }
+    part.selectable = on
+    return 0
+}
+
+pub fn Native.set_follow_end(&mut self, on bool) i32 { return self.writable() }
+pub fn Native.scroll_to_end(&mut self) i32 { return self.writable() }
+
+pub fn Native.set_escape_action(&mut self, action u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if action > MAX_ACTION { return 1 }
+    self.escape_action = action
+    return 0
+}
+
+pub fn Native.set_align_start(&mut self, key &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.parts.contains(key) { return 1 }
+    part := self.parts.get_mut(key)
+    if part.kind != LABEL { return 1 }
+    part.align_start = true
+    return 0
+}
+
+// ---- Dynamic regions (lists & trees) ----
+const REGION_LIST u32 = 1
+const REGION_TREE u32 = 2
+const NODE_BUTTON u32 = 3
+const NODE_PRIMARY u32 = 4
+const NODE_INPUT u32 = 5
+const NODE_COLUMN u32 = 6
+const NODE_ROW u32 = 7
+const MAX_STAGED usize = MAX_PARTS * 2
+const MAX_TREE_DEPTH u32 = 12
+
+fn Native.within_region(&self, key &string, ancestor &string) bool {
+    var cur = key.clone()
+    for !cur.is_empty() {
+        if !self.parts.contains(&cur) { return false }
+        part := self.parts.get(&cur)
+        if part.parent.eq(ancestor) { return true }
+        cur = part.parent.clone()
+    }
+    return false
+}
+
+fn Native.keys_within(&self, root &string, inclusive bool) Vec<string> {
+    var keys: Vec<string> = Vec.new()
+    var cursor: usize = 0
+    for true {
+        slot := match self.parts.next_slot(&mut cursor) {
+            Some(found) => found
+            None => { break }
+        }
+        entry := self.parts.entry_at(slot)
+        if self.within_region(&entry.key, root) || (inclusive && entry.key.eq(root)) {
+            keys.push(entry.key.clone())
+        }
+    }
+    return keys
+}
+
+fn Native.remove_subtree(&mut self, parent &string, child &string) {
+    if self.focused_key.eq(child) || self.within_region(&self.focused_key, child) {
+        self.focus_removed = true
+    }
+    for key in self.keys_within(child, true) {
+        removed := self.parts.remove(&key)
+    }
+    if self.parts.contains(parent) {
+        host := self.parts.get_mut(parent)
+        var next_children: Vec<string> = Vec.new()
+        for item in host.children.as_slice() {
+            if !item.eq(child) { next_children.push(item.clone()) }
+        }
+        host.children = next_children
+    }
+}
+
+fn Native.place_child(&mut self, parent &string, key &string) {
+    index := collections.get_copy(&self.next_index, parent).unwrap_or(0)
+    if self.parts.contains(parent) {
+        host := self.parts.get_mut(parent)
+        var pos: usize = host.children.len()
+        var i: usize = 0
+        for i < host.children.len() {
+            if host.children.get(i).eq(key) {
+                pos = i
+                break
+            }
+            i = i + 1
+        }
+        if pos < host.children.len() && pos != index {
+            var reordered: Vec<string> = Vec.new()
+            var j: usize = 0
+            for j < host.children.len() {
+                if j == index { reordered.push(key.clone()) }
+                if j != pos { reordered.push(host.children.get(j).clone()) }
+                j = j + 1
+            }
+            if index >= reordered.len() { reordered.push(key.clone()) }
+            host.children = reordered
+        } else if pos == host.children.len() {
+            host.children.push(key.clone())
+        }
+    }
+    previous := self.next_index.insert(parent.clone(), index + 1)
+    added := self.seen.insert(key.clone())
+}
+
+pub fn Native.list_begin(&mut self, parent &string, count u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.region_root.is_empty() || count > 256 || !self.parts.contains(parent) { return 1 }
+    var old: usize = 0
+    {
+        host := self.parts.get(parent)
+        if (host.kind != PAGE && host.kind != BOX) || host.region == REGION_TREE || host.tree_kind != 0 { return 1 }
+        old = host.children.len()
+        if host.region != REGION_LIST && old != 0 { return 1 }
+    }
+    if self.parts.len() - old + usize(count) > MAX_PARTS { return 1 }
+    self.parts.get_mut(parent).region = REGION_LIST
+    self.region_root = parent.clone()
+    self.expected = count
+    self.tree_mode = false
+    self.focus_removed = false
+    self.seen = collections.Set.new()
+    self.next_index = collections.Map.new()
+    return 0
+}
+
+pub fn Native.list_item(&mut self, key &string, text &string, action u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if self.region_root.is_empty() || self.tree_mode || !valid_key(key) || !valid_action(action) || self.seen.contains(key) { return 1 }
+    if u32(self.seen.len()) >= self.expected { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    root := self.region_root.clone()
+    if self.parts.contains(key) {
+        {
+            found := self.parts.get(key)
+            if !found.parent.eq(&root) || found.kind != BUTTON || found.action != action { return 1 }
+        }
+        shown := self.set_text(key, text)
+    } else {
+        if self.parts.len() >= MAX_STAGED { return 1 }
+        var created = new_part(key, &root, BUTTON, false)
+        created.text = text.clone()
+        created.action = action
+        previous := self.parts.insert(key.clone(), created)
+    }
+    self.place_child(&root, key)
+    return 0
+}
+
+fn Native.prune(&mut self, parent &string, nested bool) {
+    if !self.parts.contains(parent) { return }
+    var child_keys: Vec<string> = Vec.new()
+    {
+        host := self.parts.get(parent)
+        for k in host.children.as_slice() { child_keys.push(k.clone()) }
+    }
+    for k in child_keys.as_slice() {
+        if !self.seen.contains(k) {
+            self.remove_subtree(parent, k)
+        } else if nested && self.parts.contains(k) {
+            is_box := self.parts.get(k).kind == BOX
+            if is_box { self.prune(k, true) }
+        }
+    }
+}
+
+pub fn Native.list_end(&mut self) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if self.region_root.is_empty() || self.tree_mode || u32(self.seen.len()) != self.expected { return 1 }
+    root := self.region_root.clone()
+    self.prune(&root, false)
+    self.region_root = ""
+    self.seen = collections.Set.new()
+    self.next_index = collections.Map.new()
+    return 0
+}
+
+pub fn Native.tree_begin(&mut self, key &string, count u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.region_root.is_empty() || count > 256 || !self.parts.contains(key) { return 1 }
+    {
+        host := self.parts.get(key)
+        if (host.kind != PAGE && host.kind != BOX) || host.region == REGION_LIST || host.tree_kind != 0 { return 1 }
+        if host.region != REGION_TREE && !host.children.is_empty() { return 1 }
+    }
+    old := self.keys_within(key, false).len()
+    if self.parts.len() - old + usize(count) > MAX_PARTS { return 1 }
+    self.parts.get_mut(key).region = REGION_TREE
+    self.region_root = key.clone()
+    self.expected = count
+    self.tree_mode = true
+    self.focus_removed = false
+    self.seen = collections.Set.new()
+    self.next_index = collections.Map.new()
+    return 0
+}
+
+fn Native.region_depth(&self, parent_key &string) u32 {
+    if !parent_key.eq(&self.region_root) && (!self.seen.contains(parent_key) || !self.within_region(parent_key, &self.region_root)) {
+        return MAX_TREE_DEPTH + 1
+    }
+    var depth: u32 = 0
+    var climb = parent_key.clone()
+    for !climb.eq(&self.region_root) {
+        depth = depth + 1
+        if depth > MAX_TREE_DEPTH || !self.parts.contains(&climb) { return MAX_TREE_DEPTH + 1 }
+        climb = self.parts.get(&climb).parent.clone()
+    }
+    return depth
+}
+
+pub fn Native.tree_node(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, spacing u32) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || self.region_root.is_empty() || !valid_key(key) || kind > NODE_ROW || spacing > 64 { return 1 }
+    if self.seen.contains(key) || u32(self.seen.len()) >= self.expected { return 1 }
+    takes_action := kind >= NODE_BUTTON && kind <= NODE_INPUT
+    if takes_action && !valid_action(action) { return 1 }
+    if !takes_action && action != 0 { return 1 }
+    value := match c(text) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    if kind == NODE_INPUT && chars(text) > MAX_INPUT { return 1 }
+    if !self.parts.contains(parent_key) { return 1 }
+    {
+        host := self.parts.get(parent_key)
+        if host.kind != PAGE && host.kind != BOX { return 1 }
+    }
+    depth := self.region_depth(parent_key)
+    if depth > MAX_TREE_DEPTH || (kind >= NODE_COLUMN && depth >= MAX_TREE_DEPTH) { return 1 }
+
+    if self.parts.contains(key) {
+        {
+            found := self.parts.get(key)
+            if !found.parent.eq(parent_key) || found.tree_kind != kind + 1 || found.action != action { return 1 }
+        }
+        if kind >= NODE_COLUMN {
+            self.parts.get_mut(key).spacing = spacing
+        } else if kind == NODE_INPUT {
+            written := self.set_input(key, text)
+            if written != 0 { return written }
+        } else {
+            shown := self.set_text(key, text)
+        }
+    } else {
+        if self.parts.len() >= MAX_STAGED { return 1 }
+        var p_kind = LABEL
+        if kind == NODE_BUTTON || kind == NODE_PRIMARY {
+            p_kind = BUTTON
+        } else if kind == NODE_INPUT {
+            p_kind = ENTRY
+        } else if kind >= NODE_COLUMN {
+            p_kind = BOX
+        }
+        var node = new_part(key, parent_key, p_kind, kind == NODE_ROW)
+        node.text = text.clone()
+        node.action = action
+        node.spacing = spacing
+        node.primary = kind == NODE_PRIMARY
+        node.tree_kind = kind + 1
+        previous := self.parts.insert(key.clone(), node)
+    }
+    self.place_child(parent_key, key)
+    return 0
+}
+
+pub fn Native.tree_end(&mut self) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    if !self.tree_mode || self.region_root.is_empty() || u32(self.seen.len()) != self.expected { return 1 }
+    root := self.region_root.clone()
+    self.prune(&root, true)
+    self.region_root = ""
+    self.tree_mode = false
+    self.seen = collections.Set.new()
+    self.next_index = collections.Map.new()
+    return 0
+}
+
+// ---- Snapshot (Direct pure-Tarn PNG encoder from framebuffer) ----
+pub fn Native.snapshot_png(&mut self, path &string) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    file := match c(path) {
+        Ok(converted) => converted
+        Err(failure) => { return failure }
+    }
+    self.flush_damage()
+    return match self.scene.snapshot_png(path) {
+        Ok(_) => 0
+        Err(code) => code
+    }
+}
+
+// ---- Test & inspection helpers ----
+pub fn Native.has_widget(&self, key &string) bool {
+    return self.parts.contains(key)
+}
+pub fn Native.widget_text(&self, key &string) string {
+    if !self.parts.contains(key) { return "" }
+    return self.parts.get(key).text.clone()
+}
+pub fn Native.first_child_key(&self, parent &string) string {
+    if !self.parts.contains(parent) { return "" }
+    host := self.parts.get(parent)
+    if host.children.is_empty() { return "" }
+    return host.children.get(0).clone()
+}
+pub fn Native.trigger_key(&mut self, key &string) i32 {
+    if !self.parts.contains(key) { return 1 }
+    part := self.parts.get(key)
+    if !part.enabled { return 1 }
+    if part.kind == BUTTON && part.action != 0 {
+        enqueue(self.block, 1000 + i32(part.action), objc.nil())
+        return 0
+    }
+    if part.kind == ENTRY && part.submit_action != 0 {
+        enqueue(self.block, 1000 + i32(part.submit_action), objc.owned_text(objc.nsstring(&part.text)))
+        return 0
+    }
+    return 1
+}
+
+// ---- Deferred to B4 (status 11) ----
+fn Native.unsupported(&self) i32 {
+    status := self.writable()
+    if status != 0 { return status }
+    return 11
+}
+pub fn Native.add_control(&mut self, parent &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 { return self.unsupported() }
+pub fn Native.add_container(&mut self, parent &string, key &string, kind u32, title &string, action u32, value i64) i32 { return self.unsupported() }
+pub fn Native.add_text_area(&mut self, parent &string, key &string, text &string, action u32, lines u32) i32 { return self.unsupported() }
+pub fn Native.set_header(&mut self, subtitle &string) i32 { return self.unsupported() }
+pub fn Native.add_header_button(&mut self, key &string, text &string, icon &string, action u32, end bool) i32 { return self.unsupported() }
+pub fn Native.add_menu_item(&mut self, key &string, text &string, action u32) i32 { return self.unsupported() }
+pub fn Native.tree_control(&mut self, parent_key &string, key &string, kind u32, text &string, action u32, value i64, min i64, max i64) i32 { return self.unsupported() }
+pub fn Native.tree_container(&mut self, parent_key &string, key &string, kind u32, title &string, action u32, value i64) i32 { return self.unsupported() }
+pub fn Native.tree_text_area(&mut self, parent_key &string, key &string, text &string, action u32, lines u32) i32 { return self.unsupported() }
+
+// ---- Run loop sources (watch_fd / watch_interval) ----
+pub fn Native.watch_interval(&mut self, milliseconds u32) u32 {
+    if self.check() != 0 { return 0 }
+    var timer: *mut u8 = objc.nil()
+    unsafe { timer = objc.objc_msgSend(objc.class(&"NSTimer"), objc.sel(&"timerWithTimeInterval:target:selector:userInfo:repeats:"),
+        self.target, objc.sel(&"tick:"), objc.nil(), objc.flag(true), f64(milliseconds) / 1000.0, 0.0, 0.0, 0.0, objc.nil(), objc.nil(), objc.nil(), objc.nil()) }
+    if objc.is_nil(timer) { return 0 }
+    loop := objc.send(objc.class(&"NSRunLoop"), &"mainRunLoop")
+    objc.tell2(loop, &"addTimer:forMode:", timer, objc.common_modes())
+    objc.tell(timer, &"retain")
+    return self.remember(WATCH_TIMER, objc.number(timer))
+}
+
+pub fn Native.watch_fd(&mut self, fd i32) u32 {
+    if self.check() != 0 || fd < 0 { return 0 }
+    unsafe {
+        context := objc.calloc(1, 40)
+        if objc.is_nil(context) { return 0 }
+        var info: *mut *mut u8 = cell(context, 8)
+        ffi.write(info, self.block)
+        descriptor := objc.CFFileDescriptorCreate(objc.nil(), fd, false, ffi.callback(on_descriptor), context)
+        objc.free(context)
+        if objc.is_nil(descriptor) { return 0 }
+        objc.CFFileDescriptorEnableCallBacks(descriptor, 1)
+        source := objc.CFFileDescriptorCreateRunLoopSource(objc.nil(), descriptor, 0)
+        if objc.is_nil(source) {
+            objc.CFRelease(descriptor)
+            return 0
+        }
+        objc.CFRunLoopAddSource(objc.CFRunLoopGetMain(), source, objc.common_modes())
+        objc.CFRelease(source)
+        return self.remember(WATCH_DESCRIPTOR, objc.number(descriptor))
+    }
+}
+
+fn Native.remember(&mut self, kind u32, source usize) u32 {
+    self.next_watch = self.next_watch + 1
+    previous := self.watches.insert(self.next_watch, Watch { kind: kind, source: source })
+    return self.next_watch
+}
+
+pub fn Native.unwatch(&mut self, id u32) {
+    watch := match self.watches.remove(&id) {
+        Some(found) => found
+        None => { return }
+    }
+    var pointer: *mut u8 = ffi.from_address(watch.source)
+    if watch.kind == WATCH_TIMER {
+        objc.tell(pointer, &"invalidate")
+        release(pointer)
+    } else {
+        unsafe {
+            objc.CFFileDescriptorInvalidate(pointer)
+            objc.CFRelease(pointer)
+        }
+    }
+}

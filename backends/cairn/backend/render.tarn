@@ -1,0 +1,939 @@
+// Pure-Tarn 2D tile rasterizer (Milestone B1):
+// - Premultiplied BGRA8 color math and sRGB `color-mix`
+// - Analytical anti-aliased SDF rounded rectangles with per-corner radii
+//   (r_tl, r_tr, r_br, r_bl), 1px inner/outer border, and top 1px inner
+//   specular highlight (`--hi`) in a single pass
+// - Linear and radial gradients
+// - Precomputed 9-slice Gaussian/distance-field drop shadows (zero per-frame
+//   blur cost per ADR 0009 §9)
+// - Procedural Wallpaper("lago") generator from desktop-spec.md §1.10
+import "ffi"
+import "backend/damage"
+
+extern "C" fn memset_pattern4(b *mut u8, pattern4 *u8, len usize)
+extern "C" fn memcpy(dst *mut u8, src *u8, n usize) *mut u8
+
+pub copy struct Color {
+    pub r u8
+    pub g u8
+    pub b u8
+    pub a u8
+}
+
+pub fn rgba(r u8, g u8, b u8, a u8) Color {
+    return Color { r: r, g: g, b: b, a: a }
+}
+
+pub fn rgb(r u8, g u8, b u8) Color {
+    return Color { r: r, g: g, b: b, a: 255 }
+}
+
+pub fn hex_rgb(hex u32) Color {
+    return Color {
+        r: u8((hex >> 16) & 255),
+        g: u8((hex >> 8) & 255),
+        b: u8(hex & 255),
+        a: 255,
+    }
+}
+
+pub fn Color.with_alpha(&self, a u8) Color {
+    return Color { r: self.r, g: self.g, b: self.b, a: a }
+}
+
+// Packs straight-alpha `Color` into a 32-bit premultiplied BGRA word (little-endian).
+pub fn pack_bgra_premul(c Color) u32 {
+    if c.a == 255 {
+        return u32(c.b) | (u32(c.g) << 8) | (u32(c.r) << 16) | 4278190080
+    }
+    if c.a == 0 { return 0 }
+    a := u32(c.a)
+    r := (u32(c.r) * a + 127) / 255
+    g := (u32(c.g) * a + 127) / 255
+    b := (u32(c.b) * a + 127) / 255
+    return b | (g << 8) | (r << 16) | (a << 24)
+}
+
+// CSS `color-mix(in srgb, c1 pct%, c2)` where pct is 0..100.
+pub fn color_mix(c1 Color, pct u32, c2 Color) Color {
+    var p = pct
+    if p > 100 { p = 100 }
+    q := 100 - p
+    r := u8((u32(c1.r) * p + u32(c2.r) * q + 50) / 100)
+    g := u8((u32(c1.g) * p + u32(c2.g) * q + 50) / 100)
+    b := u8((u32(c1.b) * p + u32(c2.b) * q + 50) / 100)
+    a := u8((u32(c1.a) * p + u32(c2.a) * q + 50) / 100)
+    return Color { r: r, g: g, b: b, a: a }
+}
+
+// Linear interpolation between c1 and c2 by t in 0..256.
+pub fn lerp_color(c1 Color, c2 Color, t u32) Color {
+    var k = t
+    if k > 256 { k = 256 }
+    inv := 256 - k
+    r := u8((u32(c1.r) * inv + u32(c2.r) * k + 128) >> 8)
+    g := u8((u32(c1.g) * inv + u32(c2.g) * k + 128) >> 8)
+    b := u8((u32(c1.b) * inv + u32(c2.b) * k + 128) >> 8)
+    a := u8((u32(c1.a) * inv + u32(c2.a) * k + 128) >> 8)
+    return Color { r: r, g: g, b: b, a: a }
+}
+
+pub copy struct Radii {
+    pub tl f64
+    pub tr f64
+    pub br f64
+    pub bl f64
+}
+
+pub fn uniform_radii(r f64) Radii {
+    return Radii { tl: r, tr: r, br: r, bl: r }
+}
+
+pub copy struct RRectStyle {
+    pub radii Radii
+    pub fill_top Color
+    pub fill_bottom Color
+    pub border_color Color
+    pub border_width f64
+    pub inner_hi Color
+}
+
+pub fn solid_rrect(r f64, fill Color, border Color, inner_hi Color) RRectStyle {
+    return RRectStyle {
+        radii: uniform_radii(r),
+        fill_top: fill,
+        fill_bottom: fill,
+        border_color: border,
+        border_width: 1.0,
+        inner_hi: inner_hi,
+    }
+}
+
+// Theme tokens from desktop-spec.md §1.3 (`themeVars(prefs, dark)`).
+pub copy struct ThemePalette {
+    pub dark bool
+    pub transparency u32
+    pub accent Color
+    pub accent_soft Color
+    pub accent_text Color
+    pub surface Color
+    pub pop Color
+    pub side Color
+    pub menu Color
+    pub hi Color
+    pub edge Color
+    pub text Color
+    pub muted Color
+    pub card Color
+    pub card_hover Color
+    pub line Color
+    pub line_strong Color
+    pub track Color
+    pub pill Color
+}
+
+pub fn theme_palette(dark bool, accent_hex u32, transparency u32) ThemePalette {
+    var tr = transparency
+    if tr > 100 { tr = 100 }
+    alpha_f := 0.94 - (f64(tr) / 100.0) * 0.44
+    alpha_u8 := u8(alpha_f * 255.0 + 0.5)
+    var pop_f = alpha_f - 0.04
+    if pop_f < 0.5 { pop_f = 0.5 }
+    pop_u8 := u8(pop_f * 255.0 + 0.5)
+
+    accent := hex_rgb(accent_hex)
+    transparent := accent.with_alpha(0)
+    if dark {
+        var side_f = alpha_f * 0.4
+        if side_f > 0.5 { side_f = 0.5 }
+        return ThemePalette {
+            dark: true,
+            transparency: tr,
+            accent: accent,
+            accent_soft: color_mix(accent, 24, transparent),
+            accent_text: color_mix(accent, 45, rgb(255, 255, 255)),
+            surface: rgba(22, 24, 54, alpha_u8),
+            pop: rgba(26, 28, 62, pop_u8),
+            side: rgba(12, 14, 36, u8(side_f * 255.0 + 0.5)),
+            menu: rgba(30, 32, 66, 250),
+            hi: rgba(255, 255, 255, 56),          // 0.22
+            edge: rgba(255, 255, 255, 36),        // 0.14
+            text: hex_rgb(0xeef0ff),
+            muted: rgba(228, 230, 255, 168),      // 0.66
+            card: rgba(255, 255, 255, 15),        // 0.06
+            card_hover: rgba(255, 255, 255, 28),  // 0.11
+            line: rgba(255, 255, 255, 28),        // 0.11
+            line_strong: rgba(255, 255, 255, 71), // 0.28
+            track: rgba(255, 255, 255, 33),       // 0.13
+            pill: rgba(255, 255, 255, 41),        // 0.16
+        }
+    }
+    var side_f = alpha_f * 0.5
+    if side_f > 0.6 { side_f = 0.6 }
+    return ThemePalette {
+        dark: false,
+        transparency: tr,
+        accent: accent,
+        accent_soft: color_mix(accent, 13, transparent),
+        accent_text: color_mix(accent, 82, rgb(0, 0, 0)),
+        surface: rgba(250, 250, 255, alpha_u8),
+        pop: rgba(248, 248, 255, pop_u8),
+        side: rgba(232, 232, 252, u8(side_f * 255.0 + 0.5)),
+        menu: rgba(255, 255, 255, 250),
+        hi: rgba(255, 255, 255, 242),         // 0.95
+        edge: rgba(255, 255, 255, 179),       // 0.70
+        text: hex_rgb(0x1a1c3d),
+        muted: rgba(26, 28, 61, 173),         // 0.68
+        card: rgba(255, 255, 255, 158),       // 0.62
+        card_hover: rgba(255, 255, 255, 235), // 0.92
+        line: rgba(40, 44, 110, 31),          // 0.12
+        line_strong: rgba(40, 44, 110, 77),   // 0.30
+        track: rgba(40, 44, 110, 31),         // 0.12
+        pill: rgb(255, 255, 255),
+    }
+}
+
+// 32-bit premultiplied BGRA pixel canvas.
+pub struct Canvas {
+    pub width i32
+    pub height i32
+    pub stride i32
+    pub scale i32
+    pub pixels Vec<u8>
+}
+
+pub fn Canvas.new(width i32, height i32, scale i32) Canvas {
+    var s = scale
+    if s < 1 { s = 1 }
+    var w = width
+    if w < 1 { w = 1 }
+    var h = height
+    if h < 1 { h = 1 }
+    total := usize(w) * usize(h) * 4
+    var pixels: Vec<u8> = Vec.with_capacity(total)
+    zero_chunk := [256]u8{
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+    }
+    for pixels.len() + 256 <= total {
+        pixels.extend_from_slice(&zero_chunk[..])
+    }
+    for pixels.len() < total {
+        pixels.push(0)
+    }
+    return Canvas {
+        width: w,
+        height: h,
+        stride: w * 4,
+        scale: s,
+        pixels: pixels,
+    }
+}
+
+// Blends straight-alpha `src` over premultiplied BGRA pixel at byte offset `idx`.
+pub fn blend_at(pixels &mut []u8, idx usize, src Color, cov u32) {
+    if src.a == 0 || cov == 0 { return }
+    sa := (u32(src.a) * cov + 127) / 255
+    if sa == 0 { return }
+    if sa >= 255 {
+        pixels[idx] = src.b
+        pixels[idx + 1] = src.g
+        pixels[idx + 2] = src.r
+        pixels[idx + 3] = 255
+        return
+    }
+    sr := (u32(src.r) * sa + 127) / 255
+    sg := (u32(src.g) * sa + 127) / 255
+    sb := (u32(src.b) * sa + 127) / 255
+    inv := 255 - sa
+    db := u32(pixels[idx])
+    dg := u32(pixels[idx + 1])
+    dr := u32(pixels[idx + 2])
+    da := u32(pixels[idx + 3])
+    pixels[idx] = u8(sb + (db * inv + 127) / 255)
+    pixels[idx + 1] = u8(sg + (dg * inv + 127) / 255)
+    pixels[idx + 2] = u8(sr + (dr * inv + 127) / 255)
+    pixels[idx + 3] = u8(sa + (da * inv + 127) / 255)
+}
+
+// Fast 64-bit SWAR span blend (processes 2 BGRA pixels per 64-bit word, or uses
+// hardware memset_pattern4 for opaque spans).
+fn blend_span(base_ptr *mut u8, start_idx usize, count usize, src Color) {
+    if count == 0 || src.a == 0 { return }
+    var dst: *mut u8 = ffi.offset_mut(base_ptr, start_idx)
+    if src.a == 255 {
+        var pat = [4]u8{src.b, src.g, src.r, 255}
+        unsafe { memset_pattern4(dst, ffi.slice(&pat), count * 4) }
+        return
+    }
+    sa := u32(src.a)
+    sr := (u32(src.r) * sa + 127) / 255
+    sg := (u32(src.g) * sa + 127) / 255
+    sb := (u32(src.b) * sa + 127) / 255
+    packed32 := sb | (sg << 8) | (sr << 16) | (sa << 24)
+    packed64 := u64(packed32) | (u64(packed32) << 32)
+    inv32 := 255 - sa
+    inv64 := u64(inv32)
+    mask64 := u64(71777214294589695)       // 0x00FF00FF00FF00FF
+    round64 := u64(36029346783166592)      // 0x0080008000800080
+
+    var p32: *mut u32 = ffi.from_address(ffi.address(ffi.to_const(dst)))
+    var pairs = count / 2
+    var p64: *mut u64 = ffi.from_address(ffi.address(ffi.to_const(dst)))
+    var i: usize = 0
+    for i < pairs {
+        unsafe {
+            cur64 := ffi.offset_mut(p64, i)
+            d64 := ffi.read(ffi.to_const(cur64))
+            rb64 := (((d64 & mask64) * inv64 + round64) >> 8) & mask64
+            ga64 := ((((d64 >> 8) & mask64) * inv64 + round64)) & (mask64 << 8)
+            ffi.write(cur64, packed64 + (rb64 | ga64))
+        }
+        i = i + 1
+    }
+    if (count & 1) != 0 {
+        unsafe {
+            cur32 := ffi.offset_mut(p32, count - 1)
+            d := ffi.read(ffi.to_const(cur32))
+            rb := (((d & 16711935) * inv32 + 8388736) >> 8) & 16711935
+            ga := ((((d >> 8) & 16711935) * inv32 + 8388736)) & 4278255360
+            ffi.write(cur32, packed32 + (rb | ga))
+        }
+    }
+}
+
+pub fn write_opaque_at(pixels &mut []u8, idx usize, c Color) {
+    pixels[idx] = c.b
+    pixels[idx + 1] = c.g
+    pixels[idx + 2] = c.r
+    pixels[idx + 3] = 255
+}
+
+// Copies a damaged rectangle from a cached background canvas into `self`.
+pub fn Canvas.blit_from(&mut self, src &Canvas, clip damage.Rect) {
+    r := clip.clamp(self.width, self.height).clamp(src.width, src.height)
+    if r.is_empty() { return }
+    dst_base := ffi.vec_mut(&mut self.pixels)
+    src_base := ffi.vec(&src.pixels)
+    if r.x == 0 && r.w == self.width && self.stride == src.stride {
+        start := usize(r.y * self.stride)
+        total := usize(r.h * self.stride)
+        unsafe {
+            copied := memcpy(ffi.offset_mut(dst_base, start), ffi.offset(src_base, start), total)
+        }
+        return
+    }
+    bytes := usize(r.w * 4)
+    var y = r.y
+    for y < r.bottom() {
+        row_dst := usize(y * self.stride + r.x * 4)
+        row_src := usize(y * src.stride + r.x * 4)
+        unsafe {
+            copied := memcpy(ffi.offset_mut(dst_base, row_dst), ffi.offset(src_base, row_src), bytes)
+        }
+        y = y + 1
+    }
+}
+
+// Analytical signed distance to a rounded rectangle centered at the origin with
+// half-extents (hx, hy) and per-quadrant corner radii.
+pub fn sdf_rrect(px f64, py f64, hx f64, hy f64, radii Radii) f64 {
+    var r = radii.tl
+    if px > 0.0 {
+        if py > 0.0 { r = radii.br } else { r = radii.tr }
+    } else {
+        if py > 0.0 { r = radii.bl } else { r = radii.tl }
+    }
+    var max_r = hx
+    if hy < max_r { max_r = hy }
+    if r > max_r { r = max_r }
+    if r < 0.0 { r = 0.0 }
+    qx := px.abs() - hx + r
+    qy := py.abs() - hy + r
+    // Fast path for flat top/bottom/left/right edges where at least one of qx, qy <= 0:
+    if qx <= 0.0 || qy <= 0.0 {
+        var inside = qx
+        if qy > inside { inside = qy }
+        return inside - r
+    }
+    return (qx * qx + qy * qy).sqrt() - r
+}
+
+fn clamp_cov(v f64) u32 {
+    if v <= 0.0 { return 0 }
+    if v >= 1.0 { return 255 }
+    return u32(v * 255.0 + 0.5)
+}
+
+// Draws an analytical anti-aliased SDF rounded rectangle with vertical gradient
+// fill, 1px inner border (`border_color`), and 1px top specular highlight
+// (`inner_hi`), clipped to `clip`.
+pub fn Canvas.draw_rrect(&mut self, bounds damage.Rect, style RRectStyle, clip damage.Rect) {
+    work := bounds.intersect(&clip).clamp(self.width, self.height)
+    if work.is_empty() { return }
+
+    cx := f64(bounds.x) + f64(bounds.w) * 0.5
+    cy := f64(bounds.y) + f64(bounds.h) * 0.5
+    hx := f64(bounds.w) * 0.5
+    hy := f64(bounds.h) * 0.5
+    bw := style.border_width * f64(self.scale)
+    hi_band := f64(self.scale) * 1.5
+    inv_h := 1.0 / f64(bounds.h)
+
+    var max_r = style.radii.tl
+    if style.radii.tr > max_r { max_r = style.radii.tr }
+    if style.radii.br > max_r { max_r = style.radii.br }
+    if style.radii.bl > max_r { max_r = style.radii.bl }
+    corner_inset := i32(max_r + bw + 2.0)
+    edge_inset := i32(bw + 2.0)
+
+    corner_x0 := bounds.x + corner_inset
+    corner_x1 := bounds.right() - corner_inset
+    edge_x0 := bounds.x + edge_inset
+    edge_x1 := bounds.right() - edge_inset
+    corner_y0 := bounds.y + corner_inset
+    corner_y1 := bounds.bottom() - corner_inset
+
+    base_ptr := ffi.vec_mut(&mut self.pixels)
+    pixels := self.pixels.as_mut_slice()
+    var y = work.y
+    for y < work.bottom() {
+        py := (f64(y) + 0.5) - cy
+        t_grad := u32(((f64(y - bounds.y) + 0.5) * inv_h) * 256.0)
+        fill := lerp_color(style.fill_top, style.fill_bottom, t_grad)
+
+        // In the middle vertical band [corner_y0, corner_y1), the left/right edges
+        // are completely straight, so the interior span is [edge_x0, edge_x1).
+        // In the top/bottom bands (excluding the 2px top/bottom border rows), the
+        // flat horizontal span between the two corner arcs is [corner_x0, corner_x1).
+        var span_x0 = corner_x0
+        var span_x1 = corner_x1
+        var has_fast_span = false
+        if y >= corner_y0 && y < corner_y1 {
+            span_x0 = edge_x0
+            span_x1 = edge_x1
+            has_fast_span = span_x1 > span_x0
+        } else if y >= bounds.y + edge_inset && y < bounds.bottom() - edge_inset {
+            has_fast_span = span_x1 > span_x0
+        }
+
+        // Top 1px inner specular highlight (`inset 0 1px 0 var(--hi)`) along the
+        // flat top border row:
+        var has_flat_hi = false
+        if style.inner_hi.a > 0 && y >= bounds.y + i32(bw) && f64(y - bounds.y) < bw + hi_band && corner_x1 > corner_x0 {
+            has_flat_hi = true
+        }
+
+        var x = work.x
+        for x < work.right() {
+            if has_fast_span && x >= span_x0 && x < span_x1 {
+                var span_end = span_x1
+                if work.right() < span_end { span_end = work.right() }
+                span_len := usize(span_end - x)
+                idx := usize(y * self.stride + x * 4)
+                blend_span(base_ptr, idx, span_len, fill)
+                if has_flat_hi {
+                    blend_span(base_ptr, idx, span_len, style.inner_hi)
+                }
+                x = span_end
+                continue
+            }
+            if y >= corner_y0 && y < corner_y1 {
+                // On straight vertical left/right walls, px.abs() - hx == d directly:
+                idx := usize(y * self.stride + x * 4)
+                px := (f64(x) + 0.5) - cx
+                d_wall := px.abs() - hx
+                if d_wall < 0.5 {
+                    outer_cov := clamp_cov(0.5 - d_wall)
+                    if bw > 0.0 && style.border_color.a > 0 {
+                        fill_cov := clamp_cov(0.5 - (d_wall + bw))
+                        border_cov := outer_cov - fill_cov
+                        if fill_cov > 0 { blend_at(pixels, idx, fill, fill_cov) }
+                        if border_cov > 0 { blend_at(pixels, idx, style.border_color, border_cov) }
+                    } else {
+                        blend_at(pixels, idx, fill, outer_cov)
+                    }
+                }
+                x = x + 1
+                continue
+            }
+            if x >= corner_x0 && x < corner_x1 {
+                // On straight horizontal top/bottom walls between corners, py.abs() - hy == d:
+                idx := usize(y * self.stride + x * 4)
+                d_wall := py.abs() - hy
+                if d_wall < 0.5 {
+                    outer_cov := clamp_cov(0.5 - d_wall)
+                    if bw > 0.0 && style.border_color.a > 0 {
+                        fill_cov := clamp_cov(0.5 - (d_wall + bw))
+                        border_cov := outer_cov - fill_cov
+                        if fill_cov > 0 { blend_at(pixels, idx, fill, fill_cov) }
+                        if border_cov > 0 { blend_at(pixels, idx, style.border_color, border_cov) }
+                    } else {
+                        blend_at(pixels, idx, fill, outer_cov)
+                    }
+                }
+                x = x + 1
+                continue
+            }
+            idx := usize(y * self.stride + x * 4)
+            px := (f64(x) + 0.5) - cx
+            d := sdf_rrect(px, py, hx, hy, style.radii)
+            if d < 0.5 {
+                outer_cov := clamp_cov(0.5 - d)
+                if bw > 0.0 && style.border_color.a > 0 {
+                    fill_cov := clamp_cov(0.5 - (d + bw))
+                    border_cov := outer_cov - fill_cov
+                    if fill_cov > 0 {
+                        blend_at(pixels, idx, fill, fill_cov)
+                    }
+                    if border_cov > 0 {
+                        blend_at(pixels, idx, style.border_color, border_cov)
+                    }
+                } else {
+                    blend_at(pixels, idx, fill, outer_cov)
+                }
+
+                // Top 1px inner specular highlight (`inset 0 1px 0 var(--hi)`)
+                if style.inner_hi.a > 0 && py < 0.0 {
+                    d_inner := d + bw
+                    if d_inner > -hi_band && d_inner < 0.5 {
+                        top_factor := clamp_cov(0.5 - (d_inner + hi_band * 0.5).abs())
+                        if top_factor > 0 && (f64(y - bounds.y) < max_r + hi_band * 2.0) {
+                            var vert_fade = 1.0 - (f64(y - bounds.y) - bw) / (hi_band * 2.0)
+                            if vert_fade > 0.0 {
+                                if vert_fade > 1.0 { vert_fade = 1.0 }
+                                hi_cov := u32(f64(top_factor) * vert_fade)
+                                blend_at(pixels, idx, style.inner_hi, hi_cov)
+                            }
+                        }
+                    }
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// Precomputed 9-slice drop shadow (ADR 0009 §9: zero per-frame blur cost).
+pub struct NineSliceShadow {
+    pub corner_size i32
+    pub pad i32
+    pub radius f64
+    pub blur f64
+    pub offset_y i32
+    pub spread i32
+    pub color Color
+    pub corner_alpha Vec<u8>
+}
+
+fn shadow_falloff(d f64, blur f64) u8 {
+    if blur <= 0.5 {
+        if d <= 0.0 { return 255 }
+        return 0
+    }
+    t := (blur - d) / (blur * 2.0)
+    if t <= 0.0 { return 0 }
+    if t >= 1.0 { return 255 }
+    s := t * t * (3.0 - 2.0 * t)
+    return u8(s * s * 255.0 + 0.5)
+}
+
+pub fn NineSliceShadow.precompute(radius f64, blur f64, offset_y i32, spread i32, color Color) NineSliceShadow {
+    pad := i32(blur * 1.2) + spread
+    cs := i32(radius) + pad + 2
+    total := usize(cs) * usize(cs)
+    var table: Vec<u8> = Vec.with_capacity(total)
+    arc_cx := f64(cs - 1)
+    arc_cy := f64(cs - 1)
+    var v: i32 = 0
+    for v < cs {
+        var u: i32 = 0
+        for u < cs {
+            dx := arc_cx - (f64(u) + 0.5)
+            dy := arc_cy - (f64(v) + 0.5)
+            var ox = dx
+            if ox < 0.0 { ox = 0.0 }
+            var oy = dy
+            if oy < 0.0 { oy = 0.0 }
+            var inside = dx
+            if dy > inside { inside = dy }
+            if inside > 0.0 { inside = 0.0 }
+            d := (ox * ox + oy * oy).sqrt() + inside - radius
+            table.push(shadow_falloff(d, blur))
+            u = u + 1
+        }
+        v = v + 1
+    }
+    return NineSliceShadow {
+        corner_size: cs,
+        pad: pad,
+        radius: radius,
+        blur: blur,
+        offset_y: offset_y,
+        spread: spread,
+        color: color,
+        corner_alpha: table,
+    }
+}
+
+// Draws the precomputed 9-slice outer drop shadow for `caster`, masking out
+// pixels inside `caster`'s rounded rectangle so translucent glass surfaces
+// never show a shadow offset edge through their interior.
+pub fn Canvas.draw_shadow_9slice(&mut self, caster damage.Rect, shadow &NineSliceShadow, clip damage.Rect) {
+    if shadow.color.a == 0 { return }
+    pad := shadow.pad
+    sh_rect := damage.rect(
+        caster.x - pad,
+        caster.y + shadow.offset_y - pad,
+        caster.w + pad * 2,
+        caster.h + pad * 2
+    )
+    work := sh_rect.intersect(&clip).clamp(self.width, self.height)
+    if work.is_empty() { return }
+
+    cs := shadow.corner_size
+    lut := shadow.corner_alpha.as_slice()
+    base_ptr := ffi.vec_mut(&mut self.pixels)
+    pixels := self.pixels.as_mut_slice()
+
+    x0 := sh_rect.x
+    y0 := sh_rect.y
+    x1 := sh_rect.right() - 1
+    y1 := sh_rect.bottom() - 1
+
+    flat_x0 := x0 + cs
+    flat_x1 := x1 - cs + 1
+
+    // Caster geometry for outer-only shadow clipping:
+    r_caster := shadow.radius
+    radii_caster := uniform_radii(r_caster)
+    cx := f64(caster.x) + f64(caster.w) * 0.5
+    cy := f64(caster.y) + f64(caster.h) * 0.5
+    hx := f64(caster.w) * 0.5
+    hy := f64(caster.h) * 0.5
+    r_inset := i32(r_caster) + 1
+    caster_mid_y0 := caster.y + r_inset
+    caster_mid_y1 := caster.bottom() - r_inset
+    caster_inner_x0 := caster.x + 1
+    caster_inner_x1 := caster.right() - 1
+    caster_flat_x0 := caster.x + r_inset
+    caster_flat_x1 := caster.right() - r_inset
+
+    var y = work.y
+    for y < work.bottom() {
+        var v = y - y0
+        if y1 - y < v { v = y1 - y }
+        if v >= cs { v = cs - 1 }
+        if v < 0 { v = 0 }
+        v_offset := usize(v * cs)
+        py := (f64(y) + 0.5) - cy
+        in_caster_y := y >= caster.y && y < caster.bottom()
+        in_caster_mid_y := y >= caster_mid_y0 && y < caster_mid_y1
+        in_caster_inner_y := y >= caster.y + 1 && y < caster.bottom() - 1
+
+        var x = work.x
+        for x < work.right() {
+            if in_caster_mid_y && x >= caster_inner_x0 && x < caster_inner_x1 {
+                x = caster_inner_x1
+                continue
+            }
+            if in_caster_inner_y && x >= caster_flat_x0 && x < caster_flat_x1 {
+                x = caster_flat_x1
+                continue
+            }
+            if !in_caster_y && x >= flat_x0 && x < flat_x1 {
+                var span_end = flat_x1
+                if work.right() < span_end { span_end = work.right() }
+                alpha_lut := u32(lut[v_offset + usize(cs - 1)])
+                if alpha_lut > 0 {
+                    eff_a := u8((u32(shadow.color.a) * alpha_lut + 127) / 255)
+                    idx := usize(y * self.stride + x * 4)
+                    blend_span(base_ptr, idx, usize(span_end - x), shadow.color.with_alpha(eff_a))
+                }
+                x = span_end
+                continue
+            }
+            var u = x - x0
+            if x1 - x < u { u = x1 - x }
+            if u >= cs { u = cs - 1 }
+            if u < 0 { u = 0 }
+
+            var alpha_lut = u32(lut[v_offset + usize(u)])
+            if alpha_lut > 0 && in_caster_y && x >= caster.x && x < caster.right() {
+                px := (f64(x) + 0.5) - cx
+                d_caster := sdf_rrect(px, py, hx, hy, radii_caster)
+                if d_caster <= -0.5 {
+                    alpha_lut = 0
+                } else if d_caster < 0.5 {
+                    out_cov := clamp_cov(d_caster + 0.5)
+                    alpha_lut = (alpha_lut * out_cov + 127) / 255
+                }
+            }
+            if alpha_lut > 0 {
+                idx := usize(y * self.stride + x * 4)
+                blend_at(pixels, idx, shadow.color, alpha_lut)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// ---- Procedural Wallpaper("lago") Generator (desktop-spec.md §1.10) ----
+fn build_ridge_profile(seed i64, horizon f64, amp f64, n i32, out_w i32) Vec<f64> {
+    var s = seed
+    var vx: Vec<f64> = Vec.with_capacity(usize(n + 1))
+    var vy: Vec<f64> = Vec.with_capacity(usize(n + 1))
+    step := 1600.0 / f64(n)
+    var i: i32 = 0
+    for i <= n {
+        s = (s * 16807) % 2147483647
+        r1 := f64(s) / 2147483647.0
+        var peak = 0.12 + 0.30 * r1
+        if (i % 2) != 0 {
+            peak = 0.55 + 0.45 * r1
+        }
+        var jx = 0.0
+        if i > 0 && i < n {
+            s = (s * 16807) % 2147483647
+            r2 := f64(s) / 2147483647.0
+            jx = (r2 - 0.5) * step * 0.4
+        }
+        rx := f64(i32(f64(i) * step + jx + 0.5))
+        ry := f64(i32(horizon - amp * peak + 0.5))
+        vx.push(rx)
+        vy.push(ry)
+        i = i + 1
+    }
+
+    var profile: Vec<f64> = Vec.with_capacity(usize(out_w))
+    var seg: usize = 0
+    var x: i32 = 0
+    for x < out_w {
+        wx := (f64(x) + 0.5) * 1600.0 / f64(out_w)
+        for seg + 1 < vx.len() - 1 && wx > vx.at(seg + 1) {
+            seg = seg + 1
+        }
+        x0 := vx.at(seg)
+        x1 := vx.at(seg + 1)
+        y0 := vy.at(seg)
+        y1 := vy.at(seg + 1)
+        var t = 0.0
+        if x1 > x0 {
+            t = (wx - x0) / (x1 - x0)
+        }
+        if t < 0.0 { t = 0.0 }
+        if t > 1.0 { t = 1.0 }
+        profile.push(y0 + (y1 - y0) * t)
+        x = x + 1
+    }
+    return profile
+}
+
+fn sky_lago(wy f64) Color {
+    c0 := hex_rgb(0x1f2a78)
+    c1 := hex_rgb(0x5b5bd6)
+    c2 := hex_rgb(0xb49cf0)
+    c3 := hex_rgb(0xf4cfe6)
+    u := wy / 560.0
+    if u <= 0.0 { return c0 }
+    if u >= 1.0 { return c3 }
+    s := u * 3.0
+    if s < 1.0 {
+        return lerp_color(c0, c1, u32(s * 256.0))
+    }
+    if s < 2.0 {
+        return lerp_color(c1, c2, u32((s - 1.0) * 256.0))
+    }
+    return lerp_color(c2, c3, u32((s - 2.0) * 256.0))
+}
+
+fn lake_lago(wy f64) Color {
+    c0 := hex_rgb(0x8f8de6)
+    c1 := hex_rgb(0x1b1d55)
+    t := (wy - 560.0) / 340.0
+    if t <= 0.0 { return c0 }
+    if t >= 1.0 { return c1 }
+    return lerp_color(c0, c1, u32(t * 256.0))
+}
+
+pub fn Canvas.render_wallpaper_lago(&mut self) {
+    w := self.width
+    h := self.height
+    ridge0 := build_ridge_profile(11, 560.0, 300.0, 9, w)
+    ridge1 := build_ridge_profile(47, 560.0, 210.0, 12, w)
+    ridge2 := build_ridge_profile(83, 560.0, 120.0, 15, w)
+
+    peak0 := hex_rgb(0xa99be8)
+    peak1 := hex_rgb(0x6a62c4)
+    peak2 := hex_rgb(0x2c2a72)
+    p0_u32 := pack_bgra_premul(peak0)
+    p1_u32 := pack_bgra_premul(peak1)
+    p2_u32 := pack_bgra_premul(peak2)
+    sun_color := hex_rgb(0xfff3e6)
+    white := rgb(255, 255, 255)
+
+    scale_x := 1600.0 / f64(w)
+    scale_y := 900.0 / f64(h)
+    aa_band := scale_y
+    inv_aa := 1.0 / aa_band
+
+    sun_x0 := i32((1090.0 - 262.0) / scale_x)
+    sun_x1 := i32((1090.0 + 262.0) / scale_x) + 1
+    sun_y0 := i32((330.0 - 262.0) / scale_y)
+    sun_y1 := i32((330.0 + 262.0) / scale_y) + 1
+
+    r0_slice := ridge0.as_slice()
+    r1_slice := ridge1.as_slice()
+    r2_slice := ridge2.as_slice()
+    base_ptr := ffi.vec_mut(&mut self.pixels)
+    var p32_base: *mut u32 = ffi.from_address(ffi.address(ffi.to_const(base_ptr)))
+    pixels := self.pixels.as_mut_slice()
+    row_bytes := usize(w * 4)
+
+    var y: i32 = 0
+    for y < h {
+        wy := (f64(y) + 0.5) * scale_y
+        is_sky := wy < 560.0
+        var base_row_color = lake_lago(wy)
+        if is_sky { base_row_color = sky_lago(wy) }
+
+        row_start := usize(y * self.stride)
+        row_px_start := usize(y * w)
+        var pat = [4]u8{base_row_color.b, base_row_color.g, base_row_color.r, 255}
+        unsafe { memset_pattern4(ffi.offset_mut(base_ptr, row_start), ffi.slice(&pat), row_bytes) }
+
+        if is_sky {
+            if y >= sun_y0 && y <= sun_y1 {
+                dy := wy - 330.0
+                dy2 := dy * dy
+                var sx0 = sun_x0
+                if sx0 < 0 { sx0 = 0 }
+                var sx1 = sun_x1
+                if sx1 > w { sx1 = w }
+                var x = sx0
+                for x < sx1 {
+                    wx := (f64(x) + 0.5) * scale_x
+                    dx := wx - 1090.0
+                    dist2 := dx * dx + dy2
+                    if dist2 < 260.0 * 260.0 {
+                        idx := row_start + usize(x * 4)
+                        // Polynomial glow approximation (avoids sqrt for outer glow)
+                        t_norm := dist2 * (1.0 / (260.0 * 260.0))
+                        one_minus := 1.0 - t_norm
+                        glow_a := 0.85 * one_minus * one_minus * one_minus
+                        if glow_a > 0.004 {
+                            blend_at(pixels, idx, sun_color, u32(glow_a * 255.0 + 0.5))
+                        }
+                        if dist2 < (34.0 + aa_band) * (34.0 + aa_band) {
+                            dist := dist2.sqrt()
+                            disc_cov := clamp_cov((34.0 + aa_band * 0.5 - dist) * inv_aa)
+                            blend_at(pixels, idx, sun_color.with_alpha(242), disc_cov)
+                        }
+                    }
+                    x = x + 1
+                }
+            }
+
+            if wy >= 258.0 {
+                var x: i32 = 0
+                for x < w {
+                    ux := usize(x)
+                    ry2 := r2_slice[ux]
+                    if wy >= ry2 + aa_band {
+                        unsafe { ffi.write(ffi.offset_mut(p32_base, row_px_start + ux), p2_u32) }
+                        x = x + 1
+                        continue
+                    }
+                    ry1 := r1_slice[ux]
+                    idx := row_start + ux * 4
+                    if wy >= ry1 + aa_band {
+                        unsafe { ffi.write(ffi.offset_mut(p32_base, row_px_start + ux), p1_u32) }
+                    } else {
+                        ry0 := r0_slice[ux]
+                        if wy >= ry0 - aa_band {
+                            if wy >= ry0 + aa_band {
+                                unsafe { ffi.write(ffi.offset_mut(p32_base, row_px_start + ux), p0_u32) }
+                            } else {
+                                cov0 := clamp_cov((wy - (ry0 - aa_band * 0.5)) * inv_aa)
+                                blend_at(pixels, idx, peak0, cov0)
+                            }
+                        }
+                        if wy >= ry1 - aa_band {
+                            cov1 := clamp_cov((wy - (ry1 - aa_band * 0.5)) * inv_aa)
+                            blend_at(pixels, idx, peak1, cov1)
+                        }
+                    }
+                    if wy >= ry2 - aa_band {
+                        cov2 := clamp_cov((wy - (ry2 - aa_band * 0.5)) * inv_aa)
+                        blend_at(pixels, idx, peak2, cov2)
+                    }
+                    x = x + 1
+                }
+            }
+        } else {
+            refl_mask := 0.5 * (1.0 - (wy - 560.0) / 340.0)
+            if refl_mask > 0.0 {
+                refl_cov := u32(refl_mask * 255.0 + 0.5)
+                p0_refl := pack_bgra_premul(lerp_color(base_row_color, peak0, refl_cov))
+                p1_refl := pack_bgra_premul(lerp_color(base_row_color, peak1, refl_cov))
+                p2_refl := pack_bgra_premul(lerp_color(base_row_color, peak2, refl_cov))
+                sun_refl := pack_bgra_premul(lerp_color(base_row_color, sun_color, refl_cov))
+                refl_wy := 1120.0 - wy
+                if refl_wy >= 258.0 {
+                    dy := refl_wy - 330.0
+                    dy2 := dy * dy
+                    has_sun_y := dy.abs() <= 34.0
+                    var x: i32 = 0
+                    for x < w {
+                        ux := usize(x)
+                        if refl_wy >= r2_slice[ux] {
+                            unsafe { ffi.write(ffi.offset_mut(p32_base, row_px_start + ux), p2_refl) }
+                        } else if refl_wy >= r1_slice[ux] {
+                            unsafe { ffi.write(ffi.offset_mut(p32_base, row_px_start + ux), p1_refl) }
+                        } else if refl_wy >= r0_slice[ux] {
+                            unsafe { ffi.write(ffi.offset_mut(p32_base, row_px_start + ux), p0_refl) }
+                        } else if has_sun_y {
+                            wx := (f64(x) + 0.5) * scale_x
+                            dx := wx - 1090.0
+                            if dx * dx + dy2 <= 34.0 * 34.0 {
+                                unsafe { ffi.write(ffi.offset_mut(p32_base, row_px_start + ux), sun_refl) }
+                            }
+                        }
+                        x = x + 1
+                    }
+                }
+            }
+
+            if wy >= 600.0 && wy < 602.0 {
+                x0 := i32(220.0 / scale_x)
+                x1 := i32(740.0 / scale_x)
+                blend_span(base_ptr, row_start + usize(x0 * 4), usize(x1 - x0), white.with_alpha(41))
+            } else if wy >= 640.0 && wy < 642.0 {
+                x0 := i32(350.0 / scale_x)
+                x1 := i32(800.0 / scale_x)
+                blend_span(base_ptr, row_start + usize(x0 * 4), usize(x1 - x0), white.with_alpha(33))
+            } else if wy >= 700.0 && wy < 702.0 {
+                x0 := i32(480.0 / scale_x)
+                x1 := i32(860.0 / scale_x)
+                blend_span(base_ptr, row_start + usize(x0 * 4), usize(x1 - x0), white.with_alpha(26))
+            } else if wy >= 780.0 && wy < 782.0 {
+                x0 := i32(610.0 / scale_x)
+                x1 := i32(920.0 / scale_x)
+                blend_span(base_ptr, row_start + usize(x0 * 4), usize(x1 - x0), white.with_alpha(18))
+            }
+        }
+
+        if wy >= 559.0 && wy < 561.0 {
+            blend_span(base_ptr, row_start, usize(w), white.with_alpha(46))
+        }
+        y = y + 1
+    }
+}

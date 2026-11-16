@@ -1,0 +1,147 @@
+// Pure-Tarn PNG encoder (RFC 2083 + RFC 1950/1951 uncompressed zlib blocks)
+// and SHA-256 digest helper for headless CI verification and snapshot_png.
+import "fs"
+import "crypto"
+import "encoding"
+
+fn push_be32(out &mut Vec<u8>, value u32) {
+    out.push(u8((value >> 24) & 255))
+    out.push(u8((value >> 16) & 255))
+    out.push(u8((value >> 8) & 255))
+    out.push(u8(value & 255))
+}
+
+fn crc32(bytes &[]u8) u32 {
+    var crc: u32 = 4294967295
+    for byte in bytes {
+        crc = crc ^ u32(byte)
+        var bit: usize = 0
+        for bit < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 3988292384
+            } else {
+                crc = crc >> 1
+            }
+            bit = bit + 1
+        }
+    }
+    return crc ^ 4294967295
+}
+
+fn push_chunk(out &mut Vec<u8>, tag &[4]u8, payload &[]u8) {
+    push_be32(out, u32(payload.len()))
+    start := out.len()
+    out.push(tag[0])
+    out.push(tag[1])
+    out.push(tag[2])
+    out.push(tag[3])
+    out.extend_from_slice(payload)
+    sum := crc32(&out.as_slice()[start..])
+    push_be32(out, sum)
+}
+
+// Encodes a premultiplied BGRA8 buffer (4 bytes per pixel, stride = width * 4)
+// into a standard 8-bit RGBA PNG byte vector.
+pub fn encode_bgra(pixels &[]u8, width u32, height u32) Vec<u8> {
+    w := usize(width)
+    h := usize(height)
+    row_len := 1 + w * 4
+    raw_len := h * row_len
+    blocks := (raw_len + 65534) / 65535
+    var idat: Vec<u8> = Vec.with_capacity(2 + raw_len + blocks * 5 + 4)
+    // zlib header: CMF = 0x78 (Deflate, 32K window), FLG = 0x01 (no dict, check bits)
+    idat.push(120)
+    idat.push(1)
+
+    var s1: u32 = 1
+    var s2: u32 = 0
+    var block_rem: usize = 0
+    var remaining = raw_len
+
+    var y: usize = 0
+    for y < h {
+        var col: usize = 0
+        for col < row_len {
+            if block_rem == 0 {
+                var chunk = remaining
+                var bfinal: u8 = 1
+                if chunk > 65535 {
+                    chunk = 65535
+                    bfinal = 0
+                }
+                idat.push(bfinal)
+                len16 := u16(chunk)
+                nlen16 := len16 ^ 65535
+                idat.push(u8(len16 & 255))
+                idat.push(u8(len16 >> 8))
+                idat.push(u8(nlen16 & 255))
+                idat.push(u8(nlen16 >> 8))
+                block_rem = chunk
+            }
+            var byte: u8 = 0
+            if col > 0 {
+                px := (col - 1) / 4
+                ch := (col - 1) % 4
+                base := (y * w + px) * 4
+                if ch == 0 {
+                    byte = pixels[base + 2] // R
+                } else if ch == 1 {
+                    byte = pixels[base + 1] // G
+                } else if ch == 2 {
+                    byte = pixels[base]     // B
+                } else {
+                    byte = pixels[base + 3] // A
+                }
+            }
+            idat.push(byte)
+            s1 = (s1 + u32(byte)) % 65521
+            s2 = (s2 + s1) % 65521
+            block_rem = block_rem - 1
+            remaining = remaining - 1
+            col = col + 1
+        }
+        y = y + 1
+    }
+    adler := (s2 << 16) | s1
+    push_be32(&mut idat, adler)
+
+    var out: Vec<u8> = Vec.with_capacity(idat.len() + 64)
+    sig := [8]u8{137, 80, 78, 71, 13, 10, 26, 10}
+    out.extend_from_slice(&sig[..])
+
+    var ihdr: Vec<u8> = Vec.with_capacity(13)
+    push_be32(&mut ihdr, width)
+    push_be32(&mut ihdr, height)
+    ihdr.push(8) // bit depth 8
+    ihdr.push(6) // color type 6 (RGBA)
+    ihdr.push(0) // compression 0
+    ihdr.push(0) // filter 0
+    ihdr.push(0) // interlace 0
+    tag_ihdr := [4]u8{73, 72, 68, 82}
+    push_chunk(&mut out, &tag_ihdr, ihdr.as_slice())
+
+    tag_idat := [4]u8{73, 68, 65, 84}
+    push_chunk(&mut out, &tag_idat, idat.as_slice())
+
+    tag_iend := [4]u8{73, 69, 78, 68}
+    empty := [0]u8{}
+    push_chunk(&mut out, &tag_iend, &empty[..])
+    return out
+}
+
+pub fn sha256_hex(bytes &[]u8) string {
+    digest := crypto.sha256(bytes)
+    return encoding.hex(&digest[..])
+}
+
+pub fn write_bgra_png(path &string, pixels &[]u8, width u32, height u32) Result<string, i32> {
+    if width == 0 || height == 0 || pixels.len() < usize(width) * usize(height) * 4 {
+        return Err(1)
+    }
+    bytes := encode_bgra(pixels, width, height)
+    hash := sha256_hex(bytes.as_slice())
+    match fs.write(path, bytes.as_slice()) {
+        Ok(_) => { return Ok(hash) }
+        Err(_) => { return Err(5) }
+    }
+}

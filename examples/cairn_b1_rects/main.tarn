@@ -1,0 +1,196 @@
+// Demo `examples/cairn_b1_rects`:
+// Milestone B1 of the third `tarn_ui` backend (`backends/cairn/`).
+//
+// Usage:
+//   cairn_b1_rects                         # Opens interactive macOS host window (0% CPU at idle)
+//   cairn_b1_rects --headless [out.png]    # Renders headlessly, writes PNG, prints SHA-256 & timings
+//   cairn_b1_rects --bench                 # Runs 960x600 + 1920x1080 B1 budget benchmarks + live window check
+import "os"
+import "core/session"
+import "backend/objc"
+import "backend/scene_b1"
+import "backend/native"
+
+fn run_headless(out_path &string) i32 {
+    t0 := objc.monotonic_ns()
+    var scene = scene_b1.SceneB1.new(960, 600, 1)
+    t1 := objc.monotonic_ns()
+    first_us := (t1 - t0) / 1000
+    scene.damage.clear()
+
+    // Measure idle cost (0 redraws when damage is empty)
+    idle_redraws := scene.render_damaged()
+
+    // Measure 1080p first frame and localized single-card hover damage redraw
+    t_1080_0 := objc.monotonic_ns()
+    var scene_1080 = scene_b1.SceneB1.new(1920, 1080, 1)
+    t_1080_1 := objc.monotonic_ns()
+    first_1080_us := (t_1080_1 - t_1080_0) / 1000
+    scene_1080.damage.clear()
+
+    cx := scene_1080.card1_bounds.x + scene_1080.card1_bounds.w / 2
+    cy := scene_1080.card1_bounds.y + scene_1080.card1_bounds.h / 2
+    var min_hover_us: u64 = 999999999
+    var sum_hover_us: u64 = 0
+    var iter: u32 = 0
+    for iter < 10 {
+        px := if_x(iter, cx)
+        th0 := objc.monotonic_ns()
+        moved := scene_1080.on_pointer_move(px, cy)
+        rects := scene_1080.render_damaged()
+        scene_1080.damage.clear()
+        th1 := objc.monotonic_ns()
+        dt := (th1 - th0) / 1000
+        if dt < min_hover_us && rects > 0 { min_hover_us = dt }
+        sum_hover_us = sum_hover_us + dt
+        iter = iter + 1
+    }
+    avg_hover_us := sum_hover_us / 10
+
+    hash := match scene.snapshot_png(out_path) {
+        Ok(h) => h
+        Err(code) => {
+            print("snapshot_png error: " + code.to_string())
+            return 1
+        }
+    }
+    print("cairn_b1_rects headless snapshot:")
+    print("  path: " + out_path.clone())
+    print("  sha256: " + hash)
+    print("  960x600_first_frame_us: " + first_us.to_string())
+    print("  1080p_first_frame_us: " + first_1080_us.to_string())
+    print("  1080p_hover_damage_min_us: " + min_hover_us.to_string())
+    print("  1080p_hover_damage_avg_us: " + avg_hover_us.to_string())
+    print("  idle_redraws: " + idle_redraws.to_string())
+    return 0
+}
+
+fn if_x(iter u32, cx i32) i32 {
+    if (iter % 2) == 0 { return cx }
+    return 10
+}
+
+fn run_bench() i32 {
+    status := run_headless(&"/tmp/cairn-b1-rects-snapshot.png")
+    if status != 0 { return status }
+    if !native.display_available() {
+        print("  host_window: skipped (no window server)")
+        return 0
+    }
+    var ui = match native.create(&"Cairn B1 · Lago & Glass Card", &"Bienvenido a Cairn") {
+        Ok(v) => v
+        Err(code) => {
+            print("native.create error: " + code.to_string())
+            return 1
+        }
+    }
+    win_first_us := ui.first_frame_nanos() / 1000
+    ev := ui.next()
+    presents0 := ui.presents_count()
+
+    // Idle pointer move outside cards -> 0 damage, 0 presents
+    d_idle := ui.inject_pointer_move(12, 12)
+    presents_idle := ui.presents_count() - presents0
+
+    // Hover onto card 1 -> 1 dirty rect rasterized and presented
+    th0 := objc.monotonic_ns()
+    d_hover := ui.inject_pointer_move(ui.scene.card1_bounds.x + 24, ui.scene.card1_bounds.y + 24)
+    th1 := objc.monotonic_ns()
+    win_hover_us := (th1 - th0) / 1000
+
+    closed := ui.request_close()
+    rel := ui.release()
+    print("  macos_window_first_frame_us: " + win_first_us.to_string())
+    print("  macos_window_hover_redraw_us: " + win_hover_us.to_string() + " (dirty_rects=" + d_hover.to_string() + ")")
+    print("  macos_window_idle_presents: " + presents_idle.to_string() + " (dirty_rects=" + d_idle.to_string() + ")")
+    return 0
+}
+
+fn main() {
+    argv := match os.args() {
+        Ok(list) => list
+        Err(_) => Vec.new()
+    }
+    if argv.len() >= 2 {
+        arg1 := argv.get(1)
+        if arg1.eq(&"--headless") {
+            var out = "/tmp/cairn-b1-rects.png"
+            if argv.len() >= 3 { out = argv.get(2).clone() }
+            code := run_headless(&out)
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+        if arg1.eq(&"--bench") {
+            code := run_bench()
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+        if arg1.eq(&"--idle-check") {
+            unsafe {
+                match session.run("Cairn B1 · Idle CPU Check", "Idle Check", fn(ui &mut session.Session) Result<void, session.Error> {
+                    id_warm := try ui.watch_interval(150)
+                    var id_idle: u32 = 0
+                    var t_sleep_0: u64 = 0
+                    var cpu_0: u64 = 0
+                    var phase: u32 = 0
+                    for {
+                        action := try ui.next_action()
+                        match action {
+                            session.Action.Wake => {
+                                if phase == 0 {
+                                    phase = 1
+                                    try ui.unwatch_fd(id_warm)
+                                    id_idle = try ui.watch_interval(1500)
+                                    t_sleep_0 = objc.monotonic_ns()
+                                    cpu_0 = objc.thread_cpu_ns()
+                                } else {
+                                    cpu_1 := objc.thread_cpu_ns()
+                                    t_sleep_1 := objc.monotonic_ns()
+                                    wall_ms := (t_sleep_1 - t_sleep_0) / 1000000
+                                    cpu_us := (cpu_1 - cpu_0) / 1000
+                                    print("idle_window_check: wall_ms=" + wall_ms.to_string() + " thread_cpu_us=" + cpu_us.to_string())
+                                    try ui.unwatch_fd(id_idle)
+                                    try ui.request_close()
+                                }
+                            }
+                            session.Action.Closed => { return Ok(()) }
+                            _ => {}
+                        }
+                    }
+                }) {
+                    Ok(_) => { return }
+                    Err(e) => {
+                        print(e.message())
+                        os.exit(1)
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe {
+        match session.run("Cairn B1 · Lago alpino & Glass Card", "Bienvenido a Cairn", fn(ui &mut session.Session) Result<void, session.Error> {
+            // Allow Escape to close the demo window cleanly.
+            try ui.set_escape_action(99)
+            for {
+                action := try ui.next_action()
+                match action {
+                    session.Action.Closed => { return Ok(()) }
+                    session.Action.Activate(id) => {
+                        if id == 99 {
+                            try ui.request_close()
+                        }
+                        try ui.complete_event()
+                    }
+                    _ => {}
+                }
+            }
+        }) {
+            Ok(_) => {}
+            Err(error) => {
+                print(error.message())
+                os.exit(1)
+            }
+        }
+    }
+}

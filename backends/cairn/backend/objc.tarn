@@ -1,0 +1,184 @@
+// Objective-C runtime, AppKit, QuartzCore, CoreGraphics and CoreFoundation
+// declarations used by the Cairn macOS host surface.
+// Link with: --link objc --link CoreFoundation --link CoreGraphics
+// (AppKit and QuartzCore are loaded via dlopen).
+import "ffi"
+
+pub extern "C" fn dlopen(path *u8, mode i32) *mut u8
+pub extern "C" fn dlsym(handle *mut u8, name *u8) *mut u8
+pub extern "C" fn pthread_main_np() i32
+pub extern "C" fn calloc(count usize, size usize) *mut u8
+pub extern "C" fn free(pointer *mut u8)
+pub extern "C" fn strdup(text *u8) *mut u8
+pub extern "C" fn objc_getClass(name *u8) *mut u8
+pub extern "C" fn sel_registerName(name *u8) *mut u8
+pub extern "C" fn objc_allocateClassPair(superclass *mut u8, name *u8, extra usize) *mut u8
+pub extern "C" fn objc_registerClassPair(cls *mut u8)
+pub extern "C" fn class_addMethod(cls *mut u8, selector *mut u8, imp *u8, types *u8) bool
+pub extern "C" fn objc_setAssociatedObject(object *mut u8, key *mut u8, value *mut u8, policy usize)
+pub extern "C" fn objc_getAssociatedObject(object *mut u8, key *mut u8) *mut u8
+pub extern "C" fn objc_autoreleasePoolPush() *mut u8
+pub extern "C" fn objc_autoreleasePoolPop(pool *mut u8)
+pub extern "C" fn objc_msgSend(object *mut u8, selector *mut u8, a *mut u8, b *mut u8, c *mut u8, d *mut u8,
+    x f64, y f64, z f64, w f64, e *mut u8, f *mut u8, g *mut u8, h *mut u8) *mut u8
+
+// Float-returning variant for methods returning CGFloat/double (e.g. backingScaleFactor).
+// On x86_64 System V and arm64 AAPCS64, scalar f64 returns in xmm0 / d0.
+pub extern "C" fn CFRunLoopGetMain() *mut u8
+pub extern "C" fn CFRunLoopAddSource(loop *mut u8, source *mut u8, mode *mut u8)
+pub extern "C" fn CFFileDescriptorCreate(allocator *mut u8, fd i32, close_on_invalidate bool, callout *u8, context *mut u8) *mut u8
+pub extern "C" fn CFFileDescriptorEnableCallBacks(descriptor *mut u8, types usize)
+pub extern "C" fn CFFileDescriptorCreateRunLoopSource(allocator *mut u8, descriptor *mut u8, order isize) *mut u8
+pub extern "C" fn CFFileDescriptorInvalidate(descriptor *mut u8)
+pub extern "C" fn CFRelease(object *mut u8)
+
+// CoreGraphics declarations for fast pixel buffer presentation to CALayer.contents.
+pub extern "C" fn CGColorSpaceCreateDeviceRGB() *mut u8
+pub extern "C" fn CGColorSpaceRelease(space *mut u8)
+pub extern "C" fn CGDataProviderCreateWithData(info *mut u8, data *u8, size usize, release_data *u8) *mut u8
+pub extern "C" fn CGDataProviderRelease(provider *mut u8)
+pub extern "C" fn CGImageCreate(width usize, height usize, bits_per_component usize, bits_per_pixel usize,
+    bytes_per_row usize, space *mut u8, bitmap_info u32, provider *mut u8, decode *u8, should_interpolate bool,
+    intent i32) *mut u8
+pub extern "C" fn CGImageRelease(image *mut u8)
+
+// High-resolution monotonic clock (nanoseconds) for B1 benchmark gates.
+pub extern "C" fn clock_gettime_nsec_np(clock_id i32) u64
+
+// OBJC_ASSOCIATION_RETAIN_NONATOMIC
+pub const RETAIN usize = 1
+pub const EVENT_LEFT_MOUSE_DOWN usize = 1
+pub const EVENT_LEFT_MOUSE_UP usize = 2
+pub const EVENT_MOUSE_MOVED usize = 5
+pub const EVENT_LEFT_MOUSE_DRAGGED usize = 6
+pub const EVENT_KEY_DOWN usize = 10
+pub const EVENT_APPLICATION_DEFINED usize = 15
+pub const DEFAULT_MODE string = "kCFRunLoopDefaultMode"
+
+// kCGBitmapByteOrder32Little (2 << 12 = 8192) | kCGImageAlphaPremultipliedFirst (2) = 8194
+pub const BITMAP_BGRA_PREMUL u32 = 8194
+
+pub fn monotonic_ns() u64 {
+    // CLOCK_UPTIME_RAW = 8 on macOS
+    unsafe { return clock_gettime_nsec_np(8) }
+}
+
+pub fn thread_cpu_ns() u64 {
+    // CLOCK_THREAD_CPUTIME_ID = 16 on macOS
+    unsafe { return clock_gettime_nsec_np(16) }
+}
+
+pub fn nil() *mut u8 { return ffi.null() }
+pub fn word(value usize) *mut u8 { return ffi.from_address(value) }
+pub fn flag(value bool) *mut u8 {
+    if value { return word(1) }
+    return nil()
+}
+pub fn number(object *mut u8) usize { return ffi.address(ffi.to_const(object)) }
+pub fn truth(object *mut u8) bool { return number(object) % 256 != 0 }
+pub fn is_nil(object *mut u8) bool { return ffi.is_null(ffi.to_const(object)) }
+
+fn literal(text &string) ffi.CString { return ffi.CString.new(text).expect("literal with NUL") }
+
+pub fn load_frameworks() bool {
+    appkit := literal(&"/System/Library/Frameworks/AppKit.framework/AppKit")
+    quartz := literal(&"/System/Library/Frameworks/QuartzCore.framework/QuartzCore")
+    unsafe {
+        if is_nil(dlopen(appkit.as_ptr(), 1 | 8)) { return false }
+        if is_nil(dlopen(quartz.as_ptr(), 1 | 8)) { return false }
+        return true
+    }
+}
+
+pub fn main_thread() bool {
+    unsafe { return pthread_main_np() == 1 }
+}
+
+pub fn class(name &string) *mut u8 {
+    text := literal(name)
+    unsafe { return objc_getClass(text.as_ptr()) }
+}
+
+pub fn sel(name &string) *mut u8 {
+    text := literal(name)
+    unsafe { return sel_registerName(text.as_ptr()) }
+}
+
+pub fn send(object *mut u8, selector &string) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), nil(), nil(), nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
+}
+pub fn send1(object *mut u8, selector &string, a *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
+}
+pub fn send2(object *mut u8, selector &string, a *mut u8, b *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, b, nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
+}
+pub fn send3(object *mut u8, selector &string, a *mut u8, b *mut u8, c *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, b, c, nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
+}
+pub fn send4(object *mut u8, selector &string, a *mut u8, b *mut u8, c *mut u8, d *mut u8) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, b, c, d, 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
+}
+pub fn send_f(object *mut u8, selector &string, x f64, y f64) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), nil(), nil(), nil(), nil(), x, y, 0.0, 0.0, nil(), nil(), nil(), nil()) }
+}
+pub fn send1_f(object *mut u8, selector &string, a *mut u8, x f64) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), x, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil()) }
+}
+pub fn tell(object *mut u8, selector &string) { result := send(object, selector) }
+pub fn tell1(object *mut u8, selector &string, a *mut u8) { result := send1(object, selector, a) }
+pub fn tell2(object *mut u8, selector &string, a *mut u8, b *mut u8) { result := send2(object, selector, a, b) }
+
+pub fn post_wake_event(app *mut u8) {
+    unsafe {
+        event := objc_msgSend(class(&"NSEvent"), sel(&"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
+            word(EVENT_APPLICATION_DEFINED), nil(), nil(), nil(), 0.0, 0.0, 0.0, 0.0, nil(), nil(), nil(), nil())
+        if !is_nil(event) { tell2(app, &"postEvent:atStart:", event, nil()) }
+    }
+}
+
+pub fn nsstring(text &string) *mut u8 {
+    utf8 := match ffi.CString.new(text) {
+        Some(value) => value
+        None => { return nil() }
+    }
+    unsafe { return send1(class(&"NSString"), &"stringWithUTF8String:", word(ffi.address(utf8.as_ptr()))) }
+}
+
+pub fn text_of(object *mut u8) string {
+    if is_nil(object) { return "" }
+    utf8 := send(object, &"UTF8String")
+    if is_nil(utf8) { return "" }
+    unsafe { return ffi.string_from_c(ffi.to_const(utf8)).unwrap_or("") }
+}
+
+pub fn owned_text(object *mut u8) *mut u8 {
+    if is_nil(object) { return nil() }
+    utf8 := send(object, &"UTF8String")
+    if is_nil(utf8) { return nil() }
+    unsafe { return strdup(ffi.to_const(utf8)) }
+}
+
+pub fn common_modes() *mut u8 {
+    name := literal(&"kCFRunLoopCommonModes")
+    unsafe {
+        slot := dlsym(word(18446744073709551614), name.as_ptr())
+        if is_nil(slot) { return nsstring(&DEFAULT_MODE) }
+        var cell: *mut *mut u8 = ffi.from_address(number(slot))
+        return ffi.read(ffi.to_const(cell))
+    }
+}
+
+pub fn bits(value f64) *mut u8 {
+    var cell: Vec<u64> = Vec.new()
+    cell.push(0)
+    unsafe {
+        var slot: *mut f64 = ffi.from_address(ffi.address(ffi.to_const(ffi.vec_mut(&mut cell))))
+        ffi.write(slot, value)
+    }
+    return word(usize(cell.at(0)))
+}
+
+pub fn send_rect(object *mut u8, selector &string, a *mut u8, x f64, y f64, width f64, height f64) *mut u8 {
+    unsafe { return objc_msgSend(object, sel(selector), a, nil(), nil(), nil(), x, y, width, height, bits(x), bits(y), bits(width), bits(height)) }
+}

@@ -1,0 +1,27 @@
+// Linux host surface stub for Milestone B1 (`surface_linux.tarn`).
+//
+// In Milestone B1, development and live window benchmarking run on macOS
+// (`surface_macos.tarn` via NSWindow + CALayer + CGImage). On Linux, the
+// headless CPU tile rasterizer and PNG snapshot pipeline run without a display
+// server; the interactive Wayland `wl_shm` / `wl_surface.damage_buffer` +
+// `wl_surface.frame()` vblank presenter is documented here as a compile-time
+// stub for when Linux display testing is active.
+import "backend/damage"
+
+pub struct LinuxSurface {
+    pub width i32
+    pub height i32
+    pub scale i32
+    pub headless bool
+}
+
+pub fn create_headless(width i32, height i32, scale i32) LinuxSurface {
+    return LinuxSurface { width: width, height: height, scale: scale, headless: true }
+}
+
+pub fn LinuxSurface.present_damaged(&mut self, pixels &[]u8, stride i32, dmg &damage.DamageRegion) i32 {
+    if dmg.is_empty() { return 0 }
+    if self.headless { return 0 }
+    // Wayland wl_shm_pool + wl_surface.damage_buffer + wl_surface.commit stub
+    return 11
+}

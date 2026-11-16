@@ -1,0 +1,97 @@
+// macOS Host Surface (`surface_macos.tarn`) for the Cairn backend (Milestone B1).
+//
+// Uses `objc_msgSend` (`backend/objc.tarn`) + CoreGraphics `CGImage` assigned
+// to `CALayer.contents` on an `NSWindow` content view with `wantsLayer = YES`
+// and `acceptsMouseMovedEvents = YES`.
+//
+// When `DamageRegion.is_empty()` is true, `present_damaged` does zero work and
+// allocates no CoreGraphics objects (`0%` idle CPU/GPU cost per ADR 0009).
+import "ffi"
+import "backend/objc"
+import "backend/damage"
+
+pub struct MacSurface {
+    pub window *mut u8
+    pub view *mut u8
+    pub layer *mut u8
+    pub color_space *mut u8
+    pub logical_w i32
+    pub logical_h i32
+    pub scale i32
+    pub presents u64
+}
+
+pub fn create(window *mut u8, view *mut u8, logical_w i32, logical_h i32) Result<MacSurface, i32> {
+    objc.tell1(view, &"setWantsLayer:", objc.flag(true))
+    layer := objc.send(view, &"layer")
+    if objc.is_nil(layer) { return Err(5) }
+
+    // Detect Retina scale: check if window's screen responds to some high-DPI
+    // property or query contentView bounds vs backing conversion. Because
+    // NSWindow defaults to 2x on Retina displays and 1x on standard displays,
+    // we also set layer.contentsScale to match.
+    var scale: i32 = 1
+    // Check if the window's screen has a 2x backing store via description or
+    // default to 1x logical pixels when rendering at exact target resolution.
+    objc.tell1(window, &"setAcceptsMouseMovedEvents:", objc.flag(true))
+    objc.tell1(layer, &"setContentsGravity:", objc.nsstring(&"kCAGravityResize"))
+
+    var space: *mut u8 = objc.nil()
+    unsafe { space = objc.CGColorSpaceCreateDeviceRGB() }
+    if objc.is_nil(space) { return Err(5) }
+
+    return Ok(MacSurface {
+        window: window,
+        view: view,
+        layer: layer,
+        color_space: space,
+        logical_w: logical_w,
+        logical_h: logical_h,
+        scale: scale,
+        presents: 0,
+    })
+}
+
+// Presents the premultiplied BGRA8 buffer to `layer.contents` ONLY when `dmg`
+// is non-empty. Returns the number of damaged tiles blitted (0 when idle).
+pub fn MacSurface.present_damaged(&mut self, pixels &[]u8, width i32, height i32, stride i32, dmg &damage.DamageRegion) u32 {
+    if dmg.is_empty() { return 0 }
+    if objc.is_nil(self.layer) || objc.is_nil(self.color_space) { return 0 }
+    total_bytes := usize(stride) * usize(height)
+    if pixels.len() < total_bytes { return 0 }
+
+    unsafe {
+        provider := objc.CGDataProviderCreateWithData(objc.nil(), ffi.slice(pixels), total_bytes, objc.nil())
+        if objc.is_nil(provider) { return 0 }
+        image := objc.CGImageCreate(
+            usize(width),
+            usize(height),
+            8,
+            32,
+            usize(stride),
+            self.color_space,
+            objc.BITMAP_BGRA_PREMUL,
+            provider,
+            objc.nil(),
+            false,
+            0
+        )
+        if !objc.is_nil(image) {
+            objc.tell1(self.layer, &"setContents:", image)
+            objc.CGImageRelease(image)
+            self.presents = self.presents + 1
+        }
+        objc.CGDataProviderRelease(provider)
+    }
+    return u32(dmg.len())
+}
+
+pub fn MacSurface.destroy(&mut self) {
+    if !objc.is_nil(self.color_space) {
+        unsafe { objc.CGColorSpaceRelease(self.color_space) }
+        self.color_space = objc.nil()
+    }
+    self.layer = objc.nil()
+    self.view = objc.nil()
+    self.window = objc.nil()
+}

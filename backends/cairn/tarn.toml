@@ -1,0 +1,9 @@
+# The Cairn self-drawn backend as its own package, so its modules import each
+# other as backend/... and `tarn test backends/cairn` runs the tests beside them.
+[package]
+name = "tarn_ui_cairn"
+version = "0.1.0"
+entry = "backend/native.tarn"
+
+[native]
+links = ["objc", "CoreFoundation", "CoreGraphics"]
