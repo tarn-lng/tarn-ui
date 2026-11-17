@@ -16,7 +16,7 @@ build_example() {
        "$cairn/theme.tarn" "$cairn/layout.tarn" \
        "$cairn/objc.tarn" "$cairn/surface_macos.tarn" "$cairn/surface_linux.tarn" \
        "$cairn/scene_b1.tarn" "$cairn/scene_b2.tarn" "$cairn/scene_b3.tarn" \
-       "$cairn/scene_app.tarn" "$cairn/b5_model.tarn" "$cairn/scene_b5.tarn" "$cairn/b6_vfs.tarn" "$cairn/scene_b6.tarn" "$cairn/native.tarn" "$build/source/backend/"
+       "$cairn/scene_app.tarn" "$cairn/b5_model.tarn" "$cairn/scene_b5.tarn" "$cairn/b6_vfs.tarn" "$cairn/scene_b6.tarn" "$cairn/compositor.tarn" "$cairn/native.tarn" "$build/source/backend/"
     cp "$cairn/devtools_off.tarn" "$build/source/backend/devtools.tarn"
     cp "$root/core/session.tarn" "$root/core/reactive.tarn" "$root/core/components.tarn" \
        "$root/core/navigation.tarn" "$root/core/forms.tarn" "$build/source/core/"

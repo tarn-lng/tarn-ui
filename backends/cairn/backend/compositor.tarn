@@ -1,0 +1,777 @@
+// Cairn Compositor Prototype (`compositor.tarn`):
+// Pure-Tarn desktop compositor running inside one macOS host window (`ADR 0009`):
+// - Client/Compositor protocol boundary with move-only `SurfaceBuffer` ownership transfer
+//   (zero-copy handoff: `acquire_backbuffer` -> client render -> `commit_surface`)
+// - Per-workspace window policies (`POLICY_FLOATING` and `POLICY_TILING` dwindle BSP)
+//   with `LayoutSpring` (`340/30`) animated transitions
+// - 4 Workspaces with animated switching, compositor-owned Topbar, magnified Dock
+//   (`170/14, mass 0.1`), and `Ctrl+K` Launcher
+// - Strict input isolation (`poll_client_input(id)` delivers events ONLY to focused client)
+// - End-to-end damage aggregation across clients and compositor (`0` redraws at idle)
+import "ffi"
+import "backend/damage"
+import "backend/render"
+import "backend/text"
+import "backend/icons"
+import "backend/anim"
+import "backend/theme"
+import "backend/png"
+import "backend/objc"
+
+extern "C" fn memcpy(dst *mut u8, src *u8, n usize) *mut u8
+
+pub const POLICY_FLOATING i32 = 0
+pub const POLICY_TILING i32 = 1
+
+pub const EV_POINTER_MOVE i32 = 1
+pub const EV_POINTER_DOWN i32 = 2
+pub const EV_POINTER_UP i32 = 3
+pub const EV_KEY_DOWN i32 = 4
+
+pub struct ClientInputEvent {
+    pub kind i32
+    pub x i32
+    pub y i32
+    pub keycode i64
+    pub text string
+}
+
+// Move-only client surface buffer transferred across the client/compositor boundary.
+pub struct SurfaceBuffer {
+    pub canvas render.Canvas
+}
+
+pub fn SurfaceBuffer.new(w i32, h i32, scale i32) SurfaceBuffer {
+    return SurfaceBuffer { canvas: render.Canvas.new(w, h, scale) }
+}
+
+pub struct CompWindow {
+    pub id u32
+    pub title string
+    pub workspace i32
+    pub open bool
+    pub minimized bool
+    pub maximized bool
+    pub z u32
+    pub floating_rect damage.Rect
+    pub saved_rect damage.Rect
+    pub spring anim.LayoutSpring
+    pub has_front bool
+    pub front Vec<SurfaceBuffer> // 0 or 1 owned buffer held by compositor
+    pub client_holds_back bool
+    pub inbox Vec<ClientInputEvent>
+}
+
+pub struct Compositor {
+    pub width i32
+    pub height i32
+    pub scale i32
+    pub th theme.Theme
+    pub frame render.Canvas
+    pub wallpaper render.Canvas
+    pub win_shadow render.NineSliceShadow
+    pub damage damage.DamageRegion
+    pub fonts text.FontPair
+    pub atlas text.GlyphAtlas
+
+    pub active_ws i32
+    pub ws_policies [4]i32
+    pub ws_x_spring anim.Spring
+    pub launcher_open bool
+    pub launcher_sel i32
+
+    pub dock_base i32
+    pub dock_sizes [4]anim.Spring
+    pub dock_capsule damage.Rect
+
+    pub windows Vec<CompWindow>
+    pub next_id u32
+    pub z_counter u32
+    pub focused_id u32
+    pub drag_id u32
+    pub drag_off_x i32
+    pub drag_off_y i32
+
+    pub first_frame_ns u64
+    pub frames_rendered u64
+}
+
+fn draw_solid(c &mut render.Canvas, bounds damage.Rect, fill render.Color, border render.Color, hi render.Color, r f64, bw f64, clip damage.Rect) {
+    c.draw_rrect(bounds, render.RRectStyle {
+        fill_top: fill,
+        fill_bottom: fill,
+        border_color: border,
+        inner_hi: hi,
+        radii: render.uniform_radii(r),
+        border_width: bw,
+    }, clip)
+}
+
+fn pt_in(r damage.Rect, x i32, y i32) bool {
+    return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+pub fn Compositor.new(width i32, height i32, scale i32) Compositor {
+    t0 := objc.monotonic_ns()
+    th := theme.Theme.default_dark()
+    fonts := match text.load_cairn_fonts() {
+        Ok(fp) => fp
+        Err(code) => { panic("Compositor load_cairn_fonts failed: " + code.to_string()) }
+    }
+    var atlas = text.GlyphAtlas.new(512, 512)
+    var wp = render.Canvas.new(width, height, scale)
+    wp.render_wallpaper_lago()
+
+    var frame = render.Canvas.new(width, height, scale)
+    frame.blit_from(&wp, damage.rect(0, 0, width, height))
+
+    db := 42
+    dbf := f64(db)
+    dock_cap := damage.rect((width - (db * 4 + 54)) / 2, height - db - 24, db * 4 + 54, db + 14)
+
+    var dmg = damage.DamageRegion.new()
+    dmg.add_full(width, height)
+
+    var comp = Compositor {
+        width: width,
+        height: height,
+        scale: scale,
+        th: th,
+        frame: frame,
+        wallpaper: wp,
+        win_shadow: render.NineSliceShadow.precompute(20.0, 22.0, 10, 0, th.semantic.shadow_window),
+        damage: dmg,
+        fonts: fonts,
+        atlas: atlas,
+        active_ws: 0,
+        ws_policies: [4]i32{POLICY_FLOATING, POLICY_TILING, POLICY_FLOATING, POLICY_TILING},
+        ws_x_spring: anim.Spring.new(0.0, 340.0, 30.0, 1.0, 0.5),
+        launcher_open: false,
+        launcher_sel: 0,
+        dock_base: db,
+        dock_sizes: [4]anim.Spring{anim.spring_dock(dbf), anim.spring_dock(dbf), anim.spring_dock(dbf), anim.spring_dock(dbf)},
+        dock_capsule: dock_cap,
+        windows: Vec.new(),
+        next_id: 1,
+        z_counter: 1,
+        focused_id: 0,
+        drag_id: 0,
+        drag_off_x: 0,
+        drag_off_y: 0,
+        first_frame_ns: 0,
+        frames_rendered: 0,
+    }
+    rd := comp.render_damaged()
+    t1 := objc.monotonic_ns()
+    comp.first_frame_ns = t1 - t0
+    return comp
+}
+
+// ---- Client / Compositor Protocol Boundary ----
+
+pub fn Compositor.create_surface(&mut self, title &string, x i32, y i32, w i32, h i32, workspace i32) u32 {
+    id := self.next_id
+    self.next_id = self.next_id + 1
+    self.z_counter = self.z_counter + 1
+    r := damage.rect(x, y, w, h)
+    var front: Vec<SurfaceBuffer> = Vec.new()
+    front.push(SurfaceBuffer.new(w, h, self.scale))
+    self.windows.push(CompWindow {
+        id: id,
+        title: title.clone(),
+        workspace: workspace,
+        open: true,
+        minimized: false,
+        maximized: false,
+        z: self.z_counter,
+        floating_rect: r,
+        saved_rect: r,
+        spring: anim.LayoutSpring.new(f64(x), f64(y), f64(w), f64(h), 340.0, 30.0),
+        has_front: true,
+        front: front,
+        client_holds_back: false,
+        inbox: Vec.new(),
+    })
+    self.focused_id = id
+    self.relayout_workspace(workspace)
+    self.damage.add_full(self.width, self.height)
+    return id
+}
+
+// Client acquires ownership of its buffer to draw into (zero-copy handoff).
+pub fn Compositor.acquire_backbuffer(&mut self, id u32) Option<SurfaceBuffer> {
+    var i: usize = 0
+    for i < self.windows.len() {
+        if self.windows.as_slice()[i].id == id {
+            if self.windows.as_slice()[i].client_holds_back || self.windows.as_slice()[i].front.is_empty() { return None }
+            buf := self.windows.as_mut_slice()[i].front.pop().expect("front buffer")
+            self.windows.as_mut_slice()[i].has_front = false
+            self.windows.as_mut_slice()[i].client_holds_back = true
+            return Some(buf)
+        }
+        i = i + 1
+    }
+    return None
+}
+
+// Client commits its owned buffer back to the compositor with client-local damage.
+pub fn Compositor.commit_surface(&mut self, id u32, buf SurfaceBuffer, client_dmg &damage.DamageRegion) {
+    var i: usize = 0
+    for i < self.windows.len() {
+        if self.windows.as_slice()[i].id == id {
+            var wr = damage.rect(
+                i32(self.windows.as_slice()[i].spring.x.pos + 0.5),
+                i32(self.windows.as_slice()[i].spring.y.pos + 0.5),
+                i32(self.windows.as_slice()[i].spring.w.pos + 0.5),
+                i32(self.windows.as_slice()[i].spring.h.pos + 0.5),
+            )
+            self.windows.as_mut_slice()[i].front.push(buf)
+            self.windows.as_mut_slice()[i].has_front = true
+            self.windows.as_mut_slice()[i].client_holds_back = false
+
+            if self.windows.as_slice()[i].workspace == self.active_ws && self.windows.as_slice()[i].open && !self.windows.as_slice()[i].minimized {
+                if client_dmg.is_empty() {
+                    self.damage.add(wr, self.width, self.height)
+                } else {
+                    var di: usize = 0
+                    for di < client_dmg.len() {
+                        dr := client_dmg.at(di)
+                        mapped := damage.rect(wr.x + dr.x, wr.y + 32 + dr.y, dr.w, dr.h)
+                        self.damage.add(mapped, self.width, self.height)
+                        di = di + 1
+                    }
+                }
+            }
+            return
+        }
+        i = i + 1
+    }
+}
+
+// Security boundary: ONLY the focused client ever receives events in its inbox.
+pub fn Compositor.poll_client_input(&mut self, id u32) Vec<ClientInputEvent> {
+    var out: Vec<ClientInputEvent> = Vec.new()
+    var i: usize = 0
+    for i < self.windows.len() {
+        if self.windows.as_slice()[i].id == id {
+            inbox := &mut self.windows.as_mut_slice()[i].inbox
+            var j: usize = 0
+            for j < inbox.len() {
+                ev := &inbox.as_slice()[j]
+                out.push(ClientInputEvent { kind: ev.kind, x: ev.x, y: ev.y, keycode: ev.keycode, text: ev.text.clone() })
+                j = j + 1
+            }
+            inbox.clear()
+            return out
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---- Window Policies (`Floating` & `Dwindle Tiling`) & Workspaces ----
+
+pub fn Compositor.active_policy(&self) i32 {
+    return self.ws_policies[usize(self.active_ws)]
+}
+
+pub fn Compositor.set_workspace_policy(&mut self, ws i32, policy i32) {
+    if ws < 0 || ws >= 4 { return }
+    if self.ws_policies[usize(ws)] == policy { return }
+    self.ws_policies[usize(ws)] = policy
+    self.relayout_workspace(ws)
+    self.damage.add(damage.rect(0, 0, self.width, 46), self.width, self.height)
+}
+
+pub fn Compositor.toggle_policy(&mut self) {
+    var next = POLICY_TILING
+    if self.active_policy() == POLICY_TILING { next = POLICY_FLOATING }
+    self.set_workspace_policy(self.active_ws, next)
+}
+
+pub fn Compositor.switch_workspace(&mut self, ws i32) {
+    if ws < 0 || ws >= 4 || ws == self.active_ws { return }
+    self.active_ws = ws
+    self.ws_x_spring.set_target(f64(ws * self.width))
+    // Focus top window on new workspace if any
+    var best_z: u32 = 0
+    var best_id: u32 = 0
+    var i: usize = 0
+    for i < self.windows.len() {
+        w := &self.windows.as_slice()[i]
+        if w.workspace == ws && w.open && !w.minimized && w.z >= best_z {
+            best_z = w.z
+            best_id = w.id
+        }
+        i = i + 1
+    }
+    self.focused_id = best_id
+    self.relayout_workspace(ws)
+    self.damage.add_full(self.width, self.height)
+}
+
+pub fn Compositor.relayout_workspace(&mut self, ws i32) {
+    pol := self.ws_policies[usize(ws)]
+    if pol == POLICY_FLOATING {
+        var i: usize = 0
+        for i < self.windows.len() {
+            w := &mut self.windows.as_mut_slice()[i]
+            if w.workspace == ws && w.open && !w.minimized {
+                r := w.floating_rect
+                w.spring.set_target(f64(r.x), f64(r.y), f64(r.w), f64(r.h))
+            }
+            i = i + 1
+        }
+        return
+    }
+
+    // Dwindle BSP tiling with inner/outer gaps = 12px
+    var visible_idx: Vec<usize> = Vec.new()
+    var i: usize = 0
+    for i < self.windows.len() {
+        w := &self.windows.as_slice()[i]
+        if w.workspace == ws && w.open && !w.minimized {
+            visible_idx.push(i)
+        }
+        i = i + 1
+    }
+    cnt := visible_idx.len()
+    if cnt == 0 { return }
+
+    gap := 12
+    var area = damage.rect(gap, 48 + gap, self.width - gap * 2, self.height - 48 - self.dock_base - 36 - gap * 2)
+    var k: usize = 0
+    for k < cnt {
+        idx := visible_idx.as_slice()[k]
+        var target = area
+        if k + 1 < cnt {
+            if (k % 2) == 0 {
+                // Split horizontally (left / right)
+                left_w := (area.w - gap) / 2
+                target = damage.rect(area.x, area.y, left_w, area.h)
+                area = damage.rect(area.x + left_w + gap, area.y, area.w - left_w - gap, area.h)
+            } else {
+                // Split vertically (top / bottom)
+                top_h := (area.h - gap) / 2
+                target = damage.rect(area.x, area.y, area.w, top_h)
+                area = damage.rect(area.x, area.y + top_h + gap, area.w, area.h - top_h - gap)
+            }
+        }
+        self.windows.as_mut_slice()[idx].spring.set_target(f64(target.x), f64(target.y), f64(target.w), f64(target.h))
+        k = k + 1
+    }
+}
+
+pub fn Compositor.has_active_animations(&self) bool {
+    if self.ws_x_spring.active { return true }
+    var di: usize = 0
+    for di < 4 {
+        if self.dock_sizes[di].active { return true }
+        di = di + 1
+    }
+    var i: usize = 0
+    for i < self.windows.len() {
+        if self.windows.as_slice()[i].spring.is_active() { return true }
+        i = i + 1
+    }
+    return false
+}
+
+pub fn Compositor.step_animations(&mut self, dt_s f64) bool {
+    var any = false
+    if self.ws_x_spring.advance(dt_s, false) {
+        self.damage.add_full(self.width, self.height)
+        any = true
+    }
+    var dock_chg = false
+    var di: usize = 0
+    for di < 4 {
+        if self.dock_sizes[di].advance(dt_s, false) {
+            dock_chg = true
+            any = true
+        }
+        di = di + 1
+    }
+    if dock_chg {
+        self.damage.add(damage.rect(0, self.height - self.dock_base * 2 - 20, self.width, self.dock_base * 2 + 20), self.width, self.height)
+    }
+    var i: usize = 0
+    for i < self.windows.len() {
+        if self.windows.as_slice()[i].spring.is_active() {
+            old_r := damage.rect(
+                i32(self.windows.as_slice()[i].spring.x.pos + 0.5) - 12,
+                i32(self.windows.as_slice()[i].spring.y.pos + 0.5) - 12,
+                i32(self.windows.as_slice()[i].spring.w.pos + 0.5) + 24,
+                i32(self.windows.as_slice()[i].spring.h.pos + 0.5) + 24,
+            )
+            if self.windows.as_mut_slice()[i].spring.advance(dt_s, false) {
+                new_r := damage.rect(
+                    i32(self.windows.as_slice()[i].spring.x.pos + 0.5) - 12,
+                    i32(self.windows.as_slice()[i].spring.y.pos + 0.5) - 12,
+                    i32(self.windows.as_slice()[i].spring.w.pos + 0.5) + 24,
+                    i32(self.windows.as_slice()[i].spring.h.pos + 0.5) + 24,
+                )
+                self.damage.add(old_r.union(&new_r), self.width, self.height)
+                any = true
+            }
+        }
+        i = i + 1
+    }
+    return any
+}
+
+// ---- Compositor Rendering ----
+
+fn blit_client_clipped(dst &mut render.Canvas, src &render.Canvas, dx i32, dy i32, w i32, h i32, clip damage.Rect) {
+    r := damage.rect(dx, dy, w, h).intersect(&clip).clamp(dst.width, dst.height)
+    if r.is_empty() { return }
+    dst_base := ffi.vec_mut(&mut dst.pixels)
+    src_base := ffi.vec(&src.pixels)
+    var copy_w = r.w
+    if r.x - dx + copy_w > src.width { copy_w = src.width - (r.x - dx) }
+    if copy_w <= 0 { return }
+    bytes := usize(copy_w * 4)
+    var py = r.y
+    y_end := r.bottom()
+    for py < y_end {
+        sy := py - dy
+        if sy >= 0 && sy < src.height {
+            row_dst := usize(py * dst.stride + r.x * 4)
+            row_src := usize(sy * src.stride + (r.x - dx) * 4)
+            unsafe {
+                c := memcpy(ffi.offset_mut(dst_base, row_dst), ffi.offset(src_base, row_src), bytes)
+            }
+        }
+        py = py + 1
+    }
+}
+
+pub fn Compositor.draw_tile(&mut self, tile damage.Rect) {
+    self.frame.blit_from(&self.wallpaper, tile)
+    s := f64(self.scale)
+    pal := self.th.palette
+
+    // 1. Sort open windows on active workspace by z ascending
+    var order: Vec<usize> = Vec.new()
+    var i: usize = 0
+    for i < self.windows.len() {
+        w := &self.windows.as_slice()[i]
+        if w.workspace == self.active_ws && w.open && !w.minimized {
+            order.push(i)
+        }
+        i = i + 1
+    }
+    var a: usize = 0
+    for a < order.len() {
+        var b = a + 1
+        for b < order.len() {
+            if self.windows.as_slice()[order.as_slice()[b]].z < self.windows.as_slice()[order.as_slice()[a]].z {
+                tmp := order.as_slice()[a]
+                ob := order.as_slice()[b]
+                order.as_mut_slice()[a] = ob
+                order.as_mut_slice()[b] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    var oi: usize = 0
+    for oi < order.len() {
+        idx := order.as_slice()[oi]
+        wr := damage.rect(
+            i32(self.windows.as_slice()[idx].spring.x.pos + 0.5),
+            i32(self.windows.as_slice()[idx].spring.y.pos + 0.5),
+            i32(self.windows.as_slice()[idx].spring.w.pos + 0.5),
+            i32(self.windows.as_slice()[idx].spring.h.pos + 0.5),
+        )
+        if tile.intersects(&damage.rect(wr.x - 16, wr.y - 16, wr.w + 32, wr.h + 32)) {
+            self.frame.draw_shadow_9slice(wr, &self.win_shadow, tile)
+            is_foc := self.windows.as_slice()[idx].id == self.focused_id
+            var bcol = pal.edge
+            var bw = 1.0
+            if is_foc {
+                bcol = pal.accent
+                if self.active_policy() == POLICY_TILING { bw = 2.0 }
+            }
+            draw_solid(&mut self.frame, wr, pal.surface, bcol, pal.hi, 18.0 * s, bw, tile)
+            // Traffic lights + titlebar
+            draw_solid(&mut self.frame, damage.rect(wr.x + 12, wr.y + 10, 10, 10), self.th.semantic.tl_close, render.rgba(0, 0, 0, 40), render.rgba(0, 0, 0, 0), 5.0, 1.0, tile)
+            draw_solid(&mut self.frame, damage.rect(wr.x + 28, wr.y + 10, 10, 10), self.th.semantic.tl_min, render.rgba(0, 0, 0, 40), render.rgba(0, 0, 0, 0), 5.0, 1.0, tile)
+            draw_solid(&mut self.frame, damage.rect(wr.x + 44, wr.y + 10, 10, 10), self.th.semantic.tl_max, render.rgba(0, 0, 0, 40), render.rgba(0, 0, 0, 0), 5.0, 1.0, tile)
+            wtitle := self.windows.as_slice()[idx].title.clone()
+            dt := text.draw_text_truncated(&mut self.frame, &mut self.atlas, &self.fonts.body, &wtitle, f64(wr.x + 68), f64(wr.y + 8), f64(wr.w - 84), 1, text.body_style(12.0 * s, pal.text, true), tile)
+            draw_solid(&mut self.frame, damage.rect(wr.x + 1, wr.y + 31, wr.w - 2, 1), pal.line, render.rgba(0, 0, 0, 0), render.rgba(0, 0, 0, 0), 0.0, 0.0, tile)
+
+            // Composite client owned buffer (zero-copy blit)
+            if self.windows.as_slice()[idx].has_front && !self.windows.as_slice()[idx].front.is_empty() {
+                c_clip := damage.rect(wr.x + 4, wr.y + 32, wr.w - 8, wr.h - 38).intersect(&tile)
+                if !c_clip.is_empty() {
+                    blit_client_clipped(&mut self.frame, &self.windows.as_slice()[idx].front.as_slice()[0].canvas, wr.x + 4, wr.y + 32, wr.w - 8, wr.h - 38, c_clip)
+                }
+            }
+        }
+        oi = oi + 1
+    }
+
+    // 2. Compositor Topbar (workspaces 1..4, policy pill, launcher button)
+    if tile.y < 48 {
+        ws_pill := damage.rect(12, 7, 250, 34)
+        if tile.intersects(&ws_pill) {
+            draw_solid(&mut self.frame, ws_pill, pal.surface, pal.edge, pal.hi, 17.0, 1.0, tile)
+            var wi: i32 = 0
+            for wi < 4 {
+                wr := damage.rect(ws_pill.x + 6 + wi * 32, ws_pill.y + 5, 28, 24)
+                if wi == self.active_ws {
+                    draw_solid(&mut self.frame, wr, pal.accent, pal.hi, pal.hi, 12.0, 1.0, tile)
+                }
+                dw := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &(wi + 1).to_string(), f64(wr.x), f64(wr.y + 5), 28.0, 1, text.body_style(11.5 * s, pal.text, wi == self.active_ws), tile)
+                wi = wi + 1
+            }
+            var pol_lbl = "Flotante"
+            if self.active_policy() == POLICY_TILING { pol_lbl = "Mosaico" }
+            pol_r := damage.rect(ws_pill.x + 142, ws_pill.y + 5, 100, 24)
+            draw_solid(&mut self.frame, pol_r, pal.accent_soft, pal.line, render.rgba(0, 0, 0, 0), 12.0, 1.0, tile)
+            dp := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &pol_lbl, f64(pol_r.x), f64(pol_r.y + 5), f64(pol_r.w), 1, text.body_style(11.5 * s, pal.accent_text, true), tile)
+        }
+        r_pill := damage.rect(self.width - 124, 7, 112, 34)
+        if tile.intersects(&r_pill) {
+            draw_solid(&mut self.frame, r_pill, pal.surface, pal.edge, pal.hi, 17.0, 1.0, tile)
+            dl := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &"Ctrl+K", f64(r_pill.x), f64(r_pill.y + 9), f64(r_pill.w), 1, text.body_style(11.5 * s, pal.text, true), tile)
+        }
+    }
+
+    // 3. Compositor Dock
+    if tile.y + tile.h >= self.height - self.dock_base * 2 - 20 {
+        var sum_w: i32 = 16
+        var di: usize = 0
+        for di < 4 {
+            sum_w = sum_w + i32(self.dock_sizes[di].pos + 0.5) + 10
+            di = di + 1
+        }
+        cap_x := (self.width - sum_w) / 2
+        cap_h := self.dock_base + 14
+        cap_y := self.height - cap_h - 10
+        self.dock_capsule = damage.rect(cap_x, cap_y, sum_w, cap_h)
+        draw_solid(&mut self.frame, self.dock_capsule, pal.surface, pal.edge, pal.hi, 20.0, 1.0, tile)
+        var cur_x = cap_x + 12
+        base_y := cap_y + cap_h - 7
+        d_icons := [4]u32{icons.ICON_ACTIVITY, icons.ICON_SLIDERS_HORIZONTAL, icons.ICON_SPARKLES, icons.ICON_SEARCH}
+        d_cols := [4]render.Color{render.hex_rgb(5999093), render.hex_rgb(10124784), render.hex_rgb(2075009), render.hex_rgb(14715435)}
+        di = 0
+        for di < 4 {
+            sz := i32(self.dock_sizes[di].pos + 0.5)
+            iy := base_y - sz
+            if tile.intersects(&damage.rect(cur_x, iy, sz, sz)) {
+                icons.draw_app_icon(&mut self.frame, &mut self.atlas, cur_x, iy, sz, d_cols[di], d_icons[di], tile)
+            }
+            cur_x = cur_x + sz + 10
+            di = di + 1
+        }
+    }
+
+    // 4. Launcher overlay (`Ctrl+K`)
+    if self.launcher_open {
+        lr := damage.rect((self.width - 420) / 2, self.height / 5, 420, 210)
+        if tile.intersects(&lr) {
+            draw_solid(&mut self.frame, lr, pal.pop, pal.edge, pal.hi, 18.0, 1.0, tile)
+            cmds := [4]string{"Alternar Flotante / Mosaico", "Espacio 1", "Espacio 2", "Enfocar Onboarding B5"}
+            var ci: i32 = 0
+            for ci < 4 {
+                cr := damage.rect(lr.x + 12, lr.y + 16 + ci * 44, lr.w - 24, 36)
+                var fill = pal.card
+                if ci == self.launcher_sel { fill = pal.accent_soft }
+                draw_solid(&mut self.frame, cr, fill, pal.line, render.rgba(0, 0, 0, 0), 10.0, 1.0, tile)
+                dc := text.draw_text_line(&mut self.frame, &mut self.atlas, &self.fonts.body, &cmds[usize(ci)], f64(cr.x + 12), f64(cr.y + 10), f64(cr.w - 24), 0, text.body_style(12.5 * s, pal.text, ci == self.launcher_sel), tile)
+                ci = ci + 1
+            }
+        }
+    }
+}
+
+pub fn Compositor.render_damaged(&mut self) u32 {
+    if self.damage.is_empty() { return 0 }
+    n := self.damage.len()
+    var i: usize = 0
+    for i < n {
+        r := self.damage.at(i)
+        self.draw_tile(r)
+        i = i + 1
+    }
+    self.frames_rendered = self.frames_rendered + 1
+    return u32(n)
+}
+
+// ---- Compositor Input Routing (Isolated to Focused Client) ----
+
+fn Compositor.window_rect(&self, idx usize) damage.Rect {
+    return damage.rect(
+        i32(self.windows.as_slice()[idx].spring.x.pos + 0.5),
+        i32(self.windows.as_slice()[idx].spring.y.pos + 0.5),
+        i32(self.windows.as_slice()[idx].spring.w.pos + 0.5),
+        i32(self.windows.as_slice()[idx].spring.h.pos + 0.5),
+    )
+}
+
+fn Compositor.hit_window(&self, x i32, y i32) i32 {
+    var best_idx: i32 = -1
+    var best_z: u32 = 0
+    var i: usize = 0
+    for i < self.windows.len() {
+        w := &self.windows.as_slice()[i]
+        if w.workspace == self.active_ws && w.open && !w.minimized && pt_in(self.window_rect(i), x, y) {
+            if w.z >= best_z {
+                best_z = w.z
+                best_idx = i32(i)
+            }
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+pub fn Compositor.on_pointer_move(&mut self, x i32, y i32) bool {
+    if self.drag_id != 0 {
+        var i: usize = 0
+        for i < self.windows.len() {
+            if self.windows.as_slice()[i].id == self.drag_id {
+                old_r := self.window_rect(i)
+                nx := x - self.drag_off_x
+                var ny = y - self.drag_off_y
+                if ny < 48 { ny = 48 }
+                self.windows.as_mut_slice()[i].floating_rect = damage.rect(nx, ny, old_r.w, old_r.h)
+                self.windows.as_mut_slice()[i].spring.set_target(f64(nx), f64(ny), f64(old_r.w), f64(old_r.h))
+                return true
+            }
+            i = i + 1
+        }
+    }
+
+    // Dock magnification
+    in_dock := y >= self.height - self.dock_base * 2 - 20
+    var changed = false
+    var cur_x = self.dock_capsule.x + 12
+    var di: usize = 0
+    for di < 4 {
+        sz := i32(self.dock_sizes[di].pos + 0.5)
+        var target = f64(self.dock_base)
+        if in_dock {
+            var d = x - (cur_x + sz / 2)
+            if d < 0 { d = 0 - d }
+            if d < 120 { target = f64(self.dock_base) * (1.65 - 0.65 * (f64(d) / 120.0)) }
+        }
+        if (self.dock_sizes[di].target - target).abs() > 0.1 {
+            self.dock_sizes[di].set_target(target)
+            changed = true
+        }
+        cur_x = cur_x + sz + 10
+        di = di + 1
+    }
+
+    // Route move ONLY to focused client if inside its content area
+    hit := self.hit_window(x, y)
+    if hit >= 0 && self.windows.as_slice()[usize(hit)].id == self.focused_id {
+        wr := self.window_rect(usize(hit))
+        if y > wr.y + 32 {
+            self.windows.as_mut_slice()[usize(hit)].inbox.push(ClientInputEvent { kind: EV_POINTER_MOVE, x: x - wr.x - 4, y: y - wr.y - 32, keycode: 0, text: "" })
+        }
+    }
+    return changed
+}
+
+pub fn Compositor.on_pointer_down(&mut self, x i32, y i32) bool {
+    hit := self.hit_window(x, y)
+    if hit >= 0 {
+        idx := usize(hit)
+        self.z_counter = self.z_counter + 1
+        self.windows.as_mut_slice()[idx].z = self.z_counter
+        id := self.windows.as_slice()[idx].id
+        self.focused_id = id
+        wr := self.window_rect(idx)
+        if y <= wr.y + 32 && x > wr.x + 60 && self.active_policy() == POLICY_FLOATING {
+            self.drag_id = id
+            self.drag_off_x = x - wr.x
+            self.drag_off_y = y - wr.y
+        } else if y > wr.y + 32 {
+            self.windows.as_mut_slice()[idx].inbox.push(ClientInputEvent { kind: EV_POINTER_DOWN, x: x - wr.x - 4, y: y - wr.y - 32, keycode: 0, text: "" })
+        }
+        self.damage.add_full(self.width, self.height)
+        return true
+    }
+    return false
+}
+
+pub fn Compositor.on_pointer_up(&mut self, x i32, y i32) bool {
+    self.drag_id = 0
+    ws_pill := damage.rect(12, 7, 250, 34)
+    if pt_in(ws_pill, x, y) {
+        if x >= ws_pill.x + 142 {
+            self.toggle_policy()
+            return true
+        }
+        wi := (x - ws_pill.x - 6) / 32
+        if wi >= 0 && wi < 4 {
+            self.switch_workspace(wi)
+            return true
+        }
+    }
+    r_pill := damage.rect(self.width - 124, 7, 112, 34)
+    if pt_in(r_pill, x, y) {
+        self.launcher_open = !self.launcher_open
+        self.damage.add_full(self.width, self.height)
+        return true
+    }
+
+    hit := self.hit_window(x, y)
+    if hit >= 0 {
+        idx := usize(hit)
+        wr := self.window_rect(idx)
+        if pt_in(damage.rect(wr.x + 8, wr.y + 6, 16, 18), x, y) {
+            self.windows.as_mut_slice()[idx].open = false
+            self.relayout_workspace(self.active_ws)
+            self.damage.add_full(self.width, self.height)
+            return true
+        }
+        if y > wr.y + 32 && self.windows.as_slice()[idx].id == self.focused_id {
+            self.windows.as_mut_slice()[idx].inbox.push(ClientInputEvent { kind: EV_POINTER_UP, x: x - wr.x - 4, y: y - wr.y - 32, keycode: 0, text: "" })
+            return true
+        }
+    }
+    return false
+}
+
+pub fn Compositor.on_key_input(&mut self, keycode i64, chars &string) bool {
+    if self.launcher_open {
+        if keycode == 53 {
+            self.launcher_open = false
+            self.damage.add_full(self.width, self.height)
+            return true
+        }
+        if keycode == 125 {
+            self.launcher_sel = (self.launcher_sel + 1) % 4
+            self.damage.add_full(self.width, self.height)
+            return true
+        }
+        if keycode == 36 || keycode == 76 {
+            sel := self.launcher_sel
+            self.launcher_open = false
+            if sel == 0 { self.toggle_policy() } else if sel == 1 { self.switch_workspace(0) } else if sel == 2 { self.switch_workspace(1) }
+            self.damage.add_full(self.width, self.height)
+            return true
+        }
+    }
+    // Route keyboard input ONLY to the focused client
+    var i: usize = 0
+    for i < self.windows.len() {
+        if self.windows.as_slice()[i].id == self.focused_id {
+            self.windows.as_mut_slice()[i].inbox.push(ClientInputEvent { kind: EV_KEY_DOWN, x: 0, y: 0, keycode: keycode, text: chars.clone() })
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub fn Compositor.snapshot_png(&self, path &string) Result<string, i32> {
+    return png.write_bgra_png(path, self.frame.pixels.as_slice(), u32(self.width), u32(self.height))
+}

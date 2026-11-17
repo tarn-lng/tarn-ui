@@ -1,0 +1,145 @@
+// Tests for the Cairn Compositor Prototype (`compositor_test.tarn`):
+// 1. Move-only `SurfaceBuffer` ownership transfer (`acquire_backbuffer` -> `commit_surface`),
+//    preventing double-acquire while client owns the buffer.
+// 2. Strict input isolation: pointer/key events route ONLY to `focused_id`; unfocused
+//    clients receive 0 events.
+// 3. Per-workspace Floating & Dwindle Tiling policies with animated `LayoutSpring`
+//    transitions and workspace switching.
+// 4. Deterministic headless PNG snapshots (floating vs tiling), 0 idle redraws, and
+//    1080p policy-transition frame time budget (robust under host load).
+import "testing"
+import "fs"
+import "backend/compositor"
+import "backend/damage"
+import "backend/render"
+import "backend/native"
+import "backend/objc"
+
+fn settle_comp(cmp &mut compositor.Compositor) {
+    var i: i32 = 0
+    for cmp.has_active_animations() && i < 120 {
+        ch := cmp.step_animations(0.016)
+        rd := cmp.render_damaged()
+        cmp.damage.clear()
+        i = i + 1
+    }
+}
+
+fn test_compositor_ownership_isolation_and_policies(t &mut testing.T) {
+    var cmp = compositor.Compositor.new(1200, 720, 1)
+    id1 := cmp.create_surface(&"Counter", 40, 70, 320, 220, 0)
+    id2 := cmp.create_surface(&"Widgets", 400, 90, 360, 240, 0)
+    id3 := cmp.create_surface(&"B5 Onboarding", 180, 300, 420, 220, 0)
+    t.require(cmp.focused_id == id3, &"newest window focused")
+
+    // 1. Buffer ownership transfer: acquire removes from compositor until commit
+    buf_opt := cmp.acquire_backbuffer(id1)
+    t.require(buf_opt.is_some(), &"acquire_backbuffer returns owned buffer")
+    t.require(cmp.acquire_backbuffer(id1).is_none(), &"double acquire refused while client holds buffer")
+    var buf = buf_opt.expect("buf")
+    buf.canvas.draw_rrect(damage.rect(0, 0, 320, 220), render.RRectStyle {
+        fill_top: render.hex_rgb(5527510),
+        fill_bottom: render.hex_rgb(5527510),
+        border_color: render.rgba(0, 0, 0, 0),
+        inner_hi: render.rgba(0, 0, 0, 0),
+        radii: render.uniform_radii(0.0),
+        border_width: 0.0,
+    }, damage.rect(0, 0, 320, 220))
+    var dmg = damage.DamageRegion.new()
+    dmg.add(damage.rect(0, 0, 64, 64), 320, 220)
+    cmp.commit_surface(id1, buf, &dmg)
+    b1_again_opt := cmp.acquire_backbuffer(id1)
+    t.require(b1_again_opt.is_some(), &"buffer available again after commit")
+
+    // Re-commit id1 so all 3 have front buffers
+    var b1_again = b1_again_opt.expect("b1")
+    cmp.commit_surface(id1, b1_again, &dmg)
+
+    // 2. Strict input isolation: only focused client (id3) receives key/pointer input
+    k_ok := cmp.on_key_input(49, &" ")
+    t.require(k_ok, &"key routed to focused client")
+    t.require(cmp.poll_client_input(id1).is_empty(), &"unfocused client 1 receives 0 events")
+    t.require(cmp.poll_client_input(id2).is_empty(), &"unfocused client 2 receives 0 events")
+    t.require(cmp.poll_client_input(id3).len() == 1, &"focused client 3 receives the event")
+
+    // 3. Floating -> Dwindle Tiling policy switch animates & places 3 windows cleanly
+    t.require(cmp.active_policy() == compositor.POLICY_FLOATING, &"ws 0 starts floating")
+    cmp.toggle_policy()
+    t.require(cmp.active_policy() == compositor.POLICY_TILING && cmp.has_active_animations(), &"toggling to tiling starts LayoutSpring animations")
+    settle_comp(&mut cmp)
+    w0 := &cmp.windows.as_slice()[0]
+    w1 := &cmp.windows.as_slice()[1]
+    t.require(i32(w0.spring.x.pos + 0.5) == 12 && i32(w1.spring.x.pos + 0.5) > i32(w0.spring.w.pos + 0.5), &"dwindle splits windows side-by-side")
+
+    // 4. Workspace switching
+    cmp.switch_workspace(1)
+    t.require(cmp.active_ws == 1 && cmp.active_policy() == compositor.POLICY_TILING, &"ws 1 has tiling policy")
+    cmp.switch_workspace(0)
+    t.require(cmp.active_ws == 0, &"back to ws 0")
+}
+
+fn test_compositor_snapshots_damage_and_budget(t &mut testing.T) {
+    // 1. Deterministic snapshots (floating vs tiling)
+    var a = compositor.Compositor.new(1200, 720, 1)
+    a1 := a.create_surface(&"Counter", 40, 70, 320, 220, 0)
+    a2 := a.create_surface(&"Widgets", 400, 90, 360, 240, 0)
+    settle_comp(&mut a)
+    rd_a := a.render_damaged()
+    a.damage.clear()
+    pa := "/tmp/tarn-ui-comp-a.png"
+    ha := a.snapshot_png(&pa).expect("comp a")
+
+    var b = compositor.Compositor.new(1200, 720, 1)
+    b1 := b.create_surface(&"Counter", 40, 70, 320, 220, 0)
+    b2 := b.create_surface(&"Widgets", 400, 90, 360, 240, 0)
+    settle_comp(&mut b)
+    rd_b := b.render_damaged()
+    b.damage.clear()
+    pb := "/tmp/tarn-ui-comp-b.png"
+    hb := b.snapshot_png(&pb).expect("comp b")
+    rm_a := fs.remove_file(&pa)
+    rm_b := fs.remove_file(&pb)
+    t.require(ha.eq(&hb), &"deterministic compositor floating PNG SHA-256")
+
+    // 2. Idle returns 0 redraws
+    t.require(a.render_damaged() == 0, &"compositor idle returns 0 redraws")
+
+    // 3. 1080p policy-transition CPU budget (with documented host-load margin)
+    var s1080 = compositor.Compositor.new(1920, 1080, 1)
+    c1 := s1080.create_surface(&"Counter", 40, 70, 340, 220, 0)
+    c2 := s1080.create_surface(&"Widgets", 420, 90, 380, 240, 0)
+    c3 := s1080.create_surface(&"Onboarding B5", 160, 300, 440, 240, 0)
+    settle_comp(&mut s1080)
+    s1080.toggle_policy()
+    var sum_cpu_us: u64 = 0
+    var cnt: u64 = 0
+    var f: i32 = 0
+    for f < 30 {
+        t0 := objc.thread_cpu_ns()
+        ch := s1080.step_animations(0.016667)
+        rd := s1080.render_damaged()
+        s1080.damage.clear()
+        t1 := objc.thread_cpu_ns()
+        if rd > 0 {
+            sum_cpu_us = sum_cpu_us + (t1 - t0) / 1000
+            cnt = cnt + 1
+        }
+        f = f + 1
+    }
+    avg_us := sum_cpu_us / cnt
+    print("Compositor 1080p policy anim avg_cpu_us=" + avg_us.to_string() + " (frames=" + cnt.to_string() + ")")
+    t.require(cnt > 10 && avg_us < 20000, &"compositor 1080p policy animation avg CPU within 60fps/host-load margin (< 20000 us)")
+
+    // 4. Live macOS host window in Compositor mode
+    if native.display_available() {
+        var ui = match native.create(&"Cairn Compositor · Prototype", &"Cairn Compositor") {
+            Ok(v) => v
+            Err(c) => { panic("native.create Compositor failed: " + c.to_string()) }
+        }
+        t.require(ui.use_comp && !ui.comp.is_empty(), &"Compositor uses Compositor scene")
+        t.require(ui.next() == 1, &"opened")
+        t.require(ui.request_close() == 0, &"close")
+        t.require(ui.next() == 2, &"closed")
+        t.require(ui.release() == 0, &"release")
+    }
+}

@@ -1,0 +1,182 @@
+// Demo `examples/cairn_compositor`:
+// Prototype of the Cairn Compositor (`ADR 0009`) running inside one macOS host window,
+// hosting three independent `tarn_ui` client apps (`Counter`, `Widgets`, `B5 Onboarding`)
+// via move-only `SurfaceBuffer` ownership transfer (`acquire_backbuffer` -> `commit_surface`),
+// with `Floating` and `Dwindle Tiling` policies, animated workspace switching, and
+// strict per-client input isolation.
+//
+// Usage:
+//   cairn_compositor                     # Interactive macOS host window
+//   cairn_compositor --headless [prefix] # Deterministic PNG snapshots (floating vs tiling)
+//   cairn_compositor --bench             # 1080p policy-transition animation p99 + idle check
+import "os"
+import "core/session"
+import "backend/objc"
+import "backend/damage"
+import "backend/render"
+import "backend/text"
+import "backend/compositor"
+
+fn render_client_card(buf &mut compositor.SurfaceBuffer, fonts &text.FontPair, atlas &mut text.GlyphAtlas,
+    title &string, subtitle &string, accent render.Color, counter_val i64) {
+    w := buf.canvas.width
+    h := buf.canvas.height
+    clip := damage.rect(0, 0, w, h)
+    buf.canvas.draw_rrect(clip, render.RRectStyle {
+        fill_top: render.rgb(26, 30, 56),
+        fill_bottom: render.rgb(20, 24, 44),
+        border_color: render.rgba(255, 255, 255, 24),
+        inner_hi: render.rgba(255, 255, 255, 18),
+        radii: render.uniform_radii(10.0),
+        border_width: 1.0,
+    }, clip)
+    d0 := text.draw_text_line(&mut buf.canvas, atlas, &fonts.display, title, 16.0, 18.0, f64(w - 32), 0, text.display_style(18.0, render.rgb(240, 244, 255)), clip)
+    d1 := text.draw_text_line(&mut buf.canvas, atlas, &fonts.body, subtitle, 16.0, 48.0, f64(w - 32), 0, text.body_style(12.5, render.rgb(175, 182, 210), false), clip)
+    btn := damage.rect(16, 84, 128, 34)
+    buf.canvas.draw_rrect(btn, render.RRectStyle {
+        fill_top: accent,
+        fill_bottom: accent,
+        border_color: render.rgba(255, 255, 255, 40),
+        inner_hi: render.rgba(255, 255, 255, 40),
+        radii: render.uniform_radii(9.0),
+        border_width: 1.0,
+    }, clip)
+    var btxt = "Activo"
+    if counter_val >= 0 { btxt = "Valor: " + counter_val.to_string() }
+    d2 := text.draw_text_line(&mut buf.canvas, atlas, &fonts.body, &btxt, f64(btn.x), f64(btn.y + 9), f64(btn.w), 1, text.body_style(12.5, render.rgb(255, 255, 255), true), clip)
+}
+
+fn spawn_three_clients(cmp &mut compositor.Compositor) [3]u32 {
+    id1 := cmp.create_surface(&"Counter (Cliente 1)", 40, 68, 340, 220, 0)
+    id2 := cmp.create_surface(&"Widgets (Cliente 2)", 410, 92, 380, 250, 0)
+    id3 := cmp.create_surface(&"Onboarding B5 (Cliente 3)", 160, 290, 440, 240, 0)
+
+    var atlas = text.GlyphAtlas.new(256, 256)
+    fonts := text.load_cairn_fonts().expect("fonts")
+    var dmg = damage.DamageRegion.new()
+
+    var b1 = cmp.acquire_backbuffer(id1).expect("b1")
+    render_client_card(&mut b1, &fonts, &mut atlas, &"Contador Reactivo", &"Cliente independiente · buffer propio", render.hex_rgb(5527510), 42)
+    dmg.add_full(b1.canvas.width, b1.canvas.height)
+    cmp.commit_surface(id1, b1, &dmg)
+
+    dmg.clear()
+    var b2 = cmp.acquire_backbuffer(id2).expect("b2")
+    render_client_card(&mut b2, &fonts, &mut atlas, &"Controles Nativos", &"Switch · Slider · Dropdown · Tabs", render.hex_rgb(2075009), -1)
+    dmg.add_full(b2.canvas.width, b2.canvas.height)
+    cmp.commit_surface(id2, b2, &dmg)
+
+    dmg.clear()
+    var b3 = cmp.acquire_backbuffer(id3).expect("b3")
+    render_client_card(&mut b3, &fonts, &mut atlas, &"Bienvenido a Cairn", &"Onboarding B5 en compositor", render.hex_rgb(10120432), -1)
+    dmg.add_full(b3.canvas.width, b3.canvas.height)
+    cmp.commit_surface(id3, b3, &dmg)
+
+    return [3]u32{id1, id2, id3}
+}
+
+fn settle_comp(cmp &mut compositor.Compositor) {
+    var i: i32 = 0
+    for cmp.has_active_animations() && i < 120 {
+        ch := cmp.step_animations(0.016)
+        rd := cmp.render_damaged()
+        cmp.damage.clear()
+        i = i + 1
+    }
+}
+
+fn run_headless(prefix &string) i32 {
+    var cmp = compositor.Compositor.new(1200, 720, 1)
+    ids := spawn_three_clients(&mut cmp)
+    settle_comp(&mut cmp)
+    rd0 := cmp.render_damaged()
+    cmp.damage.clear()
+    h_float := cmp.snapshot_png(&(prefix.clone() + "-floating.png")).expect("float png")
+
+    cmp.set_workspace_policy(0, compositor.POLICY_TILING)
+    settle_comp(&mut cmp)
+    rd1 := cmp.render_damaged()
+    cmp.damage.clear()
+    h_tile := cmp.snapshot_png(&(prefix.clone() + "-tiling.png")).expect("tile png")
+
+    print("cairn_compositor headless snapshots:")
+    print("  floating: sha256=" + h_float)
+    print("  tiling:   sha256=" + h_tile)
+    print("  idle_redraws: " + cmp.render_damaged().to_string())
+    return 0
+}
+
+fn run_bench() i32 {
+    var s1080 = compositor.Compositor.new(1920, 1080, 1)
+    ids := spawn_three_clients(&mut s1080)
+    settle_comp(&mut s1080)
+    s1080.toggle_policy() // Animate Floating -> Dwindle Tiling at 1080p
+    var max_cpu_us: u64 = 0
+    var frames: u32 = 0
+    var f: i32 = 0
+    for f < 40 {
+        c0 := objc.thread_cpu_ns()
+        ch := s1080.step_animations(0.016667)
+        rd := s1080.render_damaged()
+        s1080.damage.clear()
+        c1 := objc.thread_cpu_ns()
+        if rd > 0 {
+            frames = frames + 1
+            dt := (c1 - c0) / 1000
+            if dt > max_cpu_us { max_cpu_us = dt }
+        }
+        f = f + 1
+    }
+    settle_comp(&mut s1080)
+    print("Compositor 1080p first_frame_us=" + (s1080.first_frame_ns / 1000).to_string() +
+        " policy_anim_frames=" + frames.to_string() + " max_cpu_us=" + max_cpu_us.to_string() +
+        " idle_redraws=" + s1080.render_damaged().to_string())
+    return 0
+}
+
+fn main() {
+    argv := match os.args() {
+        Ok(list) => list
+        Err(_) => Vec.new()
+    }
+    if argv.len() >= 2 {
+        arg1 := argv.get(1)
+        if arg1.eq(&"--headless") {
+            var prefix = "/tmp/cairn-comp"
+            if argv.len() >= 3 { prefix = argv.get(2).clone() }
+            code := run_headless(&prefix)
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+        if arg1.eq(&"--bench") {
+            code := run_bench()
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+    }
+
+    unsafe {
+        match session.run("Cairn Compositor · Prototype", "Cairn Compositor", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.set_escape_action(99)
+            for {
+                action := try ui.next_action()
+                match action {
+                    session.Action.Closed => { return Ok(()) }
+                    session.Action.Activate(id) => {
+                        if id == 99 {
+                            try ui.request_close()
+                        }
+                        try ui.complete_event()
+                    }
+                    _ => {}
+                }
+            }
+        }) {
+            Ok(_) => {}
+            Err(error) => {
+                print(error.message())
+                os.exit(1)
+            }
+        }
+    }
+}
