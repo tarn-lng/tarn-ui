@@ -1,0 +1,305 @@
+// Virtual Filesystem & Seed Data for `Archivos` (`FileManager`) — Milestone B6:
+// Matches `cairn/docs/design/desktop-spec.md` §2.3 (`seedFiles`, `uniqueName`,
+// `FM_TAGS`, `FM_ASSOC`, `DISK_GB = 256`).
+import "collections"
+
+pub const DISK_GB u64 = 256
+pub const BASE_SYSTEM_TENTHS_GB u64 = 52
+
+pub const TAG_NONE u32 = 0
+pub const TAG_IMPORTANTE u32 = 1 // #e5565f
+pub const TAG_TRABAJO u32 = 2    // #3a8ae8
+pub const TAG_PERSONAL u32 = 3   // #1fa971
+pub const TAG_IDEAS u32 = 4      // #9a6cf0
+
+pub const KIND_FOLDER u32 = 0
+pub const KIND_DOC u32 = 1
+pub const KIND_SHEET u32 = 2
+pub const KIND_SLIDES u32 = 3
+pub const KIND_PDF u32 = 4
+pub const KIND_IMAGE u32 = 5
+pub const KIND_AUDIO u32 = 6
+pub const KIND_VIDEO u32 = 7
+pub const KIND_TEXT u32 = 8
+pub const KIND_ZIP u32 = 9
+
+pub fn kind_label(k u32) string {
+    if k == KIND_FOLDER { return "Carpeta" }
+    if k == KIND_DOC { return "Documento" }
+    if k == KIND_SHEET { return "Hoja de cálculo" }
+    if k == KIND_SLIDES { return "Presentación" }
+    if k == KIND_PDF { return "Documento PDF" }
+    if k == KIND_IMAGE { return "Imagen" }
+    if k == KIND_AUDIO { return "Audio" }
+    if k == KIND_VIDEO { return "Vídeo" }
+    if k == KIND_TEXT { return "Texto" }
+    return "Archivo ZIP"
+}
+
+pub fn assoc_app(k u32) string {
+    if k == KIND_DOC { return "WordCraft" }
+    if k == KIND_SHEET { return "GridCraft" }
+    if k == KIND_SLIDES { return "DeckCraft" }
+    if k == KIND_PDF { return "PdfCraft" }
+    if k == KIND_IMAGE { return "PhotoCraft" }
+    if k == KIND_AUDIO || k == KIND_VIDEO { return "PlayCraft" }
+    if k == KIND_TEXT { return "CodeCraft" }
+    return ""
+}
+
+pub struct VfsNode {
+    pub id string
+    pub parent string
+    pub name string
+    pub is_folder bool
+    pub kind u32
+    pub size_kb u64
+    pub mtime string
+    pub pinned bool
+    pub trashed bool
+    pub tag u32
+    pub content string
+}
+
+pub fn VfsNode.clone(&self) VfsNode {
+    return VfsNode {
+        id: self.id.clone(),
+        parent: self.parent.clone(),
+        name: self.name.clone(),
+        is_folder: self.is_folder,
+        kind: self.kind,
+        size_kb: self.size_kb,
+        mtime: self.mtime.clone(),
+        pinned: self.pinned,
+        trashed: self.trashed,
+        tag: self.tag,
+        content: self.content.clone(),
+    }
+}
+
+pub struct Vfs {
+    pub nodes collections.Map<string, VfsNode>
+    pub order Vec<string>
+    pub next_seq u32
+}
+
+fn add_node(v &mut Vfs, id &string, parent &string, name &string, is_folder bool, kind u32, size_kb u64, mtime &string, pinned bool, tag u32, content &string) {
+    v.nodes.insert(id.clone(), VfsNode {
+        id: id.clone(),
+        parent: parent.clone(),
+        name: name.clone(),
+        is_folder: is_folder,
+        kind: kind,
+        size_kb: size_kb,
+        mtime: mtime.clone(),
+        pinned: pinned,
+        trashed: false,
+        tag: tag,
+        content: content.clone(),
+    })
+    v.order.push(id.clone())
+}
+
+pub fn Vfs.seed() Vfs {
+    var v = Vfs { nodes: collections.Map.new(), order: Vec.new(), next_seq: 1 }
+
+    // Top-level folders in "home"
+    add_node(&mut v, &"escritorio", &"home", &"Escritorio", true, KIND_FOLDER, 0, &"Hoy, 18:10", true, TAG_NONE, &"")
+    add_node(&mut v, &"documentos", &"home", &"Documentos", true, KIND_FOLDER, 0, &"Hoy, 17:42", true, TAG_TRABAJO, &"")
+    add_node(&mut v, &"descargas", &"home", &"Descargas", true, KIND_FOLDER, 0, &"Hoy, 16:20", true, TAG_NONE, &"")
+    add_node(&mut v, &"imagenes", &"home", &"Imágenes", true, KIND_FOLDER, 0, &"Ayer, 20:15", true, TAG_PERSONAL, &"")
+    add_node(&mut v, &"musica", &"home", &"Música", true, KIND_FOLDER, 0, &"12 nov", false, TAG_NONE, &"")
+    add_node(&mut v, &"videos", &"home", &"Vídeos", true, KIND_FOLDER, 0, &"10 nov", false, TAG_NONE, &"")
+    add_node(&mut v, &"proyectos", &"home", &"Proyectos", true, KIND_FOLDER, 0, &"Hoy, 15:05", false, TAG_IDEAS, &"")
+
+    // Escritorio
+    add_node(&mut v, &"f-notas", &"escritorio", &"Notas rápidas.txt", false, KIND_TEXT, 4, &"Hoy, 18:10", false, TAG_IDEAS, &"Cairn OS 0.1\n- Microkernel en Tarn\n- Compositor < 4 ms a 1080p\n- Dual-Kawase blur cacheado")
+    add_node(&mut v, &"f-captura", &"escritorio", &"Captura escritorio.png", false, KIND_IMAGE, 1420, &"Hoy, 14:30", false, TAG_NONE, &"")
+
+    // Documentos + subfolder docs-cairn
+    add_node(&mut v, &"docs-cairn", &"documentos", &"Cairn OS", true, KIND_FOLDER, 0, &"Hoy, 17:42", false, TAG_TRABAJO, &"")
+    add_node(&mut v, &"f-plan", &"docs-cairn", &"Hoja de ruta 2026.md", false, KIND_TEXT, 18, &"Hoy, 17:42", false, TAG_IMPORTANTE, &"# Hoja de ruta Cairn OS\n1. Microkernel y capacidades\n2. Driver VirtIO-GPU\n3. Compositor Wayland/IPC\n4. Desktop Shell en Tarn puro")
+    add_node(&mut v, &"f-adr", &"docs-cairn", &"ADR-0009-compositor.md", false, KIND_TEXT, 24, &"Ayer, 19:00", false, TAG_TRABAJO, &"# ADR 0009: Compositor de escritorio\nPresupuesto: p99 < 4 ms en 1080p, 0 redraws en reposo.")
+    add_node(&mut v, &"f-pres", &"documentos", &"Presentación Cairn.slides", false, KIND_SLIDES, 4800, &"Ayer, 11:20", false, TAG_TRABAJO, &"")
+    add_node(&mut v, &"f-presup", &"documentos", &"Presupuesto Q4.xlsx", false, KIND_SHEET, 640, &"14 nov", false, TAG_NONE, &"")
+    add_node(&mut v, &"f-manual", &"documentos", &"Guía de estilo.pdf", false, KIND_PDF, 3200, &"11 nov", false, TAG_IMPORTANTE, &"")
+
+    // Descargas
+    add_node(&mut v, &"f-iso", &"descargas", &"cairn-0.2-x86_64.iso", false, KIND_ZIP, 245000, &"Hoy, 16:20", false, TAG_NONE, &"")
+    add_node(&mut v, &"f-fuentes", &"descargas", &"Onest-Bricolage.zip", false, KIND_ZIP, 3100, &"13 nov", false, TAG_NONE, &"")
+
+    // Imágenes + subfolder fondos
+    add_node(&mut v, &"fondos", &"imagenes", &"Fondos de pantalla", true, KIND_FOLDER, 0, &"Ayer, 20:15", false, TAG_PERSONAL, &"")
+    add_node(&mut v, &"f-lago", &"fondos", &"Lago nocturno.png", false, KIND_IMAGE, 2800, &"Ayer, 20:15", false, TAG_PERSONAL, &"")
+    add_node(&mut v, &"f-nieve", &"fondos", &"Cumbre nevada.png", false, KIND_IMAGE, 3100, &"9 nov", false, TAG_NONE, &"")
+
+    // Proyectos + subfolder microkernel
+    add_node(&mut v, &"microkernel", &"proyectos", &"microkernel", true, KIND_FOLDER, 0, &"Hoy, 15:05", false, TAG_TRABAJO, &"")
+    add_node(&mut v, &"f-sched", &"microkernel", &"scheduler.tarn", false, KIND_TEXT, 12, &"Hoy, 15:05", false, TAG_TRABAJO, &"pub fn schedule_next(ready &mut Queue) TaskId {\n    // O(1) priority bitmap\n    return ready.pop_highest()\n}")
+    add_node(&mut v, &"f-readme", &"microkernel", &"README.md", false, KIND_TEXT, 6, &"14 nov", false, TAG_NONE, &"# Microkernel Tarn\nCero asignaciones en ruta crítica.")
+
+    return v
+}
+
+pub fn Vfs.children_of(&self, parent &string) Vec<VfsNode> {
+    var out: Vec<VfsNode> = Vec.new()
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) {
+            n := self.nodes.get(id)
+            if !n.trashed && n.parent.eq(parent) {
+                out.push(n.clone())
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn Vfs.pinned_folders(&self) Vec<VfsNode> {
+    var out: Vec<VfsNode> = Vec.new()
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) {
+            n := self.nodes.get(id)
+            if !n.trashed && n.is_folder && n.pinned {
+                out.push(n.clone())
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn Vfs.recent_files(&self) Vec<VfsNode> {
+    var out: Vec<VfsNode> = Vec.new()
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) {
+            n := self.nodes.get(id)
+            if !n.trashed && !n.is_folder {
+                out.push(n.clone())
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn Vfs.tagged_files(&self, tag u32) Vec<VfsNode> {
+    var out: Vec<VfsNode> = Vec.new()
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) {
+            n := self.nodes.get(id)
+            if !n.trashed && n.tag == tag {
+                out.push(n.clone())
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn Vfs.trashed_items(&self) Vec<VfsNode> {
+    var out: Vec<VfsNode> = Vec.new()
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) {
+            n := self.nodes.get(id)
+            if n.trashed {
+                out.push(n.clone())
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn Vfs.trash_count(&self) u32 {
+    var c: u32 = 0
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) && self.nodes.get(id).trashed { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+pub fn Vfs.trash_item(&mut self, id &string) bool {
+    if !self.nodes.contains(id) { return false }
+    self.nodes.get_mut(id).trashed = true
+    return true
+}
+
+pub fn Vfs.restore_item(&mut self, id &string) bool {
+    if !self.nodes.contains(id) { return false }
+    self.nodes.get_mut(id).trashed = false
+    return true
+}
+
+pub fn Vfs.empty_trash(&mut self) u32 {
+    var removed: u32 = 0
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) && self.nodes.get(id).trashed {
+            r := self.nodes.remove(id)
+            removed = removed + 1
+        }
+        i = i + 1
+    }
+    return removed
+}
+
+pub fn Vfs.toggle_tag(&mut self, id &string, tag u32) {
+    if !self.nodes.contains(id) { return }
+    n := self.nodes.get_mut(id)
+    if n.tag == tag { n.tag = TAG_NONE } else { n.tag = tag }
+}
+
+pub fn Vfs.create_folder(&mut self, parent &string, base_name &string) string {
+    var name = base_name.clone()
+    var suffix: u32 = 2
+    for self.sibling_exists(parent, &name) {
+        name = base_name.clone() + " " + suffix.to_string()
+        suffix = suffix + 1
+    }
+    id := "new-" + self.next_seq.to_string()
+    self.next_seq = self.next_seq + 1
+    add_node(self, &id, parent, &name, true, KIND_FOLDER, 0, &"Ahora", false, TAG_NONE, &"")
+    return id
+}
+
+fn Vfs.sibling_exists(&self, parent &string, name &string) bool {
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) {
+            n := self.nodes.get(id)
+            if !n.trashed && n.parent.eq(parent) && n.name.eq(name) { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub fn Vfs.total_files_kb(&self) u64 {
+    var sum: u64 = 0
+    var i: usize = 0
+    for i < self.order.len() {
+        id := self.order.get(i)
+        if self.nodes.contains(id) {
+            n := self.nodes.get(id)
+            if !n.trashed { sum = sum + n.size_kb }
+        }
+        i = i + 1
+    }
+    return sum
+}

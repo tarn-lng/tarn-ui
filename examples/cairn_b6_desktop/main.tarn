@@ -1,0 +1,157 @@
+// Demo `examples/cairn_b6_desktop`:
+// Milestone B6 of the third `tarn_ui` backend (`backends/cairn/`):
+// Full Cairn Desktop Shell (`Wallpaper`, 3-pill `Topbar`, floating `Dock` with live
+// mouse magnification `170/14 mass 0.1`, `ClockWidget` & `StorageWidget`, multi-window
+// manager with traffic lights, `Archivos` with `DetailsPane` & `QuickLook`, `Ajustes`,
+// `ControlCenter`, `CalendarPop`, and `Launcher`).
+//
+// Usage:
+//   cairn_b6_desktop                     # Interactive macOS host window
+//   cairn_b6_desktop --headless [prefix] # Deterministic PNG snapshots (desktop, archivos, ajustes, cc, launcher)
+//   cairn_b6_desktop --bench             # 1080p dock magnification p99 (< 4 ms) + idle check
+import "os"
+import "core/session"
+import "backend/objc"
+import "backend/scene_b6"
+
+fn sort_u64(v &mut Vec<u64>) {
+    s := v.as_mut_slice()
+    n := s.len()
+    var i: usize = 0
+    for i < n {
+        var j = i + 1
+        for j < n {
+            if s[j] < s[i] {
+                tmp := s[i]
+                s[i] = s[j]
+                s[j] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn run_headless(prefix &string) i32 {
+    var sc = scene_b6.SceneB6.new(1200, 720, 1)
+    sc.damage.clear()
+    h0 := sc.snapshot_png(&(prefix.clone() + "-desktop.png")).expect("desktop png")
+
+    sc.open_app(1) // Archivos
+    rd1 := sc.render_damaged()
+    sc.damage.clear()
+    h1 := sc.snapshot_png(&(prefix.clone() + "-archivos.png")).expect("archivos png")
+
+    sc.open_app(2) // Ajustes
+    rd2 := sc.render_damaged()
+    sc.damage.clear()
+    h2 := sc.snapshot_png(&(prefix.clone() + "-ajustes.png")).expect("ajustes png")
+
+    sc.panel = scene_b6.PANEL_CC
+    sc.damage.add_full(sc.width, sc.height)
+    rd3 := sc.render_damaged()
+    sc.damage.clear()
+    h3 := sc.snapshot_png(&(prefix.clone() + "-cc.png")).expect("cc png")
+
+    sc.panel = scene_b6.PANEL_SEARCH
+    sc.damage.add_full(sc.width, sc.height)
+    rd4 := sc.render_damaged()
+    sc.damage.clear()
+    h4 := sc.snapshot_png(&(prefix.clone() + "-launcher.png")).expect("launcher png")
+
+    print("cairn_b6_desktop headless snapshots:")
+    print("  desktop:  sha256=" + h0)
+    print("  archivos: sha256=" + h1)
+    print("  ajustes:  sha256=" + h2)
+    print("  cc:       sha256=" + h3)
+    print("  launcher: sha256=" + h4)
+    return 0
+}
+
+fn run_bench() i32 {
+    var s1080 = scene_b6.SceneB6.new(1920, 1080, 1)
+    first_us := s1080.first_frame_ns / 1000
+    s1080.damage.clear()
+
+    // Continuous mouse sweep across the magnified Dock at 1080p
+    var frame_times: Vec<u64> = Vec.with_capacity(64)
+    dock_y := s1080.height - 28
+    var f: i32 = 0
+    for f < 45 {
+        mx := 760 + f * 9
+        mv := s1080.on_pointer_move(mx, dock_y)
+        c0 := objc.thread_cpu_ns()
+        ch := s1080.step_animations(0.016667)
+        rd := s1080.render_damaged()
+        s1080.damage.clear()
+        c1 := objc.thread_cpu_ns()
+        if rd > 0 { frame_times.push((c1 - c0) / 1000) }
+        f = f + 1
+    }
+    sort_u64(&mut frame_times)
+    cnt := frame_times.len()
+    var p99_us: u64 = 0
+    if cnt > 0 {
+        var idx = (cnt * 99) / 100
+        if idx >= cnt { idx = cnt - 1 }
+        p99_us = frame_times.as_slice()[idx]
+    }
+    // Settle dock springs and verify 0 idle redraws
+    var k: i32 = 0
+    for k < 60 {
+        ch := s1080.step_animations(0.016667)
+        rd := s1080.render_damaged()
+        s1080.damage.clear()
+        k = k + 1
+    }
+    idle_rd := s1080.render_damaged()
+    print("B6 1080p first_frame_us=" + first_us.to_string() + " dock_sweep_frames=" + cnt.to_string() + " cpu_p99_us=" + p99_us.to_string() + " (budget < 4000 us) idle_redraws=" + idle_rd.to_string())
+    return 0
+}
+
+fn main() {
+    argv := match os.args() {
+        Ok(list) => list
+        Err(_) => Vec.new()
+    }
+    if argv.len() >= 2 {
+        arg1 := argv.get(1)
+        if arg1.eq(&"--headless") {
+            var prefix = "/tmp/cairn-b6"
+            if argv.len() >= 3 { prefix = argv.get(2).clone() }
+            code := run_headless(&prefix)
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+        if arg1.eq(&"--bench") {
+            code := run_bench()
+            if code != 0 { os.exit(u8(code)) }
+            return
+        }
+    }
+
+    unsafe {
+        match session.run("Cairn B6 · Escritorio", "Cairn Desktop", fn(ui &mut session.Session) Result<void, session.Error> {
+            try ui.set_escape_action(99)
+            for {
+                action := try ui.next_action()
+                match action {
+                    session.Action.Closed => { return Ok(()) }
+                    session.Action.Activate(id) => {
+                        if id == 99 {
+                            try ui.request_close()
+                        }
+                        try ui.complete_event()
+                    }
+                    _ => {}
+                }
+            }
+        }) {
+            Ok(_) => {}
+            Err(error) => {
+                print(error.message())
+                os.exit(1)
+            }
+        }
+    }
+}

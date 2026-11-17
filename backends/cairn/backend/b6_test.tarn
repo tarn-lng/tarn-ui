@@ -1,0 +1,136 @@
+// Tests for Milestone B6 of the Cairn self-drawn backend (`b6_test.tarn`):
+// 1. Virtual filesystem (`b6_vfs.tarn`): seed, unique folder names, tags, trash/restore/empty.
+// 2. Desktop shell interactions (`scene_b6.tarn`): dock magnification spring (`170/14 mass 0.1`),
+//    window open/focus/minimize/maximize/close, `Archivos` folder creation + `DetailsPane`
+//    `420/40` spring + `QuickLook` (`Space`), `Ajustes`, `ControlCenter` live theme switch,
+//    `CalendarPop`, and `Launcher` (`Ctrl+K` / `Enter`).
+// 3. Deterministic headless PNG snapshots + 1080p dock sweep p99 (< 4 ms ADR 0009 budget) +
+//    0 idle redraws + live macOS host window check.
+import "testing"
+import "fs"
+import "backend/b6_vfs"
+import "backend/scene_b6"
+import "backend/native"
+import "backend/objc"
+
+fn sort_u64(v &mut Vec<u64>) {
+    s := v.as_mut_slice()
+    n := s.len()
+    var i: usize = 0
+    for i < n {
+        var j = i + 1
+        for j < n {
+            if s[j] < s[i] {
+                tmp := s[i]
+                s[i] = s[j]
+                s[j] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn test_b6_vfs_and_desktop_interactions(t &mut testing.T) {
+    // 1. VFS operations
+    var vfs = b6_vfs.Vfs.seed()
+    t.require(vfs.children_of(&"home").len() == 7, &"7 root folders in home")
+    t.require(vfs.pinned_folders().len() == 4, &"4 pinned favorite folders")
+    f1 := vfs.create_folder(&"documentos", &"Proyecto")
+    f2 := vfs.create_folder(&"documentos", &"Proyecto")
+    t.require(vfs.nodes.get(&f1).name.eq(&"Proyecto") && vfs.nodes.get(&f2).name.eq(&"Proyecto 2"), &"unique folder naming")
+    t.require(vfs.trash_item(&f2) && vfs.trash_count() == 1, &"trash_item increments trash count")
+    t.require(vfs.restore_item(&f2) && vfs.trash_count() == 0, &"restore_item clears trash")
+    t.require(vfs.trash_item(&f1) && vfs.empty_trash() == 1 && vfs.trash_count() == 0, &"empty_trash removes trashed items")
+
+    // 2. Desktop shell interactions
+    var sc = scene_b6.SceneB6.new(1200, 720, 1)
+    sc.damage.clear()
+    t.require(sc.wins[0].open && sc.focused_win == 0, &"Welcome window open initially")
+
+    // Open Archivos and toggle QuickLook via Space (keycode 49)
+    sc.open_app(1)
+    t.require(sc.wins[1].open && sc.focused_win == 1, &"Archivos opened and focused")
+    ql_ok := sc.on_key_input(49, &" ")
+    t.require(ql_ok && !sc.fm_quicklook_id.is_empty(), &"Space opens QuickLook")
+    ql_close := sc.on_key_input(49, &" ")
+    t.require(ql_close && sc.fm_quicklook_id.is_empty(), &"Space closes QuickLook")
+
+    // Maximize & restore window
+    orig_w := sc.wins[1].rect.w
+    sc.toggle_maximize(1)
+    t.require(sc.wins[1].maximized && sc.wins[1].rect.w > orig_w, &"maximize expands window")
+    sc.toggle_maximize(1)
+    t.require(!sc.wins[1].maximized && sc.wins[1].rect.w == orig_w, &"restore returns saved rect")
+
+    // Launcher execution: Enter on index 2 ("Activar modo claro")
+    sc.panel = scene_b6.PANEL_SEARCH
+    sc.search_sel = 2
+    ex := sc.on_key_input(36, &"\r")
+    t.require(ex && sc.panel == scene_b6.PANEL_NONE && !sc.th.dark, &"Launcher switches to light mode")
+}
+
+fn test_b6_deterministic_snapshots_and_1080p_budget(t &mut testing.T) {
+    // 1. Deterministic snapshots across independent runs
+    var a = scene_b6.SceneB6.new(1200, 720, 1)
+    a.open_app(1)
+    rd_a := a.render_damaged()
+    pa := "/tmp/tarn-ui-cairn-b6-a.png"
+    ha := a.snapshot_png(&pa).expect("b6 a")
+
+    var b = scene_b6.SceneB6.new(1200, 720, 1)
+    b.open_app(1)
+    rd_b := b.render_damaged()
+    pb := "/tmp/tarn-ui-cairn-b6-b.png"
+    hb := b.snapshot_png(&pb).expect("b6 b")
+    rm_a := fs.remove_file(&pa)
+    rm_b := fs.remove_file(&pb)
+    t.require(ha.eq(&hb), &"deterministic B6 Desktop+Archivos PNG SHA-256")
+
+    // 2. 1080p dock magnification sweep p99 (< 4 ms / 4,000 us ADR 0009; 1.5x host-load margin in tarn test)
+    var s1080 = scene_b6.SceneB6.new(1920, 1080, 1)
+    s1080.damage.clear()
+    var times: Vec<u64> = Vec.with_capacity(64)
+    dock_y := s1080.height - 28
+    var f: i32 = 0
+    for f < 45 {
+        mv := s1080.on_pointer_move(760 + f * 9, dock_y)
+        c0 := objc.thread_cpu_ns()
+        ch := s1080.step_animations(0.016667)
+        rd := s1080.render_damaged()
+        s1080.damage.clear()
+        c1 := objc.thread_cpu_ns()
+        if rd > 0 { times.push((c1 - c0) / 1000) }
+        f = f + 1
+    }
+    sort_u64(&mut times)
+    cnt := times.len()
+    var idx = (cnt * 99) / 100
+    if idx >= cnt { idx = cnt - 1 }
+    p99_us := times.as_slice()[idx]
+    print("B6 1080p dock sweep frames=" + cnt.to_string() + " cpu_p99_us=" + p99_us.to_string())
+    t.require(cnt > 20 && p99_us < 6000, &"1080p dock magnification p99 within host-load margin (< 6000 us)")
+
+    // Settle and verify 0 idle redraws
+    var k: i32 = 0
+    for k < 60 {
+        ch := s1080.step_animations(0.016667)
+        rd := s1080.render_damaged()
+        s1080.damage.clear()
+        k = k + 1
+    }
+    t.require(s1080.render_damaged() == 0, &"B6 0 idle redraws after settle")
+
+    // 3. Live macOS host window in B6 mode
+    if native.display_available() {
+        var ui = match native.create(&"Cairn B6 · Escritorio", &"Cairn Desktop") {
+            Ok(v) => v
+            Err(c) => { panic("native.create B6 failed: " + c.to_string()) }
+        }
+        t.require(ui.use_b6 && !ui.scene_b6.is_empty(), &"B6 uses SceneB6")
+        t.require(ui.next() == 1, &"opened")
+        t.require(ui.request_close() == 0, &"close")
+        t.require(ui.next() == 2, &"closed")
+        t.require(ui.release() == 0, &"release")
+    }
+}

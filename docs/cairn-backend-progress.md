@@ -240,3 +240,36 @@ Milestone B5 implements the complete 9-step Cairn Onboarding prototype in pure T
 - **`B5 1080p first frame`**: **`75.60 ms`** (`75,601 µs < 100,000 µs` ADR 0009 budget); `30` transition frames averaged `1.36 ms`/frame (`40,786 µs` total); **`0` idle redraws**.
 - **`scripts/test-cairn.sh`**: **12 passed, 0 failed** (`b1_test`..`b5_test`).
 - **`scripts/test-appkit.sh`**: **4 passed, 0 failed**.
+
+---
+
+## 13. What Was Built in Milestone B6
+
+Milestone B6 implements the Cairn Desktop Shell (`Desktop`), `Archivos` (`FileManager`), and `Ajustes` (`SettingsApp`) on the pure-Tarn CPU tile renderer (`cairn/docs/design/desktop-spec.md` §2.2–§2.4), with the Vulkan/Metal GPU pass (`cairn_render_vk`) documented below as a follow-up.
+
+### 13.1 Subsystems & Files Added / Updated
+
+| Path | Responsibility |
+|---|---|
+| `backends/cairn/backend/b6_vfs.tarn` | Virtual filesystem & seed data for `Archivos` (`home` with 7 folders, 4 pinned favorites, tags `Importante`/`Trabajo`/`Personal`/`Ideas`, `unique_name` folder creation, `trash`/`restore`/`empty_trash`, and `QuickLook` text previews). |
+| `backends/cairn/backend/scene_b6.tarn` | Cairn Desktop Shell: `Wallpaper("lago")`, 3-pill `.glass` Topbar, floating Dock with live mouse magnification (`mass: 0.1, stiffness: 170, damping: 14`), `ClockWidget` & `StorageWidget` (`w >= 1000`), multi-window manager (`welcome`, `archivos`, `ajustes`, `terminal`) with traffic lights (`Close`/`Minimize`/`Maximize`), z-order stacking, and window drag, `Archivos` (sidebar, grid, `+ Nueva`, `DetailsPane` `420/40` spring, `QuickLook` via `Space`, Toast), `Ajustes` (9 sections), and Popovers (`System Menu`, `CalendarPop`, `ControlCenter`, `Launcher Ctrl+K`). |
+| `backends/cairn/backend/native.tarn` | Wired `SceneB6` when title starts with `"Cairn B6"`, with refresh-paced animation ticks and keyboard input forwarding. |
+| `backends/cairn/backend/b6_test.tarn` | Automated B6 tests: VFS operations, `QuickLook` (`Space`), window maximize/restore, `Launcher` (`Enter` -> light mode), deterministic PNG SHA-256, 1080p dock sweep `p99` budget, `0` idle redraws, and live macOS host window check. |
+| `examples/cairn_b6_desktop/main.tarn` | Interactive B6 demo (`--headless [prefix]`, `--bench`, and live window). |
+| `scripts/build-cairn-b6.sh`, `scripts/run-cairn-b6.sh`, `scripts/build-cairn-b[1-5].sh` | Build & run scripts for Milestone B6 (and updated B1–B5 copy lists). |
+
+### 13.2 Measurements vs. Milestone B6 Budget Gate
+
+- **`B6 1080p first frame`**: **`76.62 ms`** (`76,622 µs < 100,000 µs` ADR 0009 budget).
+- **`B6 1080p dock magnification sweep (45 frames)`**: **`3.14 ms` `cpu_p99`** (`3,144 µs < 4,000 µs` ADR 0009 budget).
+- **`Idle redraws after settle`**: **`0` redraws**.
+
+### 13.3 GPU Pass Follow-Up Design (`cairn_render_vk` / Metal)
+
+Because host Vulkan/Metal shader-compilation and swapchain FFI bindings are deferred while B1–B6 run on the pure-Tarn CPU tile renderer, the GPU pass is designed as a drop-in sibling of `render.tarn` behind the same `Scene` / `DamageRegion` interface:
+1. **Command Stream**: Each frame emits a flat `DrawCmd` array (`SDFRRect`, `Squircle`, `NineSliceShadow`, `GlyphQuad`, `IconQuad`, `DualKawasePass`) from the retained scene graph, culled against `DamageRegion` rects.
+2. **Pre-compiled Shaders (SPIR-V / MSL)**:
+   - `sdf_rrect.frag`: analytical per-corner SDF rounded rect + `1px` border + top `1px` specular `--hi` + linear/radial gradient in a single fragment pass.
+   - `kawase_down.frag` / `kawase_up.frag`: 3-level Dual-Kawase pyramid on half-res `R8G8B8A8_UNORM` offscreen targets, invalidated only when underlying window/wallpaper damage intersects the `.glass`/`.pop` bounds.
+   - `atlas_quad.vert/.frag`: instanced glyph & Lucide icon quads sampling the shared shelf-packed atlas.
+3. **Fallback**: Headless CI snapshots (`--headless`) and software-only environments retain the B1–B6 CPU tile rasterizer unchanged.
